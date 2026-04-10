@@ -2,133 +2,31 @@ import React, { useRef, useState } from 'react';
 import { Group, Rect, Text, Circle } from 'react-konva';
 import { pageColors } from '../../../colorThemes';
 import useStore from '../../store/useStore';
+import { getClosestNodeOutlinePosition, getNodeAnchorPoint } from '../../links/linkGeometry';
+import { collectGuideMatches, collectVisibleGuides, isSameGuideMatch, SNAP_DISTANCE, UNSNAP_DISTANCE } from './symmetryGuides';
 
 const PORT_R = 7;
-const SNAP_DISTANCE = 10;
-const UNSNAP_DISTANCE = 22;
-const GUIDE_SHOW_DISTANCE = 56;
-const GUIDE_PAD = 220;
 
 const PORT_POSITIONS = (w, h) => [
-  { x: w / 2, y: 0 },      // top
-  { x: w,     y: h / 2 },  // right
-  { x: w / 2, y: h },      // bottom
-  { x: 0,     y: h / 2 },  // left
+  { x: w / 2, y: 0,     side: 'top'    },
+  { x: w,     y: h / 2, side: 'right'  },
+  { x: w / 2, y: h,     side: 'bottom' },
+  { x: 0,     y: h / 2, side: 'left'   },
+  { x: w / 2, y: h / 2, side: 'center' },
 ];
 
-function getRelativeSide(movingNode, stationaryNode) {
-  const movingCx = movingNode.x + movingNode.width / 2;
-  const movingCy = movingNode.y + movingNode.height / 2;
-  const stationaryCx = stationaryNode.x + stationaryNode.width / 2;
-  const stationaryCy = stationaryNode.y + stationaryNode.height / 2;
-  const dx = movingCx - stationaryCx;
-  const dy = movingCy - stationaryCy;
-
-  if (Math.abs(dx) >= Math.abs(dy)) return dx >= 0 ? 'right' : 'left';
-  return dy >= 0 ? 'bottom' : 'top';
-}
-
-function buildGuideMatch(movingNode, stationaryNode) {
-  const side = getRelativeSide(movingNode, stationaryNode);
-  const left = stationaryNode.x;
-  const right = stationaryNode.x + stationaryNode.width;
-  const top = stationaryNode.y;
-  const bottom = stationaryNode.y + stationaryNode.height;
-  const movingRight = movingNode.x + movingNode.width;
-  const movingBottom = movingNode.y + movingNode.height;
-
-  if (side === 'right') {
-    const farX = Math.max(right, movingRight) + GUIDE_PAD;
-    return {
-      axis: 'y',
-      guides: [
-        { id: `${stationaryNode.id}-rt`, points: [right, top, farX, top] },
-        { id: `${stationaryNode.id}-rb`, points: [right, bottom, farX, bottom] },
-      ],
-      candidates: [
-        { axis: 'y', snapPos: top, delta: Math.abs(movingNode.y - top) },
-        { axis: 'y', snapPos: bottom - movingNode.height, delta: Math.abs(movingNode.y - (bottom - movingNode.height)) },
-      ],
-    };
-  }
-
-  if (side === 'left') {
-    const farX = Math.min(left, movingNode.x) - GUIDE_PAD;
-    return {
-      axis: 'y',
-      guides: [
-        { id: `${stationaryNode.id}-lt`, points: [farX, top, left, top] },
-        { id: `${stationaryNode.id}-lb`, points: [farX, bottom, left, bottom] },
-      ],
-      candidates: [
-        { axis: 'y', snapPos: top, delta: Math.abs(movingNode.y - top) },
-        { axis: 'y', snapPos: bottom - movingNode.height, delta: Math.abs(movingNode.y - (bottom - movingNode.height)) },
-      ],
-    };
-  }
-
-  if (side === 'bottom') {
-    const farY = Math.max(bottom, movingBottom) + GUIDE_PAD;
-    return {
-      axis: 'x',
-      guides: [
-        { id: `${stationaryNode.id}-bl`, points: [left, bottom, left, farY] },
-        { id: `${stationaryNode.id}-br`, points: [right, bottom, right, farY] },
-      ],
-      candidates: [
-        { axis: 'x', snapPos: left, delta: Math.abs(movingNode.x - left) },
-        { axis: 'x', snapPos: right - movingNode.width, delta: Math.abs(movingNode.x - (right - movingNode.width)) },
-      ],
-    };
-  }
-
-  const farY = Math.min(top, movingNode.y) - GUIDE_PAD;
-  return {
-    axis: 'x',
-    guides: [
-      { id: `${stationaryNode.id}-tl`, points: [left, farY, left, top] },
-      { id: `${stationaryNode.id}-tr`, points: [right, farY, right, top] },
-    ],
-    candidates: [
-      { axis: 'x', snapPos: left, delta: Math.abs(movingNode.x - left) },
-      { axis: 'x', snapPos: right - movingNode.width, delta: Math.abs(movingNode.x - (right - movingNode.width)) },
-    ],
-  };
-}
-
-function collectGuideMatches(movingNode, allNodes) {
-  const matches = [];
-  for (const stationaryNode of allNodes) {
-    if (stationaryNode.id === movingNode.id) continue;
-    const match = buildGuideMatch(movingNode, stationaryNode);
-    const bestCandidate = match.candidates.reduce((best, candidate) => (
-      !best || candidate.delta < best.delta ? candidate : best
-    ), null);
-
-    if (!bestCandidate) continue;
-
-    matches.push({
-      stationaryId: stationaryNode.id,
-      axis: bestCandidate.axis,
-      delta: bestCandidate.delta,
-      snapPos: bestCandidate.snapPos,
-      guides: match.guides,
-    });
-  }
-
-  return matches.sort((a, b) => a.delta - b.delta);
-}
-
-function NodeShape({ node, isSelected, onSelect, onStartLink, onEndLink, isLinking }) {
+function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onEndLink, onRenameStart, onContextMenu, isLinking, onGroupDragStart, onGroupDragMove }) {
   const {
     nodes,
     updateNode,
+    updateNodeAnchor,
     showSymmetryLines,
     snapToSymmetryLines,
     setSymmetryGuides,
   } = useStore();
   const [hovered, setHovered] = useState(false);
-  const dragSnapRef = useRef(null);
+  const dragSnapRef   = useRef(null);
+  const dragStartPosRef = useRef(null); // {x,y} of this node at drag start
 
   const showPorts = isSelected || hovered || isLinking;
 
@@ -144,7 +42,9 @@ function NodeShape({ node, isSelected, onSelect, onStartLink, onEndLink, isLinki
     dragSnapRef.current = null;
     setSymmetryGuides([]);
     e.cancelBubble = true;
-    onSelect();
+    onSelect(false);
+    dragStartPosRef.current = { x: node.x, y: node.y };
+    onGroupDragStart?.(node.id);
   };
 
   const handleDragMove = (e) => {
@@ -168,10 +68,9 @@ function NodeShape({ node, isSelected, onSelect, onStartLink, onEndLink, isLinki
         nextPos = { ...nextPos, [activeSnap.axis]: activeSnap.snapPos };
         guideMatches = collectGuideMatches(nextPos, nodes);
         guideMatch = guideMatches.find(match =>
-          match.stationaryId === activeSnap.stationaryId &&
-          match.axis === activeSnap.axis &&
-          match.snapPos === activeSnap.snapPos
+          isSameGuideMatch(match, activeSnap)
         ) ?? activeSnap;
+        dragSnapRef.current = guideMatch;
       } else {
         dragSnapRef.current = null;
       }
@@ -182,29 +81,25 @@ function NodeShape({ node, isSelected, onSelect, onStartLink, onEndLink, isLinki
       nextPos = { ...nextPos, [guideMatch.axis]: guideMatch.snapPos };
       guideMatches = collectGuideMatches(nextPos, nodes);
       guideMatch = guideMatches.find(match =>
-        match.stationaryId === dragSnapRef.current.stationaryId &&
-        match.axis === dragSnapRef.current.axis &&
-        match.snapPos === dragSnapRef.current.snapPos
+        isSameGuideMatch(match, dragSnapRef.current)
       ) ?? dragSnapRef.current;
+      dragSnapRef.current = guideMatch;
     }
 
     const visibleGuides = canShowGuides
-      ? guideMatches
-          .filter(match => (
-            match.delta <= GUIDE_SHOW_DISTANCE ||
-            (
-              dragSnapRef.current &&
-              match.stationaryId === dragSnapRef.current.stationaryId &&
-              match.axis === dragSnapRef.current.axis &&
-              match.snapPos === dragSnapRef.current.snapPos
-            )
-          ))
-          .flatMap(match => match.guides)
+      ? collectVisibleGuides(guideMatches, dragSnapRef.current)
       : [];
 
     setSymmetryGuides(visibleGuides);
     applyDraggedPosition(e.target, nextPos);
     updateNode(node.id, { x: nextPos.x, y: nextPos.y });
+
+    // Move other selected nodes by the same delta
+    if (dragStartPosRef.current && isInSelection) {
+      const dx = nextPos.x - dragStartPosRef.current.x;
+      const dy = nextPos.y - dragStartPosRef.current.y;
+      onGroupDragMove?.(node.id, dx, dy);
+    }
   };
 
   const handleDragEnd = (e) => {
@@ -229,11 +124,26 @@ function NodeShape({ node, isSelected, onSelect, onStartLink, onEndLink, isLinki
       onDragStart={handleDragStart}
       onDragMove={handleDragMove}
       onDragEnd={handleDragEnd}
-      onClick={(e)    => { e.cancelBubble = true; onSelect(); }}
-      onTap={(e)      => { e.cancelBubble = true; onSelect(); }}
+      onClick={(e)    => { e.cancelBubble = true; onSelect(e.evt?.shiftKey); }}
+      onTap={(e)      => { e.cancelBubble = true; onSelect(false); }}
+      onDblClick={(e) => {
+        e.cancelBubble = true;
+        onSelect(false);
+        onRenameStart?.(node.id);
+      }}
+      onDblTap={(e) => {
+        e.cancelBubble = true;
+        onSelect(false);
+        onRenameStart?.(node.id);
+      }}
+      onContextMenu={(e) => {
+        e.cancelBubble = true;
+        onSelect(false);
+        onContextMenu?.(e, node.id);
+      }}
       onMouseEnter={()=> setHovered(true)}
       onMouseLeave={()=> setHovered(false)}
-      onMouseUp={(e)  => { if (isLinking) { e.cancelBubble = true; onEndLink(node.id); }}}
+      onMouseUp={(e)  => { if (isLinking) { e.cancelBubble = true; onEndLink(node.id, null); }}}
     >
       <Rect
         x={4}  y={4}
@@ -248,8 +158,10 @@ function NodeShape({ node, isSelected, onSelect, onStartLink, onEndLink, isLinki
         height={node.height}
         cornerRadius={node.cornerRadius}
         fill={node.fill}
-        stroke={isSelected ? pageColors.blueSelection : node.stroke}
-        strokeWidth={isSelected ? node.strokeWidth + 1 : node.strokeWidth}
+        stroke={isSelected ? pageColors.blueSelection : isInSelection ? pageColors.purpleAccent : node.stroke}
+        strokeWidth={isSelected ? node.strokeWidth + 1 : isInSelection ? node.strokeWidth + 1 : node.strokeWidth}
+        dash={isInSelection && !isSelected ? [6, 3] : undefined}
+        dashEnabled={!!(isInSelection && !isSelected)}
       />
 
       <Rect
@@ -276,27 +188,68 @@ function NodeShape({ node, isSelected, onSelect, onStartLink, onEndLink, isLinki
         listening={false}
       />
 
-      {showPorts && ports.map((p, i) => (
-        <Circle
-          key={i}
-          x={p.x}
-          y={p.y}
-          radius={PORT_R}
-          fill={pageColors.blueMain}
-          stroke={pageColors.blueSelection}
-          strokeWidth={2}
-          onMouseDown={(e) => {
-            e.cancelBubble = true;
-            onStartLink(node.id);
-          }}
-          onMouseUp={(e) => {
-            e.cancelBubble = true;
-            onEndLink(node.id);
-          }}
-          onMouseEnter={e => { e.target.getStage().container().style.cursor = 'crosshair'; }}
-          onMouseLeave={e => { e.target.getStage().container().style.cursor = 'default'; }}
-        />
-      ))}
+      {showPorts && ports.map((p, i) => {
+        const isCenter = p.side === 'center';
+        return (
+          <Circle
+            key={i}
+            x={p.x}
+            y={p.y}
+            radius={isCenter ? PORT_R - 2 : PORT_R}
+            fill={isCenter ? pageColors.transparent : pageColors.blueMain}
+            stroke={isCenter ? pageColors.blueSelection : pageColors.blueSelection}
+            strokeWidth={isCenter ? 1.5 : 2}
+            dash={isCenter ? [3, 2] : undefined}
+            onMouseDown={(e) => {
+              e.cancelBubble = true;
+              onStartLink(node.id, { side: p.side, along: 0, anchorId: null, centered: p.side !== 'center' });
+            }}
+            onMouseUp={(e) => {
+              e.cancelBubble = true;
+              onEndLink(node.id, { side: p.side, along: 0, anchorId: null, centered: p.side !== 'center' });
+            }}
+            onMouseEnter={e => { e.target.getStage().container().style.cursor = 'crosshair'; }}
+            onMouseLeave={e => { e.target.getStage().container().style.cursor = 'default'; }}
+          />
+        );
+      })}
+
+      {showPorts && (node.anchors ?? []).map((anchor) => {
+        const point = getNodeAnchorPoint(node, anchor);
+        return (
+          <Circle
+            key={anchor.id}
+            x={point.x - node.x}
+            y={point.y - node.y}
+            radius={6}
+            fill={pageColors.purpleAccent}
+            stroke={pageColors.white}
+            strokeWidth={1.5}
+            draggable={isSelected && !isLinking}
+            onDragStart={(e) => {
+              e.cancelBubble = true;
+            }}
+            onDragMove={(e) => {
+              e.cancelBubble = true;
+              const next = getClosestNodeOutlinePosition(node, {
+                x: node.x + e.target.x(),
+                y: node.y + e.target.y(),
+              });
+              e.target.x(next.point.x - node.x);
+              e.target.y(next.point.y - node.y);
+              updateNodeAnchor(node.id, anchor.id, { side: next.side, along: next.along });
+            }}
+            onDragEnd={(e) => {
+              e.cancelBubble = true;
+            }}
+            onMouseUp={(e) => {
+              e.cancelBubble = true;
+              if (!isLinking) return;
+              onEndLink(node.id, { side: anchor.side, along: anchor.along ?? 0, anchorId: anchor.id });
+            }}
+          />
+        );
+      })}
     </Group>
   );
 }

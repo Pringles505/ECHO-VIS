@@ -187,6 +187,25 @@ function ToggleInput({ checked, onChange, label = 'Enabled' }) {
   );
 }
 
+function ActionButton({ label, active = false, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        background: active ? 'var(--purple-surface-panel)' : 'var(--panel-bg)',
+        border: `1px solid ${active ? 'var(--purple-border-strong)' : 'var(--border-strong)'}`,
+        borderRadius: 6,
+        color: active ? 'var(--text-main)' : 'var(--text-muted)',
+        fontSize: 11,
+        padding: '5px 8px',
+        cursor: 'pointer',
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
 function LinkBasics({ linkLike, onUpdate }) {
   return (
     <>
@@ -199,8 +218,31 @@ function LinkBasics({ linkLike, onUpdate }) {
       <Row label="Arrow tip">
         <ToggleInput checked={!!linkLike.showArrowTip} onChange={value => onUpdate({ showArrowTip: value })} />
       </Row>
+      {linkLike.showArrowTip && (
+        <Row label="Tip style">
+          <div style={{ display: 'flex', gap: 6 }}>
+            <ModeChip
+              label="Flows"
+              active={!linkLike.arrowTipMode || linkLike.arrowTipMode === 'flow'}
+              onClick={() => onUpdate({ arrowTipMode: 'flow' })}
+            />
+            <ModeChip
+              label="At end"
+              active={linkLike.arrowTipMode === 'end'}
+              onClick={() => onUpdate({ arrowTipMode: 'end' })}
+            />
+          </div>
+        </Row>
+      )}
     </>
   );
+}
+
+function getAnchorLimit(node, side) {
+  if (!node || !side || side === 'center') return 0;
+  return side === 'top' || side === 'bottom'
+    ? Math.max(0, node.width / 2 - 12)
+    : Math.max(0, node.height / 2 - 12);
 }
 
 function PropertiesPanel() {
@@ -222,6 +264,8 @@ function PropertiesPanel() {
 
   const selectedNode = nodes.find(node => node.id === selectedId);
   const selectedLink = links.find(link => link.id === selectedId);
+  const selectedFromNode = selectedLink ? nodes.find(node => node.id === selectedLink.fromId) : null;
+  const selectedToNode = selectedLink ? nodes.find(node => node.id === selectedLink.toId) : null;
   const selectedJoint = selectedLink?.joints?.find(joint => joint.id === selectedJointId) ?? null;
   const [curveMode, setCurveMode] = useState('linked');
   const jointCurve = useMemo(() => {
@@ -293,6 +337,39 @@ function PropertiesPanel() {
           <NumberInput value={selectedNode.strokeWidth} min={0} max={10} onChange={v => up('strokeWidth', v)} />
         </Row>
 
+        {selectedNode.triggerAfterLinkId && (
+          <>
+            <Section title="Spawn Timing" />
+            <div style={{ display: 'flex', gap: 6, marginBottom: 4 }}>
+              <ModeChip
+                label="While drawing"
+                active={!selectedNode.triggerMode || selectedNode.triggerMode === 'overlap'}
+                onClick={() => up('triggerMode', 'overlap')}
+              />
+              <ModeChip
+                label="At completion"
+                active={selectedNode.triggerMode === 'on-end'}
+                onClick={() => up('triggerMode', 'on-end')}
+              />
+            </div>
+            <p style={{ color: 'var(--text-dim)', fontSize: 10, lineHeight: 1.5, marginBottom: 8 }}>
+              {(!selectedNode.triggerMode || selectedNode.triggerMode === 'overlap')
+                ? 'Node fades in during the final portion of the link draw.'
+                : 'Node starts appearing exactly when the link finishes.'}
+            </p>
+            <Row label="Delay">
+              <NumberInput
+                value={selectedNode.triggerDelay ?? 0}
+                step={0.05}
+                min={-2}
+                max={5}
+                onChange={v => up('triggerDelay', Math.round(v * 100) / 100)}
+              />
+              <span style={{ color: 'var(--text-dim)', fontSize: 11, marginLeft: 4 }}>s</span>
+            </Row>
+          </>
+        )}
+
         <div style={{ flex: 1 }} />
         <button
           onClick={() => removeNode(selectedNode.id)}
@@ -327,11 +404,89 @@ function PropertiesPanel() {
     });
   };
 
+  const handleJunctionSyncBranches = (value) => {
+    if (!selectedJoint || !selectedLink) return;
+    const syncGroupKey = `${selectedLink.id}::${selectedJoint.id}`;
+    updateLinkJoint(selectedLink.id, selectedJoint.id, { syncBranches: value });
+    const branchLinks = links.filter(link =>
+      link.fromJunctionLinkId === selectedLink.id &&
+      link.fromJunctionJointId === selectedJoint.id
+    );
+    if (!branchLinks.length) return;
+
+    if (!value) {
+      for (const branchLink of branchLinks) {
+        updateLink(branchLink.id, { syncGroupKey: null });
+      }
+      return;
+    }
+    for (const branchLink of branchLinks) {
+      updateLink(branchLink.id, { syncGroupKey, animStartTime: null });
+    }
+  };
+
   return (
     <div style={wrap}>
       <Section title="Link" />
 
       <LinkBasics linkLike={selectedLink} onUpdate={updates => updateLink(selectedLink.id, updates)} />
+
+      {(selectedLink.fromAnchorSide || selectedLink.toAnchorSide) && (
+        <>
+          <Section title="Anchors" />
+          {selectedLink.fromAnchorSide && selectedLink.fromAnchorSide !== 'center' && (
+            <>
+              <SliderControl
+                label={`Start ${selectedLink.fromAnchorSide}`}
+                value={selectedLink.fromAlongPos ?? 0}
+                min={-getAnchorLimit(selectedFromNode, selectedLink.fromAnchorSide)}
+                max={getAnchorLimit(selectedFromNode, selectedLink.fromAnchorSide)}
+                onChange={(value) => updateLink(selectedLink.id, {
+                  fromAlongPos: value,
+                  fromAnchorLockedCenter: Math.abs(value) < 0.5,
+                })}
+              />
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: -4, marginBottom: 12 }}>
+                <ActionButton
+                  label="Center Start"
+                  active={!!selectedLink.fromAnchorLockedCenter}
+                  onClick={() => updateLink(selectedLink.id, {
+                    fromAlongPos: 0,
+                    fromAnchorLockedCenter: true,
+                  })}
+                />
+              </div>
+            </>
+          )}
+          {selectedLink.toAnchorSide && selectedLink.toAnchorSide !== 'center' && (
+            <>
+              <SliderControl
+                label={`End ${selectedLink.toAnchorSide}`}
+                value={selectedLink.toAlongPos ?? 0}
+                min={-getAnchorLimit(selectedToNode, selectedLink.toAnchorSide)}
+                max={getAnchorLimit(selectedToNode, selectedLink.toAnchorSide)}
+                onChange={(value) => updateLink(selectedLink.id, {
+                  toAlongPos: value,
+                  toAnchorLockedCenter: Math.abs(value) < 0.5,
+                })}
+              />
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: -4, marginBottom: 12 }}>
+                <ActionButton
+                  label="Center End"
+                  active={!!selectedLink.toAnchorLockedCenter}
+                  onClick={() => updateLink(selectedLink.id, {
+                    toAlongPos: 0,
+                    toAnchorLockedCenter: true,
+                  })}
+                />
+              </div>
+            </>
+          )}
+          <p style={{ color: 'var(--text-dim)', fontSize: 11, lineHeight: 1.5, marginBottom: 10 }}>
+            Drag the link endpoints on canvas or use these sliders to place the anchor more precisely along the chosen side.
+          </p>
+        </>
+      )}
 
       <Section title="Joints" />
       {selectedLink.joints?.length ? (
@@ -339,7 +494,7 @@ function PropertiesPanel() {
           {selectedLink.joints.map((joint, index) => (
             <JointChip
               key={joint.id}
-              joint={`Joint ${index + 1}`}
+              joint={joint.isJunction ? `Junction ${index + 1}` : `Joint ${index + 1}`}
               isSelected={selectedJointId === joint.id}
               onClick={() => setSelectedJoint(joint.id)}
             />
@@ -356,13 +511,22 @@ function PropertiesPanel() {
           <Row label="Size">
             <NumberInput value={selectedJoint.size ?? 0} min={0} max={18} step={1} onChange={v => updateSelectedJoint('size', Math.max(0, v))} />
           </Row>
+          {selectedJoint.isJunction && (
+            <Row label="Branches">
+              <ToggleInput
+                checked={!!selectedJoint.syncBranches}
+                label="Start together"
+                onChange={handleJunctionSyncBranches}
+              />
+            </Row>
+          )}
           <Section title="Curvature" />
           <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
             <ModeChip label="Linked" active={curveMode === 'linked'} onClick={() => setCurveMode('linked')} />
             <ModeChip label="Split" active={curveMode === 'split'} onClick={() => setCurveMode('split')} />
           </div>
           <div style={{ display: 'flex', gap: 6, marginBottom: 12, flexWrap: 'wrap' }}>
-            <PresetChip label="Sharp" onClick={() => applyCurvePreset(0)} />
+            <PresetChip label="Pipe" onClick={() => applyCurvePreset(0)} />
             <PresetChip label="Soft" onClick={() => applyCurvePreset(18)} />
             <PresetChip label="Round" onClick={() => applyCurvePreset(36)} />
           </div>
@@ -392,6 +556,19 @@ function PropertiesPanel() {
                 onChange={value => updateSelectedJoint('nextCurve', value)}
               />
             </>
+          )}
+          <p style={{ color: 'var(--text-dim)', fontSize: 11, lineHeight: 1.5, marginBottom: 8 }}>
+            Double-click a link to add a joint. Drag joints directly to route the link cleanly.
+          </p>
+          {selectedJoint.isJunction && (
+            <p style={{ color: 'var(--text-dim)', fontSize: 11, lineHeight: 1.5, marginBottom: 8 }}>
+              Junctions can branch new links. Drag the small + handle next to the junction to start a new link from it.
+            </p>
+          )}
+          {selectedJoint.isJunction && (
+            <p style={{ color: 'var(--text-dim)', fontSize: 11, lineHeight: 1.5, marginBottom: 8 }}>
+              Turn on Start together if all auto-timed branch links from this junction should emerge at the same moment.
+            </p>
           )}
           <p style={{ color: 'var(--text-dim)', fontSize: 11, lineHeight: 1.5, marginBottom: 8 }}>
             Linked keeps both sides matched. Switch to Split only when you want the curve to lean more into one side.

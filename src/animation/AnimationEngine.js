@@ -1,3 +1,5 @@
+import { getLinkJointProgress } from '../links/linkGeometry';
+
 const ease = {
   linear: t => t,
   easeOut: t => 1 - Math.pow(1 - t, 3),
@@ -15,6 +17,18 @@ function clamp(value, min, max) {
 
 function lerp(a, b, t) {
   return a + (b - a) * t;
+}
+
+function inverseEaseOut(value) {
+  const clamped = clamp(value, 0, 1);
+  return 1 - Math.pow(1 - clamped, 1 / 3);
+}
+
+function getJunctionKey(link) {
+  if (link.syncGroupKey) return link.syncGroupKey;
+  return link.fromJunctionLinkId && link.fromJunctionJointId
+    ? `${link.fromJunctionLinkId}::${link.fromJunctionJointId}`
+    : null;
 }
 
 export class AnimationEngine {
@@ -47,21 +61,110 @@ export class AnimationEngine {
 
     const events = [];
     let t = initialDelay;
+    const linkMap = Object.fromEntries(this.links.map(link => [link.id, link]));
+    const junctionStartCache = new Map();
 
-    for (const node of this.nodes) {
-      const start = node.animStartTime != null ? node.animStartTime : t;
-      const duration = node.animDuration != null ? node.animDuration : nodeDuration;
+    const getAutoJunctionStart = (link, fallbackStart) => {
+      if (!(link.fromJunctionLinkId && link.fromJunctionJointId)) return fallbackStart;
+
+      const cacheKey = `${link.fromJunctionLinkId}::${link.fromJunctionJointId}`;
+      if (junctionStartCache.has(cacheKey)) {
+        return junctionStartCache.get(cacheKey) ?? fallbackStart;
+      }
+
+      const parentInfo = linkInfoMap[link.fromJunctionLinkId];
+      if (!parentInfo) {
+        junctionStartCache.set(cacheKey, null);
+        return fallbackStart;
+      }
+
+      const jointProgress = getLinkJointProgress(
+        link.fromJunctionLinkId,
+        link.fromJunctionJointId,
+        this.links,
+        this.nodes
+      );
+      const start = jointProgress == null
+        ? parentInfo.start
+        : parentInfo.start + parentInfo.duration * inverseEaseOut(jointProgress);
+
+      junctionStartCache.set(cacheKey, start);
+      return start;
+    };
+
+    // Free nodes (not triggered by a link) animate first.
+    const freeNodes     = this.nodes.filter(n => !n.triggerAfterLinkId);
+    const triggeredNodes = this.nodes.filter(n =>  n.triggerAfterLinkId);
+
+    for (const node of freeNodes) {
+      const start    = node.animStartTime != null ? node.animStartTime : t;
+      const duration = node.animDuration  != null ? node.animDuration  : nodeDuration;
       events.push({ type: 'node', id: node.id, start, duration });
-      if (node.animStartTime == null) t = start + duration + nodeGap;
+      t = Math.max(t, start + duration + nodeGap);
     }
 
     t += linkStartPause;
 
+    // Links — build a map of id → { start, end, duration } so triggered nodes can reference it.
+    const linkInfoMap = {};
+    const processedSimultaneousJunctions = new Set();
     for (const link of this.links) {
-      const start = link.animStartTime != null ? link.animStartTime : t;
-      const duration = link.animDuration != null ? link.animDuration : linkDuration;
+      const junctionKey = getJunctionKey(link);
+      if (junctionKey && processedSimultaneousJunctions.has(junctionKey)) {
+        continue;
+      }
+
+      const sourceJoint = link.fromJunctionLinkId && link.fromJunctionJointId
+        ? linkMap[link.fromJunctionLinkId]?.joints?.find(joint => joint.id === link.fromJunctionJointId) ?? null
+        : null;
+      const syncBranches = !!sourceJoint?.syncBranches;
+
+      if (junctionKey && syncBranches) {
+        const siblingLinks = this.links.filter(item =>
+          getJunctionKey(item) === junctionKey
+        );
+        const autoStart = getAutoJunctionStart(link, t);
+        const explicitStarts = siblingLinks
+          .map(item => item.animStartTime)
+          .filter(value => value != null);
+        const start = explicitStarts.length
+          ? Math.min(...explicitStarts)
+          : autoStart;
+        let groupEnd = start;
+        for (const sibling of siblingLinks) {
+          const duration = sibling.animDuration != null ? sibling.animDuration : linkDuration;
+          events.push({ type: 'link', id: sibling.id, start, duration });
+          linkInfoMap[sibling.id] = { start, end: start + duration, duration };
+          groupEnd = Math.max(groupEnd, start + duration);
+        }
+        t = Math.max(t, groupEnd + linkGap);
+        processedSimultaneousJunctions.add(junctionKey);
+        continue;
+      }
+
+      const autoStart = getAutoJunctionStart(link, t);
+      const start    = link.animStartTime != null ? link.animStartTime : autoStart;
+      const duration = link.animDuration  != null ? link.animDuration  : linkDuration;
       events.push({ type: 'link', id: link.id, start, duration });
-      if (link.animStartTime == null) t = start + duration + linkGap;
+      linkInfoMap[link.id] = { start, end: start + duration, duration };
+      t = Math.max(t, start + duration + linkGap);
+    }
+
+    // Triggered nodes.
+    // 'overlap' mode: node fades in during the final 70% of its own duration
+    //   so it is fully opaque exactly when the link tip stops — no gap.
+    // 'on-end' mode: node starts the moment the link finishes (user choice,
+    //   accepts the brief gap as a stylistic crisp beat).
+    for (const node of triggeredNodes) {
+      const info     = linkInfoMap[node.triggerAfterLinkId];
+      const duration = node.animDuration != null ? node.animDuration : nodeDuration;
+      const triggerEnd = info ? info.end : t;
+      const earliest   = info ? info.start : 0;
+
+      const lead  = node.triggerMode === 'on-end' ? 0 : duration * 0.7;
+      const delay = node.triggerDelay ?? 0;
+      const start = Math.max(earliest, triggerEnd - lead + delay);
+      events.push({ type: 'node', id: node.id, start, duration });
     }
 
     this._totalDuration = t + holdAfter;
@@ -89,8 +192,8 @@ export class AnimationEngine {
 
       if (event.type === 'node') {
         nodeStates[event.id] = {
-          opacity: clamp(raw * 3, 0, 1),
-          scale: lerp(0.7, 1, ease.easeOut(raw)),
+          opacity: ease.easeOut(clamp(raw * 1.6, 0, 1)),
+          scale: lerp(0.82, 1, ease.easeOut(raw)),
         };
       } else {
         linkStates[event.id] = {

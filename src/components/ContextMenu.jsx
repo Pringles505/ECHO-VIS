@@ -1,7 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import { v4 as uuid } from 'uuid';
 import useStore from '../store/useStore';
-import { createJointForLink } from '../links/linkGeometry';
+import { createJointForLink, getClosestNodeOutlinePosition } from '../links/linkGeometry';
 
 function ContextMenu() {
   const {
@@ -11,7 +11,10 @@ function ContextMenu() {
     links,
     nodes,
     addLinkJoint,
+    addNodeAnchor,
     setSelected,
+    setSelectedJoint,
+    updateLinkJoint,
   } = useStore();
   const menuRef = useRef(null);
 
@@ -61,10 +64,44 @@ function ContextMenu() {
           toNode,
           { x: contextMenu.canvasX, y: contextMenu.canvasY },
           uuid,
-          links
+          links,
+          nodes
         );
         setSelected(link.id);
         addLinkJoint(link.id, joint, insertIndex);
+      },
+    });
+  }
+
+  if (contextMenu.type === 'node') {
+    menuItems.push({
+      icon: '◉',
+      label: 'Add Anchor',
+      onClick: () => {
+        const node = nodes.find(item => item.id === contextMenu.nodeId);
+        if (!node) return;
+        const next = getClosestNodeOutlinePosition(node, {
+          x: contextMenu.canvasX,
+          y: contextMenu.canvasY,
+        });
+        addNodeAnchor(node.id, {
+          id: uuid(),
+          side: next.side,
+          along: next.along,
+        });
+        setSelected(node.id);
+      },
+    });
+  }
+
+  if (contextMenu.type === 'joint') {
+    menuItems.push({
+      icon: '◎',
+      label: 'Create Junction',
+      onClick: () => {
+        updateLinkJoint(contextMenu.linkId, contextMenu.jointId, { isJunction: true });
+        setSelected(contextMenu.linkId);
+        setSelectedJoint(contextMenu.jointId);
       },
     });
   }

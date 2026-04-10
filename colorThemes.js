@@ -35,7 +35,7 @@ export const colorThemes = {
   textDim: '#5B6B86',
   textFaint: '#2F3A4E',
 
-  purpleAccent: '#5B22B6',       // All purple highlights and node accents
+  purpleAccent: '#8a5bd6',       // All purple highlights and node accents
   blueMain: '#1D4ED8',           // Main link / active action blue
   blueBright: '#7FB0FF',
   blueSelection: '#93C5FD',
@@ -93,6 +93,8 @@ export const pageColors = {
   warningBorderSoft: withAlpha(colorThemes.warningMain, 0.18),
 
   canvasGridDot: withAlpha(colorThemes.blueBright, 0.28),
+  canvasGridMinor: withAlpha(colorThemes.blueBright, 0.025),
+  canvasGridMajor: withAlpha(colorThemes.blueBright, 0.12),
   canvasTexturePrimarySoft: withAlpha(colorThemes.canvasTexturePrimary, 0.18),
   canvasTextureSecondarySoft: withAlpha(colorThemes.canvasTextureSecondary, 0.14),
   canvasTextureTertiarySoft: withAlpha(colorThemes.canvasTextureTertiary, 0.12),

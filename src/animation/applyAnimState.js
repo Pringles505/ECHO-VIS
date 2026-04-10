@@ -8,7 +8,7 @@ export function computeLinkRenders(nodes, links) {
     const fromNode = nodeMap[link.fromId];
     const toNode = nodeMap[link.toId];
     if (!fromNode || !toNode) continue;
-    renders[link.id] = buildLinkRenderData(link, fromNode, toNode, links);
+    renders[link.id] = buildLinkRenderData(link, fromNode, toNode, links, nodes);
   }
 
   return renders;
@@ -30,7 +30,7 @@ export function applyAnimState(layer, animState, linkRenders) {
 
     const renderData = linkRenders[id];
     const totalLength = renderData?.length ?? 200;
-    const dashLength = totalLength + 50;
+    const dashLength = totalLength + 2; // +2 for float safety only; visual tip = progress=1
 
     shaft.opacity(state.progress > 0.001 ? 1 : 0);
     shaft.dashEnabled(true);

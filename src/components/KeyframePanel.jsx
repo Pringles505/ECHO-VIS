@@ -4,6 +4,7 @@ import React, {
 import { pageColors, withAlpha } from '../../colorThemes';
 import useStore from '../store/useStore';
 import { AnimationEngine } from '../animation/AnimationEngine';
+import { buildLinkRenderData, getLinkJointProgress } from '../links/linkGeometry';
 
 const LEFT_W     = 240;
 const ROW_H      = 36;
@@ -20,6 +21,11 @@ const LINK_HUE  = { solid: pageColors.blueMain, bright: pageColors.blueLink };
 
 const r2    = v => Math.round(v * 100) / 100;
 const trunc = (s, n = 13) => (s ?? '?').length > n ? (s ?? '?').slice(0, n - 1) + '…' : (s ?? '?');
+
+function inverseEaseOut(value) {
+  const clamped = Math.max(0, Math.min(1, value));
+  return 1 - Math.pow(1 - clamped, 1 / 3);
+}
 
 function fmtTime(s) {
   const m   = Math.floor(s / 60);
@@ -39,6 +45,14 @@ function computeAutoTimes(nodes, links) {
   const result = { nodes: {}, links: {} };
   for (const ev of tl) result[ev.type + 's'][ev.id] = { start: ev.start, duration: ev.duration };
   return result;
+}
+
+function getSyncedJunctionKey(link, linkMap) {
+  if (link?.syncGroupKey) return link.syncGroupKey;
+  if (!link?.fromJunctionLinkId || !link?.fromJunctionJointId) return null;
+  const parentLink = linkMap[link.fromJunctionLinkId];
+  const joint = parentLink?.joints?.find(item => item.id === link.fromJunctionJointId);
+  return joint?.syncBranches ? `${link.fromJunctionLinkId}::${link.fromJunctionJointId}` : null;
 }
 
 function speedLabel(dur) {
@@ -96,7 +110,7 @@ function SectionRow({ label, color }) {
 }
 
 function KeyframePanel({ playback }) {
-  const { nodes, links, updateNode, updateLink } = useStore();
+  const { nodes, links, updateNode, updateLink, removeNode, selectedId } = useStore();
   const { isPlaying, currentTime, totalDuration, play, pause, stop, seek } = playback;
 
   const [collapsed,     setCollapsed]     = useState(false);
@@ -109,31 +123,194 @@ function KeyframePanel({ playback }) {
   const leftBodyRef  = useRef(null);
   const rightBodyRef = useRef(null);
   const resizeRef    = useRef(null);
+  const panelRef     = useRef(null);
   const syncingScrollRef = useRef(false);
 
   const autoTimes = useMemo(() => computeAutoTimes(nodes, links), [nodes, links]);
+  const linkMap = useMemo(() => Object.fromEntries(links.map(link => [link.id, link])), [links]);
+  const nodeMap = useMemo(() => Object.fromEntries(nodes.map(node => [node.id, node])), [nodes]);
+  const linkLengthById = useMemo(() => Object.fromEntries(
+    links.map(link => {
+      const fromNode = nodeMap[link.fromId];
+      const toNode = nodeMap[link.toId];
+      if (!fromNode || !toNode) return [link.id, 0];
+      return [link.id, buildLinkRenderData(link, fromNode, toNode, links, nodes).length ?? 0];
+    })
+  ), [linkMap, links, nodeMap, nodes]);
+  const syncedJunctionKeyByLinkId = useMemo(() => Object.fromEntries(
+    links.map(link => [link.id, getSyncedJunctionKey(link, linkMap)])
+  ), [linkMap, links]);
+  const syncedLinkIdsByKey = useMemo(() => {
+    const groups = {};
+    for (const link of links) {
+      const key = syncedJunctionKeyByLinkId[link.id];
+      if (!key) continue;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(link.id);
+    }
+    return groups;
+  }, [links, syncedJunctionKeyByLinkId]);
+  const boundLinkIdsByKey = useMemo(() => {
+    const groups = {};
+    for (const link of links) {
+      for (const joint of link.joints ?? []) {
+        if (!joint?.syncBranches) continue;
+        const key = `${link.id}::${joint.id}`;
+        const childIds = links
+          .filter(item => item.fromJunctionLinkId === link.id && item.fromJunctionJointId === joint.id)
+          .map(item => item.id);
+        if (!childIds.length) continue;
+        groups[key] = [link.id, ...childIds];
+      }
+    }
+    return groups;
+  }, [links]);
+  const boundKeyByLinkId = useMemo(() => {
+    const entries = [];
+    for (const [key, linkIds] of Object.entries(boundLinkIdsByKey)) {
+      for (const linkId of linkIds) {
+        entries.push([linkId, key]);
+      }
+    }
+    return Object.fromEntries(entries);
+  }, [boundLinkIdsByKey]);
+  const syncedGroupStartByKey = useMemo(() => {
+    const result = {};
+    for (const [key, linkIds] of Object.entries(syncedLinkIdsByKey)) {
+      result[key] = Math.min(...linkIds.map(linkId => {
+        const link = linkMap[linkId];
+        return link?.animStartTime ?? autoTimes.links[linkId]?.start ?? 0;
+      }));
+    }
+    return result;
+  }, [autoTimes.links, linkMap, syncedLinkIdsByKey]);
 
   const effectiveTiming = useCallback((item, kind) => {
     const pool       = kind === 'node' ? autoTimes.nodes : autoTimes.links;
     const defaultDur = kind === 'node' ? 0.5 : 0.65;
+    const syncKey = kind === 'link' ? syncedJunctionKeyByLinkId[item.id] : null;
+    const sharedStart = syncKey ? syncedGroupStartByKey[syncKey] : null;
     return {
-      start:    item.animStartTime ?? pool[item.id]?.start    ?? 0,
+      start:    sharedStart ?? item.animStartTime ?? pool[item.id]?.start ?? 0,
       duration: item.animDuration  ?? pool[item.id]?.duration ?? defaultDur,
       isAuto:   item.animStartTime == null,
     };
-  }, [autoTimes]);
+  }, [autoTimes, syncedGroupStartByKey, syncedJunctionKeyByLinkId]);
 
   const selKind = selectedItem?.kind;
-  const selData = selKind === 'node'
+  const selData = !selectedItem ? null : selKind === 'node'
     ? nodes.find(n => n.id === selectedItem.id) ?? null
     : links.find(e => e.id === selectedItem.id) ?? null;
   const selTiming = selData ? effectiveTiming(selData, selKind) : null;
   const selLabel  = selKind === 'node'
     ? (selData?.label ?? '?')
     : selData ? linkLabel(selData, nodes) : null;
+  const selectedBoundKey = selKind === 'link' ? boundKeyByLinkId[selectedItem?.id] : null;
+  const selectedBoundLinkIds = selectedBoundKey ? boundLinkIdsByKey[selectedBoundKey] ?? [] : [];
+  const buildBoundDurationUpdates = useCallback((sourceLinkId, nextDuration) => {
+    const key = boundKeyByLinkId[sourceLinkId];
+    const normalizedDuration = nextDuration == null ? null : r2(Math.max(MIN_DUR, nextDuration));
+    if (!key) {
+      return {
+        [sourceLinkId]: { animDuration: normalizedDuration },
+      };
+    }
+
+    const [parentId, jointId] = key.split('::');
+    const memberIds = boundLinkIdsByKey[key] ?? [sourceLinkId];
+
+    // Primary-link duration changes should control the speed of the portion of
+    // the primary link after the junction, because that is the part that
+    // visually overlaps with child links.
+    if (sourceLinkId === parentId) {
+      const updates = {
+        [parentId]: { animDuration: normalizedDuration },
+      };
+      const parentLength = linkLengthById[parentId] ?? 0;
+      const junctionProgress = getLinkJointProgress(parentId, jointId, links, nodes);
+      const junctionTimeFraction = junctionProgress == null ? 0 : inverseEaseOut(junctionProgress);
+      const remainingParentDistance = parentLength > 0 && junctionProgress != null
+        ? Math.max(0, parentLength * (1 - junctionProgress))
+        : 0;
+      const remainingParentDuration = normalizedDuration != null
+        ? Math.max(MIN_DUR, normalizedDuration * (1 - junctionTimeFraction))
+        : null;
+      const postJunctionSpeed = normalizedDuration != null && remainingParentDistance > 0
+        ? remainingParentDistance / Math.max(remainingParentDuration, MIN_DUR)
+        : null;
+
+      for (const memberId of memberIds) {
+        if (memberId === parentId) continue;
+        const member = linkMap[memberId];
+        updates[memberId] = {
+          animDuration: postJunctionSpeed == null
+            ? normalizedDuration
+            : r2(Math.max(MIN_DUR, (linkLengthById[memberId] ?? 0) / postJunctionSpeed)),
+          ...(member?.fromJunctionLinkId && member?.fromJunctionJointId ? { animStartTime: null } : {}),
+        };
+      }
+      return updates;
+    }
+
+    const sourceLength = linkLengthById[sourceLinkId] ?? 0;
+    if (normalizedDuration == null || sourceLength <= 0) {
+      return Object.fromEntries(memberIds.map(memberId => [memberId, {
+        animDuration: normalizedDuration,
+        ...(linkMap[memberId]?.fromJunctionLinkId && linkMap[memberId]?.fromJunctionJointId ? { animStartTime: null } : {}),
+      }]));
+    }
+    const durationPerUnit = normalizedDuration / sourceLength;
+    return Object.fromEntries(memberIds.map(memberId => {
+      const memberLength = linkLengthById[memberId] ?? 0;
+      return [memberId, {
+        animDuration: memberLength > 0
+          ? r2(Math.max(MIN_DUR, memberLength * durationPerUnit))
+          : normalizedDuration,
+        ...(linkMap[memberId]?.fromJunctionLinkId && linkMap[memberId]?.fromJunctionJointId ? { animStartTime: null } : {}),
+      }];
+    }));
+  }, [boundKeyByLinkId, boundLinkIdsByKey, effectiveTiming, linkLengthById, linkMap, links, nodes]);
+  const updateLinkStartGroup = useCallback((linkId, nextStart) => {
+    const key = syncedJunctionKeyByLinkId[linkId];
+    if (!key) {
+      updateLink(linkId, {
+        animStartTime: nextStart == null ? null : r2(Math.max(0, nextStart)),
+      });
+      return;
+    }
+    for (const siblingId of syncedLinkIdsByKey[key] ?? [linkId]) {
+      updateLink(siblingId, {
+        animStartTime: nextStart == null ? null : r2(Math.max(0, nextStart)),
+      });
+    }
+  }, [syncedJunctionKeyByLinkId, syncedLinkIdsByKey, updateLink]);
+  const updateLinkDurationGroup = useCallback((linkId, nextDuration) => {
+    const updatesById = buildBoundDurationUpdates(linkId, nextDuration);
+    for (const [memberId, updates] of Object.entries(updatesById)) {
+      updateLink(memberId, updates);
+    }
+  }, [buildBoundDurationUpdates, updateLink]);
   const doUpdate  = (updates) => selKind === 'node'
     ? updateNode(selectedItem.id, updates)
-    : updateLink(selectedItem.id, updates);
+    : (
+        (() => {
+          const rest = { ...updates };
+          if (Object.prototype.hasOwnProperty.call(updates, 'animStartTime')) {
+            updateLinkStartGroup(selectedItem.id, updates.animStartTime);
+            delete rest.animStartTime;
+          }
+          if (Object.prototype.hasOwnProperty.call(updates, 'animDuration')) {
+            updateLinkDurationGroup(selectedItem.id, updates.animDuration);
+            delete rest.animDuration;
+          }
+          if (Object.keys(rest).length) {
+            updateLink(selectedItem.id, rest);
+            return;
+          }
+          if (Object.prototype.hasOwnProperty.call(updates, 'animStartTime') || Object.prototype.hasOwnProperty.call(updates, 'animDuration')) return;
+          updateLink(selectedItem.id, updates);
+        })()
+      );
 
   useEffect(() => {
     if (!selectedItem) return;
@@ -145,6 +322,24 @@ function KeyframePanel({ playback }) {
     if (!selectedItem && nodes.length > 0) setSelectedItem({ kind: 'node', id: nodes[0].id });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodes.length]);
+
+  // Sync canvas selection → timeline selection + scroll into view
+  useEffect(() => {
+    if (!selectedId) return;
+    const isNode = !!nodes.find(n => n.id === selectedId);
+    const isLink = !isNode && !!links.find(l => l.id === selectedId);
+    if (!isNode && !isLink) return;
+    const kind = isNode ? 'node' : 'link';
+    setSelectedItem({ kind, id: selectedId });
+
+    // Scroll the left label panel so the selected row is visible
+    requestAnimationFrame(() => {
+      const el = leftBodyRef.current;
+      if (!el) return;
+      const row = el.querySelector(`[data-row-id="${kind}-${selectedId}"]`);
+      if (row) row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    });
+  }, [selectedId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const seekFromClientX = useCallback((clientX) => {
     const el = timelineRef.current;
@@ -159,11 +354,36 @@ function KeyframePanel({ playback }) {
       const d = blockDragRef.current;
       if (!d) return;
       const dtSec  = (e.clientX - d.startX) / PX_PER_SEC;
+      if (d.kind === 'node') {
+        const update = d.dragType === 'move'
+          ? { animStartTime: r2(Math.max(0, d.initStart + dtSec)), animDuration: d.initDur }
+          : { animDuration: r2(Math.max(MIN_DUR, d.initDur + dtSec)) };
+        updateNode(d.itemId, update);
+        return;
+      }
+
+      if (d.linkGroup?.length) {
+        const resizedDuration = r2(Math.max(MIN_DUR, d.initDur + dtSec));
+        if (d.dragType === 'resize') {
+          const updatesById = buildBoundDurationUpdates(d.itemId, resizedDuration);
+          for (const [memberId, updates] of Object.entries(updatesById)) {
+            updateLink(memberId, updates);
+          }
+          return;
+        }
+        for (const groupItem of d.linkGroup) {
+          updateLink(groupItem.id, {
+            animStartTime: r2(Math.max(0, groupItem.initStart + dtSec)),
+            animDuration: groupItem.initDur,
+          });
+        }
+        return;
+      }
+
       const update = d.dragType === 'move'
         ? { animStartTime: r2(Math.max(0, d.initStart + dtSec)), animDuration: d.initDur }
         : { animDuration: r2(Math.max(MIN_DUR, d.initDur + dtSec)) };
-      if (d.kind === 'node') updateNode(d.itemId, update);
-      else                   updateLink(d.itemId, update);
+      updateLink(d.itemId, update);
     };
     const onUp = () => {
       blockDragRef.current = null;
@@ -175,7 +395,7 @@ function KeyframePanel({ playback }) {
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup',   onUp);
     };
-  }, [updateNode, updateLink]);
+  }, [buildBoundDurationUpdates, updateNode, updateLink]);
 
   useEffect(() => {
     const onMove = (e) => { if (headDragRef.current) seekFromClientX(e.clientX); };
@@ -224,12 +444,44 @@ function KeyframePanel({ playback }) {
     setSelectedItem({ kind, id: item.id });
     const { start, duration } = effectiveTiming(item, kind);
     // Store the computed timing before the user starts dragging.
-    if (item.animStartTime == null) {
-      if (kind === 'node') updateNode(item.id, { animStartTime: start, animDuration: duration });
-      else                 updateLink(item.id, { animStartTime: start, animDuration: duration });
+    if (kind === 'node') {
+      const nextUpdates = {};
+      if (dragType === 'move' && item.animStartTime == null) nextUpdates.animStartTime = start;
+      if (item.animDuration == null) nextUpdates.animDuration = duration;
+      if (Object.keys(nextUpdates).length) updateNode(item.id, nextUpdates);
+    } else {
+      const nextUpdates = {};
+      if (dragType === 'move' && item.animStartTime == null) nextUpdates.animStartTime = start;
+      if (item.animDuration == null) nextUpdates.animDuration = duration;
+      if (Object.keys(nextUpdates).length) {
+        if (Object.prototype.hasOwnProperty.call(nextUpdates, 'animStartTime')) {
+          updateLinkStartGroup(item.id, nextUpdates.animStartTime);
+        }
+        if (Object.prototype.hasOwnProperty.call(nextUpdates, 'animDuration')) {
+          updateLinkDurationGroup(item.id, nextUpdates.animDuration);
+        }
+      }
     }
-    blockDragRef.current = { dragType, kind, itemId: item.id, startX: e.clientX, initStart: start, initDur: duration };
-  }, [effectiveTiming, updateNode, updateLink]);
+    const syncKey = kind === 'link' ? syncedJunctionKeyByLinkId[item.id] : null;
+    const boundKey = kind === 'link' ? boundKeyByLinkId[item.id] : null;
+    const groupLinkIds = dragType === 'move'
+      ? (syncKey ? syncedLinkIdsByKey[syncKey] ?? [] : [])
+      : (boundKey ? boundLinkIdsByKey[boundKey] ?? [] : []);
+    const linkGroup = groupLinkIds.length
+      ? groupLinkIds.map(linkId => {
+          const sibling = links.find(link => link.id === linkId);
+          const siblingTiming = sibling ? effectiveTiming(sibling, 'link') : { start: 0, duration: 0.65 };
+          if (sibling) {
+            const siblingUpdates = {};
+            if (dragType === 'move' && sibling.animStartTime == null) siblingUpdates.animStartTime = siblingTiming.start;
+            if (sibling.animDuration == null) siblingUpdates.animDuration = siblingTiming.duration;
+            if (Object.keys(siblingUpdates).length) updateLink(sibling.id, siblingUpdates);
+          }
+          return { id: linkId, initStart: siblingTiming.start, initDur: siblingTiming.duration };
+        })
+      : null;
+    blockDragRef.current = { dragType, kind, itemId: item.id, startX: e.clientX, initStart: start, initDur: duration, linkGroup };
+  }, [boundKeyByLinkId, boundLinkIdsByKey, effectiveTiming, links, syncedJunctionKeyByLinkId, syncedLinkIdsByKey, updateLinkStartGroup, updateLinkDurationGroup, updateNode, updateLink]);
 
   const handleTimelineMouseDown = useCallback((e) => {
     e.preventDefault();
@@ -241,24 +493,33 @@ function KeyframePanel({ playback }) {
   const handleResizeMouseDown = useCallback((e) => {
     if (collapsed) return;
     e.preventDefault();
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'ns-resize';
+
     const startY = e.clientY;
     const startHeight = panelHeight;
+
     const onMove = (moveEvent) => {
       const maxHeight = Math.floor(window.innerHeight * 0.76);
-      const nextHeight = startHeight - (moveEvent.clientY - startY);
-      setPanelHeight(Math.max(PANEL_MIN_H, Math.min(nextHeight, maxHeight)));
+      const next = Math.max(PANEL_MIN_H, Math.min(startHeight - (moveEvent.clientY - startY), maxHeight));
+      // Write directly to DOM — zero re-renders during drag
+      if (panelRef.current) {
+        panelRef.current.style.height = `${next}px`;
+        panelRef.current.style.minHeight = `${next}px`;
+      }
+      resizeRef.current = next;
     };
+
     const onUp = () => {
-      resizeRef.current = null;
       document.body.style.userSelect = '';
       document.body.style.cursor = '';
+      // Sync state once on release so React knows the final height
+      if (resizeRef.current != null) setPanelHeight(resizeRef.current);
+      resizeRef.current = null;
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
     };
 
-    resizeRef.current = { startY, startHeight };
-    document.body.style.userSelect = 'none';
-    document.body.style.cursor = 'ns-resize';
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
   }, [collapsed, panelHeight]);
@@ -278,14 +539,13 @@ function KeyframePanel({ playback }) {
   const isEmpty = nodes.length === 0 && links.length === 0;
 
   return (
-    <div style={{
+    <div ref={panelRef} style={{
       height: collapsed ? 34 : panelHeight,
       minHeight: collapsed ? 34 : panelHeight,
       background: 'linear-gradient(180deg, var(--panel-bg), var(--panel-bg-2))',
       borderTop: '1px solid var(--border-strong)',
       display: 'flex', flexDirection: 'column', flexShrink: 0,
       overflow: 'hidden', userSelect: 'none',
-      transition: 'height 0.16s ease, min-height 0.16s ease',
       position: 'relative',
     }}>
       {!collapsed && (
@@ -330,16 +590,65 @@ function KeyframePanel({ playback }) {
 
         {!collapsed && selData && selTiming && (
           <>
-            <span style={{ color: selKind === 'node' ? pageColors.purpleAccent : pageColors.blueLink, fontSize: 12, whiteSpace: 'nowrap', maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            <span style={{ color: selKind === 'node' ? pageColors.purpleAccent : pageColors.blueLink, fontSize: 12, whiteSpace: 'nowrap', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis' }}>
               {selLabel}
             </span>
             <VSep />
 
-            <FieldLabel>Start</FieldLabel>
-            <NumberField value={selTiming.start}    step={0.05} min={0}       onChange={v => doUpdate({ animStartTime: r2(Math.max(0, v)),      animDuration: selTiming.duration })} />
-            <FieldLabel>s</FieldLabel>
+            {selKind === 'node' && (() => {
+              const isTrigger = !!(selData?.triggerAfterLinkId);
+              return (
+                <>
+                  <FieldLabel>Triggered by</FieldLabel>
+                  <select
+                    value={selData?.triggerAfterLinkId ?? ''}
+                    onChange={e => {
+                      const val = e.target.value || null;
+                      doUpdate({ triggerAfterLinkId: val, animStartTime: null });
+                    }}
+                    onMouseDown={e => e.stopPropagation()}
+                    style={{
+                      background: 'var(--panel-bg)', border: '1px solid var(--border-strong)',
+                      borderRadius: 4, color: isTrigger ? pageColors.blueLink : 'var(--text-dim)',
+                      padding: '3px 6px', fontSize: 11, cursor: 'pointer',
+                      maxWidth: 130, fontWeight: isTrigger ? 600 : 400,
+                    }}
+                  >
+                    <option value="">None</option>
+                    {links.map(link => (
+                      <option key={link.id} value={link.id}>{linkLabel(link, nodes)}</option>
+                    ))}
+                  </select>
+                  <VSep />
+                  {!isTrigger && (
+                    <>
+                      <FieldLabel>Start</FieldLabel>
+                      <NumberField value={selTiming.start} step={0.05} min={0} onChange={v => doUpdate({ animStartTime: r2(Math.max(0, v)), animDuration: selTiming.duration })} />
+                      <FieldLabel>s</FieldLabel>
+                      <div style={{ width: 6 }} />
+                    </>
+                  )}
+                </>
+              );
+            })()}
 
-            <div style={{ width: 8 }} />
+            {selKind === 'link' && (
+              <>
+                <FieldLabel>Start</FieldLabel>
+                <NumberField value={selTiming.start} step={0.05} min={0} onChange={v => doUpdate({ animStartTime: r2(Math.max(0, v)), animDuration: selTiming.duration })} />
+                <FieldLabel>s</FieldLabel>
+                <div style={{ width: 6 }} />
+                {selectedBoundKey && (
+                  <>
+                    <FieldLabel>Bound</FieldLabel>
+                    <span style={{ color: pageColors.blueLink, fontSize: 11, fontWeight: 600, minWidth: 30 }}>
+                      ×{selectedBoundLinkIds.length}
+                    </span>
+                    <div style={{ width: 6 }} />
+                  </>
+                )}
+              </>
+            )}
 
             <FieldLabel>Duration</FieldLabel>
             <NumberField value={selTiming.duration} step={0.05} min={MIN_DUR} onChange={v => doUpdate({ animDuration: r2(Math.max(MIN_DUR, v)) })} />
@@ -351,7 +660,7 @@ function KeyframePanel({ playback }) {
               {speedLabel(selTiming.duration)}
             </span>
 
-            {!selTiming.isAuto && (
+            {!selTiming.isAuto && !selData?.triggerAfterLinkId && (
               <button
                 onClick={() => doUpdate({ animStartTime: null, animDuration: null })}
                 style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text-dim)', fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
@@ -390,9 +699,14 @@ function KeyframePanel({ playback }) {
                 const hue   = kind === 'node' ? NODE_HUE : LINK_HUE;
                 const isSel = selectedItem?.kind === kind && selectedItem?.id === item.id;
                 const label = kind === 'node' ? trunc(item.label) : linkLabel(item, nodes);
+                const isTriggered = kind === 'node' && !!item.triggerAfterLinkId;
+                const boundKey = kind === 'link' ? boundKeyByLinkId[item.id] : null;
+                const isBound = !!boundKey;
+                const boundCount = isBound ? (boundLinkIdsByKey[boundKey]?.length ?? 1) : 0;
                 return (
                   <div
                     key={`${kind}-${item.id}`}
+                    data-row-id={`${kind}-${item.id}`}
                     onClick={() => setSelectedItem({ kind, id: item.id })}
                     style={{
                       height: ROW_H, display: 'flex', alignItems: 'center',
@@ -403,11 +717,30 @@ function KeyframePanel({ playback }) {
                       flexShrink: 0,
                     }}
                   >
-                    <div style={{ width: 6, height: 6, borderRadius: '50%', flexShrink: 0, background: isAuto ? pageColors.rulerMinorTick : hue.solid }} />
+                    {isTriggered
+                      ? <span style={{ fontSize: 11, flexShrink: 0, opacity: 0.8 }} title="Triggered by link">⛓</span>
+                      : <div style={{ width: 6, height: 6, borderRadius: '50%', flexShrink: 0, background: isAuto ? pageColors.rulerMinorTick : hue.solid }} />
+                    }
                     <span style={{ color: isSel ? hue.bright : pageColors.timelineTextMuted, fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>
                       {label}
                     </span>
-                    {isAuto && <span style={{ color: pageColors.rulerMinorTick, fontSize: 9, letterSpacing: '0.05em' }}>AUTO</span>}
+                    {isBound && (
+                      <span style={{
+                        color: pageColors.blueLink,
+                        fontSize: 9,
+                        fontWeight: 700,
+                        letterSpacing: '0.05em',
+                        padding: '2px 5px',
+                        borderRadius: 999,
+                        background: withAlpha(pageColors.blueLink, 0.12),
+                        border: `1px solid ${withAlpha(pageColors.blueLink, 0.28)}`,
+                        flexShrink: 0,
+                      }}>
+                        SYNC ×{boundCount}
+                      </span>
+                    )}
+                    {isAuto && !isTriggered && <span style={{ color: pageColors.rulerMinorTick, fontSize: 9, letterSpacing: '0.05em' }}>AUTO</span>}
+                    {isTriggered && <span style={{ color: pageColors.blueLink, fontSize: 9, letterSpacing: '0.05em' }}>TRIGGER</span>}
                   </div>
                 );
               })}
@@ -436,10 +769,14 @@ function KeyframePanel({ playback }) {
 
                   const { item, type: kind } = row;
                   const { start, duration, isAuto } = effectiveTiming(item, kind);
-                  const hue    = kind === 'node' ? NODE_HUE : LINK_HUE;
-                  const isSel  = selectedItem?.kind === kind && selectedItem?.id === item.id;
-                  const bLeft  = start * PX_PER_SEC;
-                  const bWidth = Math.max(duration * PX_PER_SEC, HANDLE_W + 6);
+                  const hue        = kind === 'node' ? NODE_HUE : LINK_HUE;
+                  const isSel      = selectedItem?.kind === kind && selectedItem?.id === item.id;
+                  const isTriggered = kind === 'node' && !!item.triggerAfterLinkId;
+                  const boundKey   = kind === 'link' ? boundKeyByLinkId[item.id] : null;
+                  const isBound    = !!boundKey;
+                  const boundCount = isBound ? (boundLinkIdsByKey[boundKey]?.length ?? 1) : 0;
+                  const bLeft      = start * PX_PER_SEC;
+                  const bWidth     = Math.max(duration * PX_PER_SEC, HANDLE_W + 6);
 
                   return (
                     <div
@@ -447,41 +784,99 @@ function KeyframePanel({ playback }) {
                       onClick={e => { e.stopPropagation(); setSelectedItem({ kind, id: item.id }); }}
                       style={{ height: ROW_H, borderBottom: `1px solid ${pageColors.timelineRowDivider}`, position: 'relative', flexShrink: 0, background: isSel ? withAlpha(hue.solid, 0.04) : pageColors.transparent, cursor: 'crosshair' }}
                     >
+                      {isTriggered && (
+                        <div style={{
+                          position: 'absolute', left: 0, top: ROW_H / 2 - 0.5,
+                          width: bLeft, height: 1,
+                          background: `repeating-linear-gradient(90deg, ${withAlpha(pageColors.blueLink, 0.5)} 0 4px, transparent 4px 8px)`,
+                          pointerEvents: 'none',
+                        }} />
+                      )}
                       <div
-                        title={`${kind === 'node' ? 'Node' : 'Link'} · Start ${start.toFixed(2)}s · Duration ${duration.toFixed(2)}s`}
-                        onMouseDown={e => startBlockDrag(e, item, kind, 'move')}
+                        title={`${kind === 'node' ? 'Node' : 'Link'} · Start ${start.toFixed(2)}s · Duration ${duration.toFixed(2)}s${isTriggered ? ' · Triggered by link' : ''}${isBound ? ` · Synced with ${boundCount} links` : ''}`}
+                        onMouseDown={e => !isTriggered && startBlockDrag(e, item, kind, 'move')}
                         style={{
                           position: 'absolute', top: 6, left: bLeft,
                           width: bWidth, height: ROW_H - 12,
-                          borderRadius: 5, cursor: 'grab',
+                          borderRadius: 5, cursor: isTriggered ? 'pointer' : 'grab',
                           display: 'flex', alignItems: 'center', overflow: 'hidden',
                           userSelect: 'none',
                           background: isSel
                             ? withAlpha(hue.solid, 0.35)
-                            : isAuto
-                              ? withAlpha(hue.solid, 0.12)
-                              : withAlpha(hue.solid, 0.24),
-                          border: `1px solid ${isSel ? hue.solid : withAlpha(hue.solid, 0.3)}`,
+                            : isTriggered
+                              ? withAlpha(pageColors.blueLink, 0.18)
+                              : isBound
+                                ? `linear-gradient(135deg, ${withAlpha(pageColors.blueLink, 0.18)}, ${withAlpha(hue.solid, isAuto ? 0.18 : 0.28)})`
+                              : isAuto
+                                ? withAlpha(hue.solid, 0.12)
+                                : withAlpha(hue.solid, 0.24),
+                          border: `1px solid ${isSel ? hue.solid : isTriggered || isBound ? withAlpha(pageColors.blueLink, 0.5) : withAlpha(hue.solid, 0.3)}`,
+                          boxShadow: isTriggered || isBound ? `0 0 0 1px ${withAlpha(pageColors.blueLink, 0.15)} inset` : 'none',
                         }}
                       >
-                        {bWidth > 44 && (
-                          <span style={{ color: isSel ? hue.bright : hue.solid, fontSize: 10, paddingLeft: 6, pointerEvents: 'none', whiteSpace: 'nowrap' }}>
+                        {isBound && (
+                          <div style={{
+                            position: 'absolute',
+                            left: 0,
+                            right: 0,
+                            top: 0,
+                            height: 2,
+                            background: pageColors.blueLink,
+                            opacity: 0.85,
+                            pointerEvents: 'none',
+                          }} />
+                        )}
+                        {isTriggered && (
+                          <span style={{ fontSize: 10, paddingLeft: 5, opacity: 0.8, flexShrink: 0, pointerEvents: 'none' }}>⛓</span>
+                        )}
+                        {isBound && bWidth > 74 && (
+                          <span style={{
+                            color: pageColors.blueLink,
+                            fontSize: 8,
+                            fontWeight: 700,
+                            letterSpacing: '0.06em',
+                            paddingLeft: isTriggered ? 3 : 6,
+                            pointerEvents: 'none',
+                            whiteSpace: 'nowrap',
+                            flexShrink: 0,
+                          }}>
+                            SYNC
+                          </span>
+                        )}
+                        {bWidth > (isTriggered || isBound ? 60 : 44) && (
+                          <span style={{ color: isSel ? hue.bright : isTriggered || isBound ? pageColors.blueLink : hue.solid, fontSize: 10, paddingLeft: isTriggered ? 3 : 6, pointerEvents: 'none', whiteSpace: 'nowrap' }}>
                             {duration.toFixed(2)}s
                           </span>
                         )}
 
-                        <div
-                          onMouseDown={e => startBlockDrag(e, item, kind, 'resize')}
-                          style={{
-                            position: 'absolute', right: 0, top: 0, bottom: 0,
-                            width: HANDLE_W, cursor: 'ew-resize',
-                            background: isSel ? withAlpha(hue.solid, 0.3) : pageColors.transparent,
-                            display: 'flex', alignItems: 'center', justifyContent: 'center',
-                            borderRadius: '0 5px 5px 0',
-                          }}
-                        >
-                          {isSel && <div style={{ width: 2, height: 12, background: hue.bright, borderRadius: 1 }} />}
-                        </div>
+                        {!isTriggered && (
+                          <div
+                            onMouseDown={e => startBlockDrag(e, item, kind, 'resize')}
+                            style={{
+                              position: 'absolute', right: 0, top: 0, bottom: 0,
+                              width: HANDLE_W, cursor: 'ew-resize',
+                              background: isSel ? withAlpha(hue.solid, 0.3) : pageColors.transparent,
+                              display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              borderRadius: '0 5px 5px 0',
+                            }}
+                          >
+                            {isSel && <div style={{ width: 2, height: 12, background: hue.bright, borderRadius: 1 }} />}
+                          </div>
+                        )}
+                        {isTriggered && (
+                          <div
+                            onMouseDown={e => startBlockDrag(e, item, kind, 'resize')}
+                            style={{
+                              position: 'absolute', right: 0, top: 0, bottom: 0,
+                              width: HANDLE_W, cursor: 'ew-resize',
+                              background: isSel ? withAlpha(pageColors.blueLink, 0.3) : pageColors.transparent,
+                              display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              borderRadius: '0 5px 5px 0',
+                            }}
+                          >
+                            {isSel && <div style={{ width: 2, height: 12, background: pageColors.blueLink, borderRadius: 1 }} />}
+                          </div>
+                        )}
                       </div>
                     </div>
                   );
@@ -564,4 +959,3 @@ function StopBtn({ onClick }) {
 }
 
 export default KeyframePanel;
-
