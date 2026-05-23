@@ -1,22 +1,42 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { v4 as uuid } from 'uuid';
-import useStore from '../store/useStore';
+import useStore, { NODE_SHAPE_PRESETS } from '../store/useStore';
 import { createJointForLink, getClosestNodeOutlinePosition } from '../links/linkGeometry';
+
+const NODE_SHAPE_MENU = [
+  { key: 'rectangle', icon: '▭', label: 'Rectangle' },
+  { key: 'pill', icon: '⬭', label: 'Pill' },
+  { key: 'cylinder', icon: '⌭', label: 'Cylinder' },
+  { key: 'diamond', icon: '◇', label: 'Diamond' },
+  { key: 'hexagon', icon: '⬢', label: 'Hexagon' },
+  { key: 'slanted', icon: '▱', label: 'Slanted' },
+  { key: 'circle', icon: '◯', label: 'Circle' },
+];
 
 function ContextMenu() {
   const {
     contextMenu,
     setContextMenu,
     addNode,
+    addVariableNode,
+    addMonitorNode,
+    addMirrorNode,
+    addTextNode,
+    addArea,
+    addSubdiagramNode,
     links,
     nodes,
+    selectedId,
+    selectedIds,
     addLinkJoint,
     addNodeAnchor,
     setSelected,
     setSelectedJoint,
     updateLinkJoint,
+    reverseLink,
   } = useStore();
   const menuRef = useRef(null);
+  const [canvasMenuView, setCanvasMenuView] = useState('root');
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -32,22 +52,87 @@ function ContextMenu() {
     };
   }, [contextMenu, setContextMenu]);
 
+  useEffect(() => {
+    setCanvasMenuView('root');
+  }, [contextMenu]);
+
   if (!contextMenu) return null;
 
   const { screenX, screenY } = contextMenu;
   const left = Math.min(screenX, window.innerWidth - 190);
-  const top = Math.min(screenY, window.innerHeight - 140);
+  const top = Math.min(screenY, window.innerHeight - 280);
 
   const menuItems = [];
   if (contextMenu.type === 'canvas') {
-    menuItems.push({
-      icon: '⬡',
-      label: 'Add Node',
-      onClick: () => addNode(contextMenu.canvasX, contextMenu.canvasY),
-    });
+    if (canvasMenuView === 'add-node') {
+      menuItems.push({
+        icon: '←',
+        label: 'Back',
+        onClick: () => setCanvasMenuView('root'),
+        keepOpen: true,
+      });
+      for (const shapeItem of NODE_SHAPE_MENU) {
+        menuItems.push({
+          icon: shapeItem.icon,
+          label: shapeItem.label,
+          onClick: () => addNode(contextMenu.canvasX, contextMenu.canvasY, NODE_SHAPE_PRESETS[shapeItem.key]),
+        });
+      }
+    } else {
+      menuItems.push({
+        icon: '⬡',
+        label: 'Add Node',
+        onClick: () => addNode(contextMenu.canvasX, contextMenu.canvasY),
+      });
+      menuItems.push({
+        icon: '𝑽',
+        label: 'Add Variable',
+        onClick: () => addVariableNode(contextMenu.canvasX, contextMenu.canvasY),
+      });
+      menuItems.push({
+        icon: '⊡',
+        label: 'Add Monitor',
+        onClick: () => addMonitorNode(contextMenu.canvasX, contextMenu.canvasY),
+      });
+      menuItems.push({
+        icon: '◇',
+        label: 'Add Shape',
+        onClick: () => setCanvasMenuView('add-node'),
+        keepOpen: true,
+      });
+      menuItems.push({
+        icon: '▣',
+        label: 'Add Mirror',
+        onClick: () => addMirrorNode(
+          contextMenu.canvasX,
+          contextMenu.canvasY,
+          [...new Set([...(selectedIds ?? []), selectedId].filter(Boolean))]
+        ),
+      });
+      menuItems.push({
+        icon: 'T',
+        label: 'Add Text',
+        onClick: () => addTextNode(contextMenu.canvasX, contextMenu.canvasY),
+      });
+      menuItems.push({
+        icon: '⬚',
+        label: 'Add Area',
+        onClick: () => addArea(contextMenu.canvasX, contextMenu.canvasY),
+      });
+      menuItems.push({
+        icon: '▶',
+        label: 'Add Sub-diagram',
+        onClick: () => addSubdiagramNode(contextMenu.canvasX, contextMenu.canvasY),
+      });
+    }
   }
 
   if (contextMenu.type === 'link') {
+    menuItems.push({
+      icon: '⇄',
+      label: 'Reverse direction',
+      onClick: () => reverseLink(contextMenu.linkId),
+    });
     menuItems.push({
       icon: '◆',
       label: 'Add Joint',
@@ -122,17 +207,19 @@ function ContextMenu() {
         zIndex: 9999,
         minWidth: 176,
         boxShadow: '0 12px 40px var(--menu-shadow)',
-        animation: 'fadeInScale 0.08s ease-out',
+        transformOrigin: 'top left',
+        animation: 'popFromNode 0.18s cubic-bezier(0.34, 1.3, 0.64, 1)',
       }}
     >
       <style>{`
-        @keyframes fadeInScale {
-          from { opacity:0; transform:scale(0.95); }
-          to   { opacity:1; transform:scale(1); }
+        @keyframes popFromNode {
+          0%   { opacity: 0; transform: scale(0.5) translate(-6px, -6px); }
+          60%  { opacity: 1; transform: scale(1.04) translate(0, 0); }
+          100% { opacity: 1; transform: scale(1)    translate(0, 0); }
         }
       `}</style>
 
-      <MenuLabel text="ADD" />
+      <MenuLabel text={contextMenu.type === 'canvas' && canvasMenuView === 'add-node' ? 'ADD NODE' : 'ADD'} />
       {menuItems.map(item => (
         <MenuItem
           key={item.label}
@@ -140,7 +227,7 @@ function ContextMenu() {
           label={item.label}
           onClick={() => {
             item.onClick();
-            setContextMenu(null);
+            if (!item.keepOpen) setContextMenu(null);
           }}
         />
       ))}
@@ -181,7 +268,17 @@ function MenuItem({ icon, label, onClick }) {
         transition: 'background 0.08s',
       }}
     >
-      <span style={{ fontSize: 14, opacity: 0.7 }}>{icon}</span>
+      <span
+        style={{
+          width: 16,
+          textAlign: 'center',
+          fontSize: 14,
+          opacity: 0.7,
+          flexShrink: 0,
+        }}
+      >
+        {icon}
+      </span>
       <span style={{ flex: 1 }}>{label}</span>
     </div>
   );

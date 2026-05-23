@@ -1,10 +1,15 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import useStore from '../store/useStore';
 import { exportToMP4 } from '../export/VideoExporter';
+import {
+  writeProject, downloadProjectFile,
+  parseProjectFile,
+} from '../projects/projectStore';
 
-function TopBar({ stageRef, layerRef }) {
+function TopBar({ stageRef, layerRef, onGoHome }) {
   const {
     nodes, links,
+    activeProject, renameActiveProject, setActiveProject, loadProjectData,
     isExporting, exportProgress, exportStatus,
     setExporting, setExportProgress, setExportStatus,
     showGridLines, setShowGridLines,
@@ -12,8 +17,47 @@ function TopBar({ stageRef, layerRef }) {
     snapToSymmetryLines, setSnapToSymmetryLines,
   } = useStore();
 
+  const fileInputRef   = useRef(null);
+  const [editingName, setEditingName] = useState(false);
+  const [nameVal, setNameVal]         = useState('');
+
   const [resolution, setResolution] = useState('1080p');
   const [fps,        setFps]        = useState(30);
+
+  const handleDownload = () => {
+    if (!activeProject) return;
+    downloadProjectFile({ version: 1, ...activeProject, nodes, links });
+  };
+
+  const handleOpenFile = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const project = parseProjectFile(ev.target.result);
+        writeProject(project);
+        setActiveProject({ id: project.id, name: project.name, createdAt: project.createdAt });
+        loadProjectData({ nodes: project.nodes, links: project.links });
+      } catch (err) {
+        alert(`Could not open file:\n${err.message}`);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  const startRenameName = () => {
+    setNameVal(activeProject?.name ?? '');
+    setEditingName(true);
+  };
+
+  const commitName = () => {
+    const name = nameVal.trim() || 'Untitled';
+    renameActiveProject(name);
+    if (activeProject) writeProject({ version: 1, ...activeProject, name, nodes, links });
+    setEditingName(false);
+  };
 
   const resMap = {
     '720p':  { w: 1280,  h: 720  },
@@ -66,14 +110,63 @@ function TopBar({ stageRef, layerRef }) {
       zIndex: 200,
       userSelect: 'none',
     }}>
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 1, marginRight: 8 }}>
-        <span style={{ color: 'var(--purple-bright)', fontSize: 16, fontWeight: 800, letterSpacing: '0.06em' }}>
-          ECHO
+      <button
+        onClick={onGoHome}
+        title="Back to projects"
+        style={{
+          background: 'none',
+          border: 'none',
+          cursor: 'pointer',
+          display: 'flex',
+          alignItems: 'baseline',
+          gap: 1,
+          padding: '2px 4px',
+          borderRadius: 5,
+          marginRight: 4,
+        }}
+      >
+        <span style={{ color: 'var(--purple-bright)', fontSize: 16, fontWeight: 800, letterSpacing: '0.06em' }}>ECHO</span>
+        <span style={{ color: 'var(--blue-bright)', fontSize: 16, fontWeight: 300, letterSpacing: '0.06em' }}>VIS</span>
+      </button>
+
+      <Divider />
+
+      {editingName ? (
+        <input
+          autoFocus
+          value={nameVal}
+          onChange={e => setNameVal(e.target.value)}
+          onBlur={commitName}
+          onKeyDown={e => { if (e.key === 'Enter') commitName(); if (e.key === 'Escape') setEditingName(false); }}
+          style={{
+            background: 'var(--panel-bg-3)',
+            border: '1px solid var(--purple-border-soft)',
+            borderRadius: 5,
+            color: 'var(--text-main)',
+            fontSize: 13,
+            fontWeight: 600,
+            padding: '3px 8px',
+            width: 160,
+          }}
+        />
+      ) : (
+        <span
+          onClick={startRenameName}
+          title="Click to rename"
+          style={{
+            color: 'var(--text-main)',
+            fontSize: 13,
+            fontWeight: 600,
+            cursor: 'text',
+            maxWidth: 200,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {activeProject?.name ?? 'Untitled'}
         </span>
-        <span style={{ color: 'var(--blue-bright)', fontSize: 16, fontWeight: 300, letterSpacing: '0.06em' }}>
-          VIS
-        </span>
-      </div>
+      )}
 
       <Divider />
 
@@ -135,6 +228,46 @@ function TopBar({ stageRef, layerRef }) {
           </span>
         </div>
       )}
+
+      {!isExporting && (
+        <>
+          <button onClick={() => fileInputRef.current?.click()} style={{
+            background: 'var(--panel-bg-3)',
+            border: '1px solid var(--border-strong)',
+            borderRadius: 8,
+            color: 'var(--text-muted)',
+            padding: '7px 13px',
+            fontSize: 12,
+            fontWeight: 500,
+            cursor: 'pointer',
+            whiteSpace: 'nowrap',
+          }}>
+            Open
+          </button>
+          <button onClick={handleDownload} style={{
+            background: 'var(--panel-bg-3)',
+            border: '1px solid var(--border-strong)',
+            borderRadius: 8,
+            color: 'var(--text-muted)',
+            padding: '7px 13px',
+            fontSize: 12,
+            fontWeight: 500,
+            cursor: 'pointer',
+            whiteSpace: 'nowrap',
+          }}>
+            Download
+          </button>
+          <Divider />
+        </>
+      )}
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".echoproj,.json"
+        style={{ display: 'none' }}
+        onChange={handleOpenFile}
+      />
 
       <button
         onClick={handleGenerate}

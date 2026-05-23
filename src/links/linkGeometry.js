@@ -33,6 +33,17 @@ function tangentOnQuadratic(p0, p1, p2, t) {
   };
 }
 
+function pointOnSegment(segment, t) {
+  if (segment.type === 'line') {
+    return {
+      x: lerp(segment.start.x, segment.end.x, t),
+      y: lerp(segment.start.y, segment.end.y, t),
+    };
+  }
+
+  return pointOnQuadratic(segment.start, segment.control, segment.end, t);
+}
+
 function pointAlong(point, target, distance) {
   const length = dist(point, target);
   if (length < EPSILON || distance <= 0) return { ...point };
@@ -336,9 +347,6 @@ function getEndpointDescriptor(link, node, oppositeNode, allLinks = [], isStart)
   const explicitAnchorId = isStart ? link.fromAnchorId : link.toAnchorId;
   const lockCenter = isStart ? !!link.fromAnchorLockedCenter : !!link.toAnchorLockedCenter;
   const explicitAnchor = explicitAnchorId ? getNodeAnchorById(node, explicitAnchorId) : null;
-  // Always use boundary anchoring — the center fallback caused links to visually
-  // route to the middle of the node by default. 'center' is now an explicit value.
-
   const targetPoint = getEndpointTargetPoint(
     link,
     isStart ? node : oppositeNode,
@@ -352,7 +360,6 @@ function getEndpointDescriptor(link, node, oppositeNode, allLinks = [], isStart)
     y: targetPoint.y - (center.y + offset.y),
   };
 
-  // 'center' is an explicit opt-in — route to the node center.
   if (explicitSide === 'center') {
     return {
       usesBoundaryAnchor: false,
@@ -823,32 +830,103 @@ function getFinalTangent(segments, routePoints) {
   return { x: end.x - start.x, y: end.y - start.y };
 }
 
-export function buildLinkRenderData(link, fromNode, toNode, allLinks = [], allNodes = [], visited = new Set()) {
-  const anchors = (() => {
-    if (!(link.fromJunctionLinkId && link.fromJunctionJointId)) {
-      return getLinkAnchorPoints(link, fromNode, toNode, allLinks, allNodes);
+function pointInNode(point, node) {
+  return (
+    point.x >= node.x - EPSILON &&
+    point.x <= node.x + node.width + EPSILON &&
+    point.y >= node.y - EPSILON &&
+    point.y <= node.y + node.height + EPSILON
+  );
+}
+
+function getVisibleLength(segmentList, toNode, keepHiddenTail) {
+  if (keepHiddenTail) {
+    return segmentList.reduce((sum, segment) => sum + segment.length, 0);
+  }
+
+  let totalLength = segmentList.reduce((sum, segment) => sum + segment.length, 0);
+  let hiddenTailLength = 0;
+
+  for (let index = segmentList.length - 1; index >= 0; index -= 1) {
+    const segment = segmentList[index];
+    const samples = segment.type === 'line' ? 24 : 72;
+    let firstOutsideT = null;
+
+    for (let step = samples; step >= 0; step -= 1) {
+      const t = step / samples;
+      const point = pointOnSegment(segment, t);
+      if (!pointInNode(point, toNode)) {
+        firstOutsideT = t;
+        break;
+      }
     }
 
-    const junctionPoint = resolveLinkJunctionPoint(
-      link.fromJunctionLinkId,
-      link.fromJunctionJointId,
-      allLinks,
-      allNodes,
-      visited
-    );
+    if (firstOutsideT == null) {
+      hiddenTailLength += segment.length;
+      continue;
+    }
 
-    if (!junctionPoint) {
+    if (firstOutsideT >= 1) {
+      break;
+    }
+
+    hiddenTailLength += segment.length * (1 - firstOutsideT);
+    break;
+  }
+
+  return Math.max(0, totalLength - hiddenTailLength);
+}
+
+export function buildLinkRenderData(link, fromNode, toNode, allLinks = [], allNodes = [], visited = new Set()) {
+  const anchors = (() => {
+    const hasFromJunction = !!(link.fromJunctionLinkId && link.fromJunctionJointId);
+    const hasToJunction = !!(link.toJunctionLinkId && link.toJunctionJointId);
+
+    if (!hasFromJunction && !hasToJunction) {
       return getLinkAnchorPoints(link, fromNode, toNode, allLinks, allNodes);
     }
 
     const fallbackAnchors = getLinkAnchorPoints(link, fromNode, toNode, allLinks, allNodes);
-    return {
-      ...fallbackAnchors,
-      start: junctionPoint,
-      startCenter: junctionPoint,
-      offset: { x: 0, y: 0 },
-      sourceAnchors: {},
-    };
+    let result = { ...fallbackAnchors };
+
+    if (hasFromJunction) {
+      const junctionPoint = resolveLinkJunctionPoint(
+        link.fromJunctionLinkId,
+        link.fromJunctionJointId,
+        allLinks,
+        allNodes,
+        visited
+      );
+      if (junctionPoint) {
+        result = {
+          ...result,
+          start: junctionPoint,
+          startCenter: junctionPoint,
+          offset: { x: 0, y: 0 },
+          sourceAnchors: {},
+        };
+      }
+    }
+
+    if (hasToJunction) {
+      const junctionPoint = resolveLinkJunctionPoint(
+        link.toJunctionLinkId,
+        link.toJunctionJointId,
+        allLinks,
+        allNodes,
+        visited
+      );
+      if (junctionPoint) {
+        result = {
+          ...result,
+          end: junctionPoint,
+          endCenter: junctionPoint,
+          targetAnchors: {},
+        };
+      }
+    }
+
+    return result;
   })();
   const routePoints = (() => {
     const joints = (link.joints ?? []).map(joint => ({
@@ -869,6 +947,12 @@ export function buildLinkRenderData(link, fromNode, toNode, allLinks = [], allNo
   const pathData = buildPathData(segments);
   const tangent = getFinalTangent(segments, routePoints);
   const endPoint = routePoints[routePoints.length - 1].point;
+  const totalLength = segments.reduce((sum, segment) => sum + segment.length, 0);
+  const visibleLength = getVisibleLength(
+    segments,
+    toNode,
+    !!(link.showArrowTip || link.toAnchorSide || link.toAnchorId || (link.toJunctionLinkId && link.toJunctionJointId))
+  );
   const jointRenderPoints = routePoints
     .filter(point => point.type !== 'endpoint')
     .map(point => ({
@@ -888,7 +972,8 @@ export function buildLinkRenderData(link, fromNode, toNode, allLinks = [], allNo
     arrowHeadPoints: link.showArrowTip ? getArrowHead(endPoint, tangent) : [endPoint.x, endPoint.y, endPoint.x, endPoint.y, endPoint.x, endPoint.y],
     showArrowTip: !!link.showArrowTip,
     arrowTipMode: link.arrowTipMode ?? 'flow',
-    length: segments.reduce((sum, segment) => sum + segment.length, 0),
+    length: totalLength,
+    visibleLength,
   };
 }
 
@@ -899,12 +984,9 @@ export function getAnimatedArrowHead(renderData, progress) {
 
   const p = clamp(progress, 0, 1);
 
-  // 'end' mode — arrowhead sits at its final position and fades in only after
-  // the line is fully drawn (fades in over the last 15% of animation progress).
   if (renderData.arrowTipMode === 'end') {
     const FADE_START = 0.85;
     const raw = p < FADE_START ? 0 : (p - FADE_START) / (1 - FADE_START);
-    // cubic ease-in so it doesn't pop — slow start, arrives confidently
     const opacity = raw * raw * (3 - 2 * raw);
     return {
       points: renderData.arrowHeadPoints,
@@ -912,10 +994,9 @@ export function getAnimatedArrowHead(renderData, progress) {
     };
   }
 
-  // 'flow' mode — arrowhead rides the visual tip of the dash.
-  // Must use the same dashLength as applyAnimState (length + 2).
-  const dashLength = renderData.length + 2;
-  const traveledLength = Math.min(dashLength * p, renderData.length);
+  const pathLength = renderData.visibleLength ?? renderData.length;
+  const dashLength = pathLength + 2;
+  const traveledLength = Math.min(dashLength * p, pathLength);
   if (traveledLength < EPSILON) {
     return { points: renderData.arrowHeadPoints, opacity: 0 };
   }
@@ -924,6 +1005,16 @@ export function getAnimatedArrowHead(renderData, progress) {
     points: getArrowHead(point, tangent, LINK_POINTER_LENGTH, LINK_POINTER_WIDTH),
     opacity: 1,
   };
+}
+
+// Utility: get the point (and tangent) along this link's path for a given progress (0..1)
+// Optionally uses the visible length (default) to avoid traveling under target nodes.
+export function getPointAtProgress(renderData, progress, useVisibleLength = true) {
+  if (!renderData) return { point: { x: 0, y: 0 }, tangent: { x: 1, y: 0 } };
+  const p = clamp(progress ?? 0, 0, 1);
+  const pathLength = (useVisibleLength ? (renderData.visibleLength ?? renderData.length) : renderData.length) ?? 0;
+  const traveled = Math.min(pathLength * p, pathLength);
+  return getPointAndTangentAtLength(renderData.segments ?? [], traveled);
 }
 
 function distanceToSegment(point, start, end) {

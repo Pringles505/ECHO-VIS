@@ -1,20 +1,39 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { Circle, Group, Line, Path } from 'react-konva';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Circle, Group, Line, Path, Rect, Text } from 'react-konva';
 import { pageColors } from '../../../colorThemes';
 import { buildLinkRenderData, getLinkParallelOffset, getNodeAnchorCandidates, JOINT_HIT_RADIUS } from '../../links/linkGeometry';
 import useStore from '../../store/useStore';
+import { buildWebByLinkId, computeVariableWebs } from '../../variables/flow';
 import { collectGuideMatches, collectVisibleGuides, isSameGuideMatch, SNAP_DISTANCE, UNSNAP_DISTANCE } from './symmetryGuides';
 
 const END_HANDLE_RADIUS = 7;
-const ANCHOR_PAD = 12; // matches CORNER_PAD in linkGeometry.js
+const ANCHOR_PAD = 12;
+
+function getLinkMidpoint(startPoint, jointRenderPoints, endPoint) {
+  const pts = [startPoint, ...jointRenderPoints, endPoint];
+  let totalLen = 0;
+  for (let i = 0; i < pts.length - 1; i++) {
+    totalLen += Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+  }
+  if (totalLen === 0) return { x: (startPoint.x + endPoint.x) / 2, y: (startPoint.y + endPoint.y) / 2 };
+  const half = totalLen / 2;
+  let acc = 0;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const segLen = Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+    if (acc + segLen >= half) {
+      const t = (half - acc) / segLen;
+      return { x: pts[i].x + t * (pts[i + 1].x - pts[i].x), y: pts[i].y + t * (pts[i + 1].y - pts[i].y) };
+    }
+    acc += segLen;
+  }
+  return endPoint;
+}
 const SIDE_CENTER_SNAP = 10;
 const GRID_SPACING = 72;
 const GRID_SNAP_DISTANCE = 10;
 const GRID_UNSNAP_DISTANCE = 18;
 
-// Returns { side, along, point } — snaps to nearest side and slides along it.
 function resolveAnchor(cursor, anchors, node) {
-  // Find nearest anchor (determines which side)
   let best = null;
   for (const [side, anchor] of Object.entries(anchors)) {
     const d = Math.hypot(cursor.x - anchor.x, cursor.y - anchor.y);
@@ -68,6 +87,8 @@ function LinkShape({
   onStartBranchFromJoint,
   onStartAnchorChange,
   onEndAnchorChange,
+  onEndLinkAtJunction,
+  isLinking = false,
   renderPaths = true,
   renderControls = true,
 }) {
@@ -83,7 +104,16 @@ function LinkShape({
   const parallelOffset = getLinkParallelOffset(link, fromNode, toNode, allLinks);
   const sourceAnchors = getNodeAnchorCandidates(fromNode, parallelOffset);
   const targetAnchors = getNodeAnchorCandidates(toNode, parallelOffset);
-  const color = isSelected ? pageColors.blueSelection : isInSelection ? pageColors.purpleAccent : link.stroke;
+  const isFailing = !!link.failing;
+  const color = isSelected ? pageColors.blueSelection
+    : isInSelection ? pageColors.purpleAccent
+    : isFailing ? pageColors.dangerBright
+    : link.stroke;
+  const failSize = Math.max(7, 4 + (link.strokeWidth ?? 2) * 1.4);
+  const failStrokeWidth = Math.max(2, (link.strokeWidth ?? 2) * 0.85);
+  const failMidpoint = isFailing
+    ? getLinkMidpoint(render.startPoint, render.jointRenderPoints, render.endPoint)
+    : null;
   const hasJunctionSource = !!(link.fromJunctionLinkId && link.fromJunctionJointId);
   const [draggedStartPoint, setDraggedStartPoint] = useState(null);
   const [draggedEndPoint, setDraggedEndPoint] = useState(null);
@@ -96,6 +126,35 @@ function LinkShape({
     setDraggedStartPoint(null);
     setDraggedEndPoint(null);
   }, [link.id]);
+
+  // Token appearance: per-variable overrides win, then global simulateOptions,
+  // then hard-coded defaults.
+  const simulateOptions = useStore(state => state.simulateOptions);
+  const ownerVariable = useMemo(() => {
+    const webs = computeVariableWebs(nodes, allLinks);
+    const webByLink = buildWebByLinkId(webs);
+    const web = webByLink[link.id];
+    if (!web) return null;
+    return nodes.find(n => n.id === web.sourceNodeId) ?? null;
+  }, [nodes, allLinks, link.id]);
+  const pick = (key, fallback) => (
+    ownerVariable && ownerVariable[key] != null
+      ? ownerVariable[key]
+      : (simulateOptions?.[key] ?? fallback)
+  );
+  const tokenR = Math.max(2, Math.min(24, pick('tokenSize', 7)));
+  const tokenFill = pick('tokenFill', '#ffffff');
+  const tokenStroke = pick('tokenStroke', pageColors.blueLink);
+  const baseTokenText = simulateOptions?.tokenText ?? '';
+  const varTextOverride = (ownerVariable?.tokenText ?? '').trim();
+  const sourceVar = (fromNode?.variableLabel ?? '').trim();
+  const eff = (link.messageLabel && link.messageLabel.trim())
+    ? link.messageLabel
+    : (varTextOverride || sourceVar || baseTokenText);
+  const effectiveTokenText = eff.slice(0, 6);
+  const tokenTextColor = pick('tokenTextColor', tokenStroke);
+  const tokenTextSize = Math.max(8, Math.min(24, pick('tokenTextSize', 10)));
+  const tokenShape = pick('tokenShape', 'circle');
 
   return (
     <Group>
@@ -126,14 +185,74 @@ function LinkShape({
             id={`link-head-${link.id}`}
             points={render.arrowHeadPoints}
             basePoints={render.arrowHeadPoints}
-            showTip={render.showArrowTip}
+            showTip={render.showArrowTip && !isFailing}
             closed
             fill={color}
             stroke={color}
             strokeWidth={1}
-            opacity={render.showArrowTip ? 1 : 0}
+            opacity={render.showArrowTip && !isFailing ? 1 : 0}
             listening={false}
           />
+
+          {/* Message token (simulation) — moved by applyAnimState when enabled */}
+          <Group id={`link-token-${link.id}`} opacity={0} listening={false}>
+            {tokenShape === 'square' ? (
+              <Rect width={tokenR * 2} height={tokenR * 2} offsetX={tokenR} offsetY={tokenR} fill={tokenFill} stroke={tokenStroke} strokeWidth={2} cornerRadius={3} />
+            ) : tokenShape === 'diamond' ? (
+              <Line points={[0, -tokenR, tokenR, 0, 0, tokenR, -tokenR, 0]} closed fill={tokenFill} stroke={tokenStroke} strokeWidth={2} />
+            ) : (
+              <Circle radius={tokenR} fill={tokenFill} stroke={tokenStroke} strokeWidth={2} />
+            )}
+            {!!effectiveTokenText && (
+              <Text
+                id={`link-token-label-${link.id}`}
+                text={effectiveTokenText}
+                align="center"
+                verticalAlign="middle"
+                offsetX={tokenR}
+                offsetY={tokenR}
+                width={tokenR * 2}
+                height={tokenR * 2}
+                fill={tokenTextColor}
+                fontSize={tokenTextSize}
+                fontFamily="Inter, system-ui, sans-serif"
+                listening={false}
+              />
+            )}
+          </Group>
+
+          {isFailing && failMidpoint && (
+            <Group
+              id={`link-fail-${link.id}`}
+              x={failMidpoint.x}
+              y={failMidpoint.y}
+              listening={false}
+            >
+              <Circle
+                radius={failSize + 6}
+                fill={pageColors.dangerMain}
+                opacity={0.18}
+              />
+              <Circle
+                radius={failSize + 2}
+                stroke={pageColors.dangerBright}
+                strokeWidth={1}
+                opacity={0.35}
+              />
+              <Line
+                points={[-failSize, -failSize, failSize, failSize]}
+                stroke={pageColors.dangerBright}
+                strokeWidth={failStrokeWidth}
+                lineCap="round"
+              />
+              <Line
+                points={[failSize, -failSize, -failSize, failSize]}
+                stroke={pageColors.dangerBright}
+                strokeWidth={failStrokeWidth}
+                lineCap="round"
+              />
+            </Group>
+          )}
         </>
       )}
 
@@ -150,7 +269,7 @@ function LinkShape({
         />
       ))}
 
-      {renderControls && isSelected && Object.entries(targetAnchors).map(([side, anchor]) => (
+      {renderControls && isSelected && !link.toJunctionLinkId && Object.entries(targetAnchors).map(([side, anchor]) => (
         <Circle
           key={`anchor-${link.id}-${side}`}
           x={anchor.x}
@@ -240,6 +359,32 @@ function LinkShape({
           />
         </Group>
       )}
+
+      {isLinking && !isSelected && (link.joints ?? []).filter(j => j.isJunction).map((joint) => {
+        const renderJoint = renderJointMap[joint.id] ?? joint;
+        const visibleRadius = Math.max(4, joint.size ?? 4);
+        return (
+          <Group key={`jt-drop-${joint.id}`} x={renderJoint.x} y={renderJoint.y}>
+            <Circle
+              radius={JOINT_HIT_RADIUS + 4}
+              fill={pageColors.blackHitArea}
+              strokeEnabled={false}
+              onMouseUp={(e) => {
+                e.cancelBubble = true;
+                onEndLinkAtJunction?.(link.id, joint.id);
+              }}
+            />
+            <Circle
+              radius={visibleRadius}
+              fill={pageColors.purpleAccent}
+              stroke={pageColors.purpleBorderStrong}
+              strokeWidth={2}
+              opacity={0.55}
+              listening={false}
+            />
+          </Group>
+        );
+      })}
 
       {renderControls && isSelected && (link.joints ?? []).map((joint) => {
         const isJointSelected = selectedJointId === joint.id;

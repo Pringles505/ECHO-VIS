@@ -2,10 +2,19 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Layer, Line, Rect, Stage } from 'react-konva';
 import { v4 as uuid } from 'uuid';
 import { pageColors } from '../../../colorThemes';
+import { AnimationEngine } from '../../animation/AnimationEngine';
 import { buildLinkRenderData, getLinkParallelOffset, getNodeAnchorPoint, resolveLinkJunctionPoint } from '../../links/linkGeometry';
+import { buildMirrorBindings, isMirrorNode, MIRROR_PADDING } from '../../mirror/mirrorData';
+import { isAreaNode, isSubdiagramNode } from '../../store/useStore';
+import { normalizeTextMorphList } from '../../text/textMorphs';
 import useStore from '../../store/useStore';
+import AreaShape from './AreaShape';
 import LinkShape from './LinkShape';
+import MirrorShape from './MirrorShape';
 import NodeShape from './NodeShape';
+import MonitorShape from './MonitorShape';
+import SubdiagramShape from './SubdiagramShape';
+import SubdiagramOverlay from '../SubdiagramOverlay';
 
 const MIN_SCALE = 0.15;
 const MAX_SCALE = 4;
@@ -44,7 +53,11 @@ function isCanvasBackgroundShape(shape) {
   return !shape || shape.id?.() === 'background';
 }
 
-function DiagramCanvas({ stageRef, layerRef }) {
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function DiagramCanvas({ stageRef, layerRef, playback }) {
   const {
     nodes,
     links,
@@ -68,34 +81,66 @@ function DiagramCanvas({ stageRef, layerRef }) {
     updateLink,
     updateLinkJoint,
     updateNode,
+    updateMirrorNodeOverride,
     setContextMenu,
     deleteSelected,
     showGridLines,
     symmetryGuides,
+    pendingMorphEdit,
+    setPendingMorphEdit,
+    expandedSubdiagramId,
+    setExpandedSubdiagramId,
   } = useStore();
+  const playbackTime = playback?.currentTime ?? 0;
+  const playbackTimeline = playback?.timeline ?? [];
+  // Ref-copy of expandedSubdiagramId so the frame callback doesn't capture a stale closure
+  const expandedIdRef = useRef(null);
+  // Keep expandedIdRef in sync so the frame callback never captures a stale value
+  expandedIdRef.current = expandedSubdiagramId ?? null;
 
   const [scale, setScale] = useState(1);
   const [stagePos, setStagePos] = useState({ x: 0, y: 0 });
   const [rubberEnd, setRubberEnd] = useState({ x: 0, y: 0 });
   const [editingNodeId, setEditingNodeId] = useState(null);
   const [editingLabel, setEditingLabel] = useState('');
-  const [selectionBox, setSelectionBox] = useState(null); // rubber-band rect in canvas coords
+  const [editingMirror, setEditingMirror] = useState(null);
+  const [editingMorph, setEditingMorph] = useState(null); // { nodeId, morphId }
+  const [selectionBox, setSelectionBox] = useState(null);
+  const [popupOverlayState, setPopupOverlayState] = useState(null);
+  // Ref to the SubdiagramOverlay so we can drive its time imperatively at 60fps
+  const subdiagramOverlayRef = useRef(null);
+  // Tracks which popup window is currently active (without React state)
+  const currentActivePopupRef = useRef(null);
   const containerRef = useRef(null);
   const renameInputRef = useRef(null);
   const lastPointerCanvasRef = useRef(null);
   const [dims, setDims] = useState({ w: 800, h: 600 });
 
-  // Consumed by handleStageClick to suppress clear-selection after a rubber-band drag
+  const getNodeScreenRect = useCallback((node) => {
+    const width = (node.width ?? 150) * scale;
+    const height = (node.height ?? 52) * scale;
+    return {
+      x: stagePos.x + node.x * scale,
+      y: stagePos.y + node.y * scale,
+      width,
+      height,
+    };
+  }, [scale, stagePos]);
+
   const rbWasDragRef = useRef(false);
 
-  // Group-drag refs
   const groupDragBaseRef  = useRef({});
+  const selectedIdRef     = useRef(selectedId);
   const selectedIdsRef    = useRef(selectedIds);
   const nodesRef          = useRef(nodes);
+  const dragNodesRef      = useRef(nodes);
+  const linkNodesRef      = useRef([]);
   const linksRef          = useRef(links);
   const linkingFromRef    = useRef(linkingFrom);
+  useEffect(() => { selectedIdRef.current = selectedId; }, [selectedId]);
   useEffect(() => { selectedIdsRef.current = selectedIds; }, [selectedIds]);
   useEffect(() => { nodesRef.current = nodes; }, [nodes]);
+  useEffect(() => { dragNodesRef.current = nodes; }, [nodes]);
   useEffect(() => { linksRef.current = links; }, [links]);
   useEffect(() => { linkingFromRef.current = linkingFrom; }, [linkingFrom]);
 
@@ -108,16 +153,13 @@ function DiagramCanvas({ stageRef, layerRef }) {
     return () => obs.disconnect();
   }, []);
 
-  // Native rubber-band (left-drag on empty canvas) + middle-mouse pan
-  // Uses native DOM events to avoid Konva event propagation issues entirely.
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
-    // All rubber-band + pan state is local — no stale closure risk
-    let rb = null;       // { x1,y1,x2,y2 } in canvas coords while dragging
+    let rb = null;
     let rbActive = false;
-    let pan = null;      // { clientX, clientY, stageX, stageY }
+    let pan = null;
 
     const stageXY = (clientX, clientY) => {
       const rect = container.getBoundingClientRect();
@@ -144,7 +186,6 @@ function DiagramCanvas({ stageRef, layerRef }) {
       }
       if (e.button !== 0) return;
       if (linkingFromRef.current) return;
-      // Start rubber band only if pointer is over empty canvas (no Konva shape)
       const sc = stageXY(e.clientX, e.clientY);
       const shape = stageRef.current.getIntersection(sc);
       if (!isCanvasBackgroundShape(shape)) return;
@@ -201,7 +242,6 @@ function DiagramCanvas({ stageRef, layerRef }) {
           );
           const allIds = [...hitNodes.map(n => n.id), ...hitLinks.map(l => l.id)];
           if (allIds.length) {
-            // Use getState() so we don't need these in deps
             useStore.getState().setSelectedIds(allIds);
             useStore.getState().addToSelection(hitNodes[0]?.id ?? hitLinks[0]?.id ?? null);
           } else {
@@ -220,7 +260,7 @@ function DiagramCanvas({ stageRef, layerRef }) {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
     };
-  }, []); // empty deps — all live state read via refs or stageRef.current
+  }, []);
 
   useEffect(() => {
     const onKey = (e) => {
@@ -245,6 +285,150 @@ function DiagramCanvas({ stageRef, layerRef }) {
     () => nodes.find(node => node.id === editingNodeId) ?? null,
     [editingNodeId, nodes]
   );
+  const mirrorBindings = useMemo(() => buildMirrorBindings(nodes, links), [nodes, links]);
+  const mirrorBindingById = useMemo(
+    () => Object.fromEntries(mirrorBindings.bindings.map(binding => [binding.mirrorId, binding])),
+    [mirrorBindings.bindings]
+  );
+  const playbackNodeEventsById = useMemo(
+    () => Object.fromEntries(
+      playbackTimeline
+        .filter(event => event.type === 'node')
+        .map(event => [event.id, event])
+    ),
+    [playbackTimeline]
+  );
+  const playbackLinkEventsById = useMemo(
+    () => Object.fromEntries(
+      playbackTimeline
+        .filter(event => event.type === 'link')
+        .map(event => [event.id, event])
+    ),
+    [playbackTimeline]
+  );
+  // Compute popup windows once per node/event change — NOT per frame.
+  // Creating AnimationEngines here means we pay the cost only when the diagram changes,
+  // not on every playback tick.
+  const popupWindows = useMemo(() => {
+    if (expandedSubdiagramId) return [];
+    return nodes
+      .filter(node =>
+        isSubdiagramNode(node) &&
+        ((node.showPopupInPlayback ?? node.showPreviewInPlayback) === true) &&
+        (node.snapshotNodes?.length ?? 0) > 0
+      )
+      .map(node => {
+        const event = playbackNodeEventsById[node.id];
+        if (!event) return null;
+        const triggerLinkEvent = node.triggerAfterLinkId
+          ? playbackLinkEventsById[node.triggerAfterLinkId]
+          : null;
+        const nestedEngine = new AnimationEngine(node.snapshotNodes ?? [], node.snapshotLinks ?? [], {
+          ancestorSubdiagramIds: [node.id],
+        });
+        const popupDelay = Math.max(0, node.popupDelay ?? 0);
+        const popupPlaybackSpeed = Math.max(0.25, node.popupPlaybackSpeed ?? 1);
+        const popupHold = Math.max(0, node.popupHold ?? 0);
+        const popupStart = Math.max(
+          event.start + popupDelay,
+          triggerLinkEvent ? triggerLinkEvent.start + triggerLinkEvent.duration + popupDelay : -Infinity
+        );
+        const nestedContentDuration = nestedEngine.getContentDuration();
+        const popupEnd = popupStart + nestedContentDuration / popupPlaybackSpeed + popupHold;
+        return {
+          node,
+          event,
+          popupStart,
+          popupEnd,
+          popupPlaybackSpeed,
+          nestedContentDuration,
+          sourceRect: getNodeScreenRect(node),
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.event.start - a.event.start || a.node.id.localeCompare(b.node.id));
+  }, [expandedSubdiagramId, getNodeScreenRect, nodes, playbackLinkEventsById, playbackNodeEventsById]);
+
+  // Determine which popup window (if any) is active at the current React-state time.
+  // Only used for popup IDENTITY changes (show/hide); per-frame time updates go via ref.
+  const activeSubdiagramPopup = useMemo(() => {
+    return popupWindows.find(w => playbackTime >= w.popupStart && playbackTime <= w.popupEnd) ?? null;
+  }, [popupWindows, playbackTime]);
+
+  // Ref-copy of activeSubdiagramPopupTime — read inside the effect to get the initial
+  // nested time when a popup first appears, without making it an effect dependency.
+  const popupTimeRef = useRef(null);
+  popupTimeRef.current = activeSubdiagramPopup
+    ? clamp(
+        (playbackTime - activeSubdiagramPopup.popupStart) * activeSubdiagramPopup.popupPlaybackSpeed,
+        0,
+        activeSubdiagramPopup.nestedContentDuration
+      )
+    : null;
+
+  // React state is only updated when popup IDENTITY changes (a different popup appears or
+  // disappears). Per-frame time changes are driven imperatively via frameCallbackRef → setTime().
+  // This means setPopupOverlayState fires rarely, not every animation frame.
+  useEffect(() => {
+    if (expandedSubdiagramId) {
+      currentActivePopupRef.current = null;
+      setPopupOverlayState(null);
+      return;
+    }
+
+    if (activeSubdiagramPopup) {
+      if (currentActivePopupRef.current?.node.id !== activeSubdiagramPopup.node.id) {
+        // New popup — show it with the current time as its initial controlled position
+        currentActivePopupRef.current = activeSubdiagramPopup;
+        setPopupOverlayState({
+          node: activeSubdiagramPopup.node,
+          controlledTime: popupTimeRef.current,
+          visible: true,
+          sourceRect: activeSubdiagramPopup.sourceRect ?? null,
+        });
+      }
+      // Same popup still active — time updates handled imperatively via frameCallback
+      return;
+    }
+
+    if (currentActivePopupRef.current) {
+      currentActivePopupRef.current = null;
+      setPopupOverlayState((current) => (current ? { ...current, visible: false } : null));
+    }
+  }, [activeSubdiagramPopup, expandedSubdiagramId]); // NOT time-dependent — fires only on identity changes
+
+  // Wire up the per-frame callback so the overlay is driven at full 60fps without React re-renders.
+  // Uses subdiagramFrameCallbackRef (not frameCallbackRef) to avoid clobbering the KeyframePanel
+  // playhead callback which also registers on frameCallbackRef.
+  useEffect(() => {
+    const frameCallback = playback?.subdiagramFrameCallbackRef;
+    if (!frameCallback) return undefined;
+
+    frameCallback.current = (t) => {
+      if (expandedIdRef.current) return;
+      const popup = currentActivePopupRef.current;
+      if (!popup) return;
+      if (t < popup.popupStart || t > popup.popupEnd) return;
+      const nestedT = clamp(
+        (t - popup.popupStart) * popup.popupPlaybackSpeed,
+        0,
+        popup.nestedContentDuration
+      );
+      subdiagramOverlayRef.current?.setTime(nestedT);
+    };
+
+    return () => { frameCallback.current = null; };
+  }, [playback?.subdiagramFrameCallbackRef]); // stable — all runtime values read from refs
+  const allNodes = useMemo(
+    () => [...nodes.filter(n => !isAreaNode(n)), ...mirrorBindings.bindings.flatMap(b => b.childNodes)],
+    [nodes, mirrorBindings.bindings]
+  );
+  const dragNodes = useMemo(
+    () => [...nodes, ...mirrorBindings.bindings.flatMap(b => b.childNodes)],
+    [nodes, mirrorBindings.bindings]
+  );
+  useEffect(() => { dragNodesRef.current = dragNodes; }, [dragNodes]);
+  useEffect(() => { linkNodesRef.current = allNodes; }, [allNodes]);
   const gridStyle = useMemo(() => {
     const gridPx = Math.max(12, Math.round(GRID_SPACING * scale));
     const offsetX = ((stagePos.x % gridPx) + gridPx) % gridPx;
@@ -269,10 +453,33 @@ function DiagramCanvas({ stageRef, layerRef }) {
   }, [editingNode]);
 
   useEffect(() => {
-    if (!editingNode) return;
+    if (!pendingMorphEdit) return;
+    const { nodeId, morphId } = pendingMorphEdit;
+    setPendingMorphEdit(null, null);
+    setEditingMorph({ nodeId, morphId });
+    setEditingLabel('');
+  }, [pendingMorphEdit, setPendingMorphEdit]);
+
+  useEffect(() => {
+    if (!editingNode && !editingMirror && !editingMorph) return;
     renameInputRef.current?.focus();
     renameInputRef.current?.select();
-  }, [editingNode]);
+  }, [editingNode, editingMirror, editingMorph]);
+
+  useEffect(() => {
+    for (const binding of mirrorBindings.bindings) {
+      const mirrorNode = nodes.find(node => node.id === binding.mirrorId);
+      if (!mirrorNode) continue;
+      const widthDiff = Math.abs((mirrorNode.width ?? 0) - binding.frameWidth);
+      const heightDiff = Math.abs((mirrorNode.height ?? 0) - binding.frameHeight);
+      if (widthDiff > 0.5 || heightDiff > 0.5) {
+        updateNode(binding.mirrorId, {
+          width: binding.frameWidth,
+          height: binding.frameHeight,
+        });
+      }
+    }
+  }, [mirrorBindings.bindings, nodes, updateNode]);
 
   const toCanvas = useCallback((screenPt) => ({
     x: (screenPt.x - stagePos.x) / scale,
@@ -303,6 +510,8 @@ function DiagramCanvas({ stageRef, layerRef }) {
     setLinkingFrom(null);
     setContextMenu(null);
     setEditingNodeId(null);
+    setEditingMirror(null);
+    setEditingMorph(null);
   }, [setContextMenu, setLinkingFrom, setSelected, setSelectedJoint]);
 
   const handleNodeSelect = useCallback((nodeId, shiftHeld) => {
@@ -326,7 +535,31 @@ function DiagramCanvas({ stageRef, layerRef }) {
 
   const cancelNodeRename = useCallback(() => {
     setEditingNodeId(null);
+    setEditingMirror(null);
+    setEditingMorph(null);
   }, []);
+
+  const commitMirrorRename = useCallback(() => {
+    if (!editingMirror) return;
+    const nextLabel = editingLabel.trim();
+    if (nextLabel !== editingMirror.initialLabel) {
+      updateMirrorNodeOverride(editingMirror.mirrorId, editingMirror.sourceNodeId, { label: nextLabel });
+    }
+    setEditingMirror(null);
+  }, [editingLabel, editingMirror, updateMirrorNodeOverride]);
+
+  const commitMorphTextEdit = useCallback(() => {
+    if (!editingMorph) return;
+    const { nodeId, morphId } = editingMorph;
+    const node = nodes.find(n => n.id === nodeId);
+    if (node) {
+      const nextMorphs = normalizeTextMorphList(
+        (node.textMorphs ?? []).map(m => m.id === morphId ? { ...m, text: editingLabel } : m)
+      );
+      updateNode(nodeId, { textMorphs: nextMorphs });
+    }
+    setEditingMorph(null);
+  }, [editingLabel, editingMorph, nodes, updateNode]);
 
   const handleStageClick = useCallback((e) => {
     if (rbWasDragRef.current) { rbWasDragRef.current = false; return; }
@@ -347,14 +580,12 @@ function DiagramCanvas({ stageRef, layerRef }) {
 
   const handleContextMenu = useCallback((e) => {
     e.evt.preventDefault();
-    // Only open canvas menu on background right-click
     const sc = stageRef.current.getPointerPosition();
     const shape = stageRef.current.getIntersection(sc);
     if (!isCanvasBackgroundShape(shape)) return;
     openCanvasMenu(sc);
   }, [openCanvasMenu, stageRef]);
 
-  // Only used for tracking the rubber-end line while drawing a link
   const handleMouseMove = useCallback(() => {
     const pointer = stageRef.current.getPointerPosition();
     if (!pointer) return;
@@ -363,37 +594,84 @@ function DiagramCanvas({ stageRef, layerRef }) {
     if (linkingFrom) setRubberEnd(canvasPoint);
   }, [linkingFrom, stageRef, toCanvas]);
 
-  // End link creation when mouse released over empty canvas
   const handleMouseUp = useCallback((e) => {
     if (e.evt.button === 0 && linkingFrom) setLinkingFrom(null);
   }, [linkingFrom, setLinkingFrom]);
 
-  // Group-drag handlers — called by NodeShape when it moves while part of a multi-selection
   const handleGroupDragStart = useCallback((draggedId) => {
-    const base = {};
-    for (const id of selectedIdsRef.current) {
-      if (id === draggedId) continue;
-      const n = nodesRef.current.find(node => node.id === id);
-      if (n) base[id] = { x: n.x, y: n.y };
+    const nodeBase = {};
+    const jointBase = {};
+    const dragNodeList = dragNodesRef.current;
+    const storeNodes = nodesRef.current;
+    const selectedSourceIds = [...new Set([...selectedIdsRef.current, selectedIdRef.current].filter(Boolean))];
+    const pointInArea = (point, area) => (
+      point.x >= area.x &&
+      point.x <= area.x + area.width &&
+      point.y >= area.y &&
+      point.y <= area.y + area.height
+    );
+
+    const selectedNodes = new Set();
+    for (const id of selectedSourceIds) {
+      if (dragNodeList.find(n => n.id === id)) selectedNodes.add(id);
     }
-    groupDragBaseRef.current = base;
+
+    for (const id of selectedNodes) {
+      if (id !== draggedId) {
+        const n = dragNodeList.find(node => node.id === id);
+        if (n) nodeBase[id] = { x: n.x, y: n.y };
+      }
+    }
+
+    const draggedNode = storeNodes.find(node => node.id === draggedId) ?? dragNodeList.find(node => node.id === draggedId);
+    const selectedAreas = [...selectedNodes]
+      .map(id => storeNodes.find(item => item.id === id))
+      .filter(isAreaNode);
+    const hasSelectedArea = selectedAreas.length > 0;
+
+    // Collect joints for selected links.
+    // If an area is involved, only move joints for links explicitly selected by the user.
+    // Area selections also carry any joints spatially inside the selected area bounds.
+    const selectedSet = new Set(selectedSourceIds);
+    for (const link of linksRef.current) {
+      const bothSelected = selectedNodes.has(link.fromId) && selectedNodes.has(link.toId);
+      const linkSelected = selectedSet.has(link.id);
+      const jointsInSelectedAreas = (link.joints ?? []).filter(joint =>
+        selectedAreas.some(area => pointInArea(joint, area))
+      );
+      const shouldMoveAllJoints = linkSelected || ((!isAreaNode(draggedNode) && !hasSelectedArea) && bothSelected);
+      const jointsToMove = shouldMoveAllJoints ? (link.joints ?? []) : jointsInSelectedAreas;
+      if (jointsToMove.length) {
+        jointBase[link.id] = {};
+        for (const joint of jointsToMove) {
+          jointBase[link.id][joint.id] = { x: joint.x, y: joint.y };
+        }
+      }
+    }
+
+    groupDragBaseRef.current = { nodes: nodeBase, joints: jointBase };
   }, []);
 
   const handleGroupDragMove = useCallback((draggedId, dx, dy) => {
-    for (const [id, pos] of Object.entries(groupDragBaseRef.current)) {
+    const base = groupDragBaseRef.current;
+    for (const [id, pos] of Object.entries(base.nodes ?? {})) {
       updateNode(id, { x: pos.x + dx, y: pos.y + dy });
     }
-  }, [updateNode]);
+    for (const [linkId, joints] of Object.entries(base.joints ?? {})) {
+      for (const [jointId, pos] of Object.entries(joints)) {
+        updateLinkJoint(linkId, jointId, { x: pos.x + dx, y: pos.y + dy });
+      }
+    }
+  }, [updateNode, updateLinkJoint]);
 
   const addJointAtCanvasPoint = useCallback((linkId, canvasPoint) => {
     const link = linksRef.current.find(l => l.id === linkId);
     if (!link) return;
-    const fromNode = nodesRef.current.find(n => n.id === link.fromId);
-    const toNode   = nodesRef.current.find(n => n.id === link.toId);
+    const fromNode = linkNodesRef.current.find(n => n.id === link.fromId);
+    const toNode   = linkNodesRef.current.find(n => n.id === link.toId);
     if (!fromNode || !toNode) return;
-    const render = buildLinkRenderData(link, fromNode, toNode, linksRef.current, nodesRef.current);
+    const render = buildLinkRenderData(link, fromNode, toNode, linksRef.current, linkNodesRef.current);
     const parallelOffset = getLinkParallelOffset(link, fromNode, toNode, linksRef.current);
-    // Ordered waypoints in rendered space: start, joint render points, end
     const waypoints = [render.startPoint, ...render.jointRenderPoints, render.endPoint];
     let bestDist = Infinity, bestIdx = 0;
     for (let i = 0; i < waypoints.length - 1; i++) {
@@ -416,7 +694,7 @@ function DiagramCanvas({ stageRef, layerRef }) {
   }, [addLinkJoint]);
 
   const handleStartLink = useCallback((nodeId, side = null) => {
-    const node = nodes.find(item => item.id === nodeId);
+    const node = allNodes.find(item => item.id === nodeId);
     if (node) {
       const center = { x: node.x + node.width / 2, y: node.y + node.height / 2 };
       const anchor = side
@@ -425,7 +703,49 @@ function DiagramCanvas({ stageRef, layerRef }) {
       setRubberEnd(anchor);
     }
     setLinkingFrom({ type: 'node', nodeId, ...(side ?? {}) });
-  }, [nodes, setLinkingFrom]);
+  }, [allNodes, setLinkingFrom]);
+
+  const handleEndLinkAtJunction = useCallback((junctionLinkId, junctionJointId) => {
+    if (!linkingFrom) return;
+    const parentLink = links.find(l => l.id === junctionLinkId);
+    if (!parentLink) { setLinkingFrom(null); return; }
+
+    const toId = parentLink.toId;
+    const junctionOverrides = {
+      toJunctionLinkId: junctionLinkId,
+      toJunctionJointId: junctionJointId,
+      toAnchorSide: null,
+      toAnchorLockedCenter: false,
+      toAlongPos: 0,
+      toAnchorId: null,
+    };
+
+    if (linkingFrom.type === 'junction') {
+      if (linkingFrom.fromNodeId) {
+        const parentLinkOfFrom = links.find(l => l.id === linkingFrom.linkId);
+        const parentJoint = parentLinkOfFrom?.joints?.find(j => j.id === linkingFrom.jointId) ?? null;
+        addLink(linkingFrom.fromNodeId, toId, {
+          fromJunctionLinkId: linkingFrom.linkId,
+          fromJunctionJointId: linkingFrom.jointId,
+          syncGroupKey: parentJoint?.syncBranches ? `${linkingFrom.linkId}::${linkingFrom.jointId}` : null,
+          fromAnchorSide: null,
+          fromAnchorLockedCenter: false,
+          fromAlongPos: 0,
+          fromAnchorId: null,
+          ...junctionOverrides,
+        });
+      }
+    } else if (linkingFrom.type === 'node') {
+      addLink(linkingFrom.nodeId, toId, {
+        fromAnchorSide: linkingFrom.side ?? null,
+        fromAnchorLockedCenter: !!linkingFrom.centered,
+        fromAlongPos: linkingFrom.along ?? 0,
+        fromAnchorId: linkingFrom.anchorId ?? null,
+        ...junctionOverrides,
+      });
+    }
+    setLinkingFrom(null);
+  }, [addLink, linkingFrom, links, setLinkingFrom]);
 
   const handleStartJunctionLink = useCallback((linkId, jointId) => {
     const parentLink = links.find(item => item.id === linkId);
@@ -512,6 +832,29 @@ function DiagramCanvas({ stageRef, layerRef }) {
     });
   }, [setContextMenu, setSelected, stageRef, toCanvas]);
 
+  const handleResizeMirror = useCallback((mirrorId, nextWidth, nextHeight, binding) => {
+    const sourceWidth = Math.max(1, binding?.sourceWidth ?? 1);
+    const sourceHeight = Math.max(1, binding?.sourceHeight ?? 1);
+
+    if (!binding?.childNodes?.length) {
+      updateNode(mirrorId, {
+        width: nextWidth,
+        height: nextHeight,
+      });
+      return;
+    }
+
+    const availableWidth = Math.max(24, nextWidth - MIRROR_PADDING * 2);
+    const availableHeight = Math.max(24, nextHeight - MIRROR_PADDING * 2);
+    const mirrorScale = Math.max(0.1, Math.min(availableWidth / sourceWidth, availableHeight / sourceHeight));
+
+    updateNode(mirrorId, {
+      mirrorScale,
+      width: Math.max(180, sourceWidth * mirrorScale + MIRROR_PADDING * 2),
+      height: Math.max(120, sourceHeight * mirrorScale + MIRROR_PADDING * 2),
+    });
+  }, [updateNode]);
+
   const handleJointContextMenu = useCallback((e, linkId, jointId) => {
     e.evt.preventDefault();
     const stage = stageRef.current;
@@ -532,11 +875,11 @@ function DiagramCanvas({ stageRef, layerRef }) {
   }, [setContextMenu, setSelected, setSelectedJoint, stageRef, toCanvas]);
 
   const linkingNode = linkingFrom?.type === 'node'
-    ? nodes.find(node => node.id === linkingFrom.nodeId)
+    ? allNodes.find(node => node.id === linkingFrom.nodeId)
     : null;
   const selectedLink = links.find(link => link.id === selectedId) ?? null;
-  const selectedLinkFromNode = selectedLink ? nodes.find(node => node.id === selectedLink.fromId) : null;
-  const selectedLinkToNode = selectedLink ? nodes.find(node => node.id === selectedLink.toId) : null;
+  const selectedLinkFromNode = selectedLink ? allNodes.find(node => node.id === selectedLink.fromId) : null;
+  const selectedLinkToNode = selectedLink ? allNodes.find(node => node.id === selectedLink.toId) : null;
   const linkingStart = linkingFrom?.type === 'junction'
     ? resolveLinkJunctionPoint(linkingFrom.linkId, linkingFrom.jointId, links, nodes)
     : linkingNode
@@ -578,9 +921,22 @@ function DiagramCanvas({ stageRef, layerRef }) {
             listening
           />
 
+          {nodes.filter(isAreaNode).map(area => (
+            <AreaShape
+              key={area.id}
+              area={area}
+              isSelected={selectedId === area.id}
+              isInSelection={selectedIds.includes(area.id)}
+              onSelect={(shiftHeld) => handleNodeSelect(area.id, shiftHeld)}
+              onContextMenu={handleNodeContextMenu}
+              onGroupDragStart={handleGroupDragStart}
+              onGroupDragMove={handleGroupDragMove}
+            />
+          ))}
+
           {links.map((link) => {
-            const fromNode = nodes.find(node => node.id === link.fromId);
-            const toNode = nodes.find(node => node.id === link.toId);
+            const fromNode = allNodes.find(node => node.id === link.fromId);
+            const toNode = allNodes.find(node => node.id === link.toId);
             if (!fromNode || !toNode) return null;
 
             return (
@@ -601,6 +957,8 @@ function DiagramCanvas({ stageRef, layerRef }) {
                 }}
                 onJointContextMenu={(e, jointId) => handleJointContextMenu(e, link.id, jointId)}
                 onStartBranchFromJoint={(jointId) => handleStartJunctionLink(link.id, jointId)}
+                onEndLinkAtJunction={handleEndLinkAtJunction}
+                isLinking={!!linkingFrom}
                 onJointDragStart={(jointId) => {
                   setSelected(link.id);
                   setSelectedJoint(jointId);
@@ -626,22 +984,94 @@ function DiagramCanvas({ stageRef, layerRef }) {
             );
           })}
 
-          {nodes.map(node => (
-            <NodeShape
-              key={node.id}
-              node={node}
-              isSelected={selectedId === node.id}
-              isInSelection={selectedIds.includes(node.id)}
-              onSelect={(shiftHeld) => handleNodeSelect(node.id, shiftHeld)}
-              onStartLink={handleStartLink}
-              onEndLink={handleEndLink}
-              onRenameStart={(nodeId) => setEditingNodeId(nodeId)}
-              onContextMenu={handleNodeContextMenu}
-              isLinking={!!linkingFrom}
-              onGroupDragStart={handleGroupDragStart}
-              onGroupDragMove={handleGroupDragMove}
-            />
-          ))}
+          {nodes.filter(isMirrorNode).map(node => {
+            const binding = mirrorBindingById[node.id];
+            if (!binding) return null;
+            return (
+              <MirrorShape
+                key={node.id}
+                mirror={node}
+                binding={binding}
+                isSelected={selectedId === node.id}
+                isInSelection={selectedIds.includes(node.id)}
+                onSelect={(shiftHeld) => handleNodeSelect(node.id, shiftHeld)}
+                onContextMenu={handleNodeContextMenu}
+                onGroupDragStart={handleGroupDragStart}
+                onGroupDragMove={handleGroupDragMove}
+                onSelectSourceNode={handleNodeSelect}
+                onSelectSourceLink={handleLinkSelectWithShift}
+                onSourceNodeContextMenu={handleNodeContextMenu}
+                onSourceLinkContextMenu={handleLinkContextMenu}
+                onMirrorNodeRename={(mirrorId, sourceNodeId, childNode) => {
+                  const mirrorNode = nodes.find(n => n.id === mirrorId);
+                  const override = mirrorNode?.mirrorNodeOverrides?.[sourceNodeId] ?? {};
+                  const sourceNode = nodes.find(n => n.id === sourceNodeId);
+                  const initialLabel = override.label ?? sourceNode?.label ?? '';
+                  setEditingLabel(initialLabel);
+                  setEditingMirror({ mirrorId, sourceNodeId, childNode, initialLabel });
+                }}
+                onStartSourceLink={handleStartLink}
+                onEndSourceLink={handleEndLink}
+                selectedSourceId={selectedId}
+                selectedSourceIds={selectedIds}
+                isLinking={!!linkingFrom}
+                onResizeMirror={handleResizeMirror}
+                onSourceGroupDragStart={handleGroupDragStart}
+                onSourceGroupDragMove={handleGroupDragMove}
+              />
+            );
+          })}
+
+          {nodes.map(node => {
+            if (isMirrorNode(node) || isAreaNode(node)) return null;
+            if (isSubdiagramNode(node)) return (
+              <SubdiagramShape
+                key={node.id}
+                node={node}
+                isSelected={selectedId === node.id}
+                isInSelection={selectedIds.includes(node.id)}
+                onSelect={(shiftHeld) => handleNodeSelect(node.id, shiftHeld)}
+                onStartLink={handleStartLink}
+                onEndLink={handleEndLink}
+                onContextMenu={handleNodeContextMenu}
+                isLinking={!!linkingFrom}
+                onGroupDragStart={handleGroupDragStart}
+                onGroupDragMove={handleGroupDragMove}
+                onExpand={() => setExpandedSubdiagramId(node.id)}
+              />
+            );
+            if (node.type === 'monitor') return (
+              <MonitorShape
+                key={node.id}
+                node={node}
+                isSelected={selectedId === node.id}
+                isInSelection={selectedIds.includes(node.id)}
+                onSelect={(shiftHeld) => handleNodeSelect(node.id, shiftHeld)}
+                onStartLink={handleStartLink}
+                onEndLink={handleEndLink}
+                onContextMenu={handleNodeContextMenu}
+                isLinking={!!linkingFrom}
+                onGroupDragStart={handleGroupDragStart}
+                onGroupDragMove={handleGroupDragMove}
+              />
+            );
+            return (
+              <NodeShape
+                key={node.id}
+                node={node}
+                isSelected={selectedId === node.id}
+                isInSelection={selectedIds.includes(node.id)}
+                onSelect={(shiftHeld) => handleNodeSelect(node.id, shiftHeld)}
+                onStartLink={handleStartLink}
+                onEndLink={handleEndLink}
+                onRenameStart={(nodeId) => setEditingNodeId(nodeId)}
+                onContextMenu={handleNodeContextMenu}
+                isLinking={!!linkingFrom}
+                onGroupDragStart={handleGroupDragStart}
+                onGroupDragMove={handleGroupDragMove}
+              />
+            );
+          })}
 
           {selectedLink && selectedLinkFromNode && selectedLinkToNode && (
             <LinkShape
@@ -660,6 +1090,8 @@ function DiagramCanvas({ stageRef, layerRef }) {
               }}
               onJointContextMenu={(e, jointId) => handleJointContextMenu(e, selectedLink.id, jointId)}
               onStartBranchFromJoint={(jointId) => handleStartJunctionLink(selectedLink.id, jointId)}
+              onEndLinkAtJunction={handleEndLinkAtJunction}
+              isLinking={!!linkingFrom}
               onJointDragStart={(jointId) => {
                 setSelected(selectedLink.id);
                 setSelectedJoint(jointId);
@@ -679,6 +1111,8 @@ function DiagramCanvas({ stageRef, layerRef }) {
                 toAnchorLockedCenter: !!centered,
                 toAlongPos: along,
                 toAnchorId: null,
+                toJunctionLinkId: null,
+                toJunctionJointId: null,
               })}
               renderPaths={false}
             />
@@ -765,40 +1199,71 @@ function DiagramCanvas({ stageRef, layerRef }) {
         {Math.round(scale * 100)}%
       </div>
 
-      {editingNode && (
-        <input
-          ref={renameInputRef}
-          value={editingLabel}
-          onChange={(e) => setEditingLabel(e.target.value)}
-          onBlur={commitNodeRename}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') {
-              e.preventDefault();
-              commitNodeRename();
-            }
-            if (e.key === 'Escape') {
-              e.preventDefault();
-              cancelNodeRename();
-            }
-          }}
-          onMouseDown={(e) => e.stopPropagation()}
-          style={{
-            position: 'absolute',
-            left: stagePos.x + editingNode.x * scale + 10,
-            top: stagePos.y + editingNode.y * scale + editingNode.height * scale / 2 - 16,
-            width: Math.max(84, editingNode.width * scale - 20),
-            height: 32,
-            padding: '5px 10px',
-            borderRadius: 8,
-            border: '1px solid var(--purple-border-strong)',
-            background: 'var(--panel-bg-3)',
-            color: 'var(--text-main)',
-            boxShadow: '0 0 0 1px var(--input-focus-ring)',
-            fontSize: Math.max(12, Math.min(18, editingNode.fontSize * scale)),
-            zIndex: 3,
-          }}
+      {(editingNode || editingMirror || editingMorph) && (() => {
+        const morphTargetNode = editingMorph ? nodes.find(n => n.id === editingMorph.nodeId) ?? null : null;
+        const activeNode = editingNode ?? editingMirror?.childNode ?? morphTargetNode;
+        const commit = editingNode ? commitNodeRename : editingMirror ? commitMirrorRename : commitMorphTextEdit;
+        if (!activeNode) return null;
+        return (
+          <input
+            ref={renameInputRef}
+            value={editingLabel}
+            onChange={(e) => setEditingLabel(e.target.value)}
+            onBlur={commit}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') { e.preventDefault(); commit(); }
+              if (e.key === 'Escape') { e.preventDefault(); cancelNodeRename(); }
+            }}
+            onMouseDown={(e) => e.stopPropagation()}
+            style={{
+              position: 'absolute',
+              left: stagePos.x + activeNode.x * scale + 10,
+              top: stagePos.y + activeNode.y * scale + activeNode.height * scale / 2 - 16,
+              width: Math.max(84, activeNode.width * scale - 20),
+              height: 32,
+              padding: '5px 10px',
+              borderRadius: 8,
+              border: '1px solid var(--purple-border-strong)',
+              background: 'var(--panel-bg-3)',
+              color: 'var(--text-main)',
+              boxShadow: '0 0 0 1px var(--input-focus-ring)',
+              fontSize: Math.max(12, Math.min(18, activeNode.fontSize * scale)),
+              zIndex: 3,
+            }}
+          />
+        );
+      })()}
+
+      {expandedSubdiagramId && (() => {
+        const subNode = nodes.find(n => n.id === expandedSubdiagramId);
+        if (!subNode) { setExpandedSubdiagramId(null); return null; }
+        return (
+          <SubdiagramOverlay
+            node={subNode}
+            onClose={() => setExpandedSubdiagramId(null)}
+            showControls
+            ancestryNodeIds={[subNode.id]}
+            sourceRect={getNodeScreenRect(subNode)}
+            viewportSize={dims}
+          />
+        );
+      })()}
+
+      {!expandedSubdiagramId && popupOverlayState && (
+        <SubdiagramOverlay
+          ref={subdiagramOverlayRef}
+          node={popupOverlayState.node}
+          controlledTime={popupOverlayState.controlledTime}
+          dismissible={false}
+          showControls={false}
+          visible={popupOverlayState.visible}
+          onExited={() => setPopupOverlayState(null)}
+          ancestryNodeIds={[popupOverlayState.node.id]}
+          sourceRect={popupOverlayState.sourceRect ?? null}
+          viewportSize={dims}
         />
       )}
+
     </div>
   );
 }
