@@ -502,6 +502,9 @@ function KeyframePanel({ playback }) {
   const selMorph = selKind === 'text-morph' && selData && selTiming
     ? getTextMorphById(selData, selectedItem.morphId, selTiming)
     : null;
+  const selGraphPoint = selKind === 'graph-point' && selData
+    ? (selData.graphPoints ?? []).find(p => p.id === selectedItem.pointId) ?? null
+    : null;
   const selWeb = selKind === 'variable-token' && selData ? webByVariableId[selData.id] : null;
   const selLabel  = selKind === 'text-morph'
     ? `${selData?.label ?? '?'} morph`
@@ -797,6 +800,19 @@ function KeyframePanel({ playback }) {
         }
         return;
       }
+      if (d.kind === 'graph-point') {
+        const node = nodeMap[d.itemId];
+        if (!node) return;
+        const nextStart = d.dragType === 'gp-move'
+          ? r2(Math.max(0, d.initStart + dtSec))
+          : d.initStart;
+        const nextDur = d.dragType === 'gp-resize'
+          ? r2(Math.max(MIN_DUR, d.initDur + dtSec))
+          : d.initDur;
+        const next = (node.graphPoints ?? []).map(p => p.id === d.pointId ? { ...p, startTime: nextStart, duration: nextDur } : p);
+        updateNode(d.itemId, { graphPoints: next });
+        return;
+      }
       if (d.kind === 'node') {
         const clampedStart = d.dragType === 'move'
           ? clampMoveStartAgainstPreviewRanges(
@@ -914,7 +930,9 @@ function KeyframePanel({ playback }) {
     e.stopPropagation();
     const nextItem = options.morphId
       ? { kind: 'text-morph', id, morphId: options.morphId }
-      : { kind, id };
+      : options.pointId
+        ? { kind: 'graph-point', id, pointId: options.pointId }
+        : { kind, id };
     setSelectedItem(nextItem);
     if (e.shiftKey) {
       const anchorKind = selectedItem?.kind === 'text-morph'
@@ -1093,9 +1111,11 @@ function KeyframePanel({ playback }) {
       const tokenRow = web && web.tokenPath.length > 0
         ? [{ type: 'token', item: n, web }]
         : [];
+      const pointRows = (n.type === 'graph' ? (n.graphPoints ?? []).map(pt => ({ type: 'gpoint', item: n, point: pt })) : []);
       return [
         { type: 'node', item: n },
         ...morphs.map(morph => ({ type: 'morph', item: n, morph })),
+        ...pointRows,
         ...tokenRow,
       ];
     }),
@@ -1261,6 +1281,29 @@ function KeyframePanel({ playback }) {
                 >
                   remove
                 </button>
+              </>
+            )}
+
+            {selKind === 'graph-point' && selGraphPoint && (
+              <>
+                <FieldLabel>Point</FieldLabel>
+                <span style={{ color: pageColors.purpleAccent, fontSize: 11, minWidth: 80 }}>
+                  ({(selGraphPoint.x ?? 0).toFixed(2)}, {(selGraphPoint.y ?? 0).toFixed(2)})
+                </span>
+                <VSep />
+                <FieldLabel>Start</FieldLabel>
+                <NumberField value={Number.isFinite(selGraphPoint.startTime) ? selGraphPoint.startTime : 0} step={0.05} min={0} onChange={v => {
+                  const gp = (selData.graphPoints ?? []).map(p => p.id === selGraphPoint.id ? { ...p, startTime: r2(Math.max(0, v)) } : p);
+                  doUpdate({ graphPoints: gp });
+                }} />
+                <FieldLabel>s</FieldLabel>
+                <div style={{ width: 6 }} />
+                <FieldLabel>Dur</FieldLabel>
+                <NumberField value={Number.isFinite(selGraphPoint.duration) ? selGraphPoint.duration : 0.35} step={0.05} min={0.05} onChange={v => {
+                  const gp = (selData.graphPoints ?? []).map(p => p.id === selGraphPoint.id ? { ...p, duration: r2(Math.max(0.05, v)) } : p);
+                  doUpdate({ graphPoints: gp });
+                }} />
+                <FieldLabel>s</FieldLabel>
               </>
             )}
 
@@ -1504,6 +1547,54 @@ function KeyframePanel({ playback }) {
                         {morph.text || '(blank)'}
                       </span>
                       <span style={{ color: pageColors.rulerMinorTick, fontSize: 9, letterSpacing: '0.05em', flexShrink: 0 }}>MORPH</span>
+                    </div>
+                  );
+                }
+                if (row.type === 'gpoint') {
+                  const { item: gpNode, point } = row;
+                  const isSel = selectedItem?.kind === 'graph-point' && selectedItem?.id === gpNode.id && selectedItem?.pointId === point.id;
+                  return (
+                    <div
+                      key={`gp-left-${gpNode.id}-${point.id}`}
+                      onClick={(e) => handleTimelineSelect(e, 'node', gpNode.id, { pointId: point.id })}
+                      style={{
+                        height: ROW_H, display: 'flex', alignItems: 'center',
+                        padding: '0 10px 0 22px', gap: 7, cursor: 'pointer',
+                        borderBottom: `1px solid ${pageColors.timelineRowDivider}`,
+                        borderLeft: `2px solid ${isSel ? NODE_HUE.solid : pageColors.transparent}`,
+                        background: isSel ? withAlpha(NODE_HUE.solid, 0.06) : pageColors.transparent,
+                        flexShrink: 0,
+                      }}
+                    >
+                      <div style={{ width: 5, height: 5, borderRadius: '50%', flexShrink: 0, background: NODE_HUE.solid, opacity: 0.7 }} />
+                      <span style={{ color: isSel ? NODE_HUE.bright : pageColors.timelineTextMuted, fontSize: 11, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        point ({(point.x ?? 0).toFixed(2)}, {(point.y ?? 0).toFixed(2)})
+                      </span>
+                      <span style={{ color: pageColors.rulerMinorTick, fontSize: 9, letterSpacing: '0.05em', flexShrink: 0 }}>POINT</span>
+                    </div>
+                  );
+                }
+                if (row.type === 'gpoint') {
+                  const { item: gpNode, point } = row;
+                  const isSel = selectedItem?.kind === 'graph-point' && selectedItem?.id === gpNode.id && selectedItem?.pointId === point.id;
+                  return (
+                    <div
+                      key={`gp-left-${gpNode.id}-${point.id}`}
+                      onClick={(e) => handleTimelineSelect(e, 'node', gpNode.id, { pointId: point.id })}
+                      style={{
+                        height: ROW_H, display: 'flex', alignItems: 'center',
+                        padding: '0 10px 0 22px', gap: 7, cursor: 'pointer',
+                        borderBottom: `1px solid ${pageColors.timelineRowDivider}`,
+                        borderLeft: `2px solid ${isSel ? NODE_HUE.solid : pageColors.transparent}`,
+                        background: isSel ? withAlpha(NODE_HUE.solid, 0.06) : pageColors.transparent,
+                        flexShrink: 0,
+                      }}
+                    >
+                      <div style={{ width: 5, height: 5, borderRadius: '50%', flexShrink: 0, background: NODE_HUE.solid, opacity: 0.7 }} />
+                      <span style={{ color: isSel ? NODE_HUE.bright : pageColors.timelineTextMuted, fontSize: 11, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        point ({(point.x ?? 0).toFixed(2)}, {(point.y ?? 0).toFixed(2)})
+                      </span>
+                      <span style={{ color: pageColors.rulerMinorTick, fontSize: 9, letterSpacing: '0.05em', flexShrink: 0 }}>POINT</span>
                     </div>
                   );
                 }
@@ -1849,6 +1940,65 @@ function KeyframePanel({ playback }) {
                     );
                   }
 
+                  if (row.type === 'gpoint') {
+                    const { item: node, point: pt } = row;
+                    const isSel = selectedItem?.kind === 'graph-point' && selectedItem?.id === node.id && selectedItem?.pointId === pt.id;
+                    const left = (Number.isFinite(pt.startTime) ? pt.startTime : 0) * PX_PER_SEC;
+                    const width = Math.max((Number.isFinite(pt.duration) ? pt.duration : 0.35) * PX_PER_SEC, HANDLE_W + 6);
+                    return (
+                      <div
+                        key={`gpoint-${node.id}-${pt.id}`}
+                        onClick={(e) => { e.stopPropagation(); setSelectedItem({ kind: 'graph-point', id: node.id, pointId: pt.id }); }}
+                        style={{ height: ROW_H, borderBottom: `1px solid ${pageColors.timelineRowDivider}`, position: 'relative', flexShrink: 0, background: isSel ? withAlpha(NODE_HUE.solid, 0.04) : pageColors.transparent, cursor: 'crosshair' }}
+                      >
+                        <div
+                          onMouseDown={e => {
+                            if (e.shiftKey || e.ctrlKey || e.metaKey) { setSelectedItem({ kind: 'graph-point', id: node.id, pointId: pt.id }); return; }
+                            e.preventDefault(); e.stopPropagation();
+                            document.body.style.userSelect = 'none';
+                            _pushHistory();
+                            freezeIndependentTimelineItems('node', node.id);
+                            const initStart = Number.isFinite(pt.startTime) ? pt.startTime : 0;
+                            const initDur = Number.isFinite(pt.duration) ? pt.duration : 0.35;
+                            blockDragRef.current = {
+                              dragType: 'gp-move',
+                              kind: 'graph-point',
+                              itemId: node.id,
+                              pointId: pt.id,
+                              startX: e.clientX,
+                              initStart,
+                              initDur,
+                            };
+                          }}
+                          style={{ position: 'absolute', top: 6, left, width, height: ROW_H - 12, borderRadius: 5, cursor: 'grab', display: 'flex', alignItems: 'center', overflow: 'hidden', background: isSel ? withAlpha(NODE_HUE.solid, 0.32) : withAlpha(NODE_HUE.solid, 0.18), border: `1px solid ${isSel ? NODE_HUE.solid : withAlpha(NODE_HUE.solid, 0.5)}` }}
+                        >
+                          {width > 44 && (
+                            <span style={{ color: isSel ? NODE_HUE.bright : withAlpha(NODE_HUE.solid, 0.7), fontSize: 10, paddingLeft: 6, whiteSpace: 'nowrap', pointerEvents: 'none' }}>
+                              {(Number.isFinite(pt.duration) ? pt.duration : 0.35).toFixed(2)}s
+                            </span>
+                          )}
+                          <div
+                            onMouseDown={e => {
+                              e.stopPropagation();
+                              document.body.style.userSelect = 'none';
+                              blockDragRef.current = {
+                                dragType: 'gp-resize',
+                                kind: 'graph-point',
+                                itemId: node.id,
+                                pointId: pt.id,
+                                startX: e.clientX,
+                                initStart: Number.isFinite(pt.startTime) ? pt.startTime : 0,
+                                initDur: Number.isFinite(pt.duration) ? pt.duration : 0.35,
+                              };
+                            }}
+                            style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: 'ew-resize', background: isSel ? withAlpha(NODE_HUE.solid, 0.3) : pageColors.transparent, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '0 5px 5px 0' }}
+                          >
+                            {isSel && <div style={{ width: 2, height: 10, borderRadius: 1, background: NODE_HUE.solid }} />}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  }
                   const { item, type: kind } = row;
                   const { start, duration, displayDuration, isAuto } = effectiveTiming(item, kind);
                   const hue        = kind === 'node' ? NODE_HUE : LINK_HUE;

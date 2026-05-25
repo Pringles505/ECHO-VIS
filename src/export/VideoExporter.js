@@ -527,6 +527,8 @@ export async function exportToMP4({
   onStatus?.(`Capturing ${totalFrames} frames…`);
   const frameBytes = [];
 
+  const timelineStart = (() => { const tl = engine.getTimeline(); return tl && tl.length ? Math.min(...tl.map(ev => ev.start)) : 0; })();
+
   for (let frame = 0; frame < totalFrames; frame++) {
     const t = frame / fps;
     const animState = engine.getStateAtTime(t);
@@ -535,6 +537,7 @@ export async function exportToMP4({
       webByLinkId: exportWebByLinkId,
       monitors: exportMonitors,
       currentTime: t,
+      timelineStart,
       bindToTokenHopById,
       bindMetaById,
       linkStartOverrideById,

@@ -1226,6 +1226,327 @@ function PropertiesPanel() {
         <Row label="Label">
           <TextInput value={selectedNode.label} onChange={v => up('label', v)} />
         </Row>
+        {selectedNode.type === 'graph' && (
+          <>
+            <Row label="Formula">
+              <TextInput value={selectedNode.formula ?? ''} onChange={v => up('formula', v)} />
+            </Row>
+            <p style={{ color: 'var(--text-dim)', fontSize: 11, lineHeight: 1.5, marginTop: -4, marginBottom: 8 }}>
+              Enter either "y = …" or "y^2 = …". For elliptic curves use "y^2 = x^3 + a*x + b".
+            </p>
+            <Row label="Params">
+              <TextInput value={selectedNode.graphParams ?? ''} onChange={v => up('graphParams', v)} />
+            </Row>
+            <Row label="X min">
+              <NumberInput value={Number.isFinite(selectedNode.xMin) ? selectedNode.xMin : -10} min={-1000} max={1000} step={0.5} onChange={v => up('xMin', v)} />
+            </Row>
+            <Row label="X max">
+              <NumberInput value={Number.isFinite(selectedNode.xMax) ? selectedNode.xMax : 10} min={-1000} max={1000} step={0.5} onChange={v => up('xMax', v)} />
+            </Row>
+            <Row label="Center X">
+              <input
+                type="text"
+                value={Number.isFinite(selectedNode.centerX) ? String(selectedNode.centerX) : ''}
+                placeholder="auto (0)"
+                onChange={e => {
+                  const s = e.target.value.trim();
+                  if (s === '') up('centerX', null);
+                  else {
+                    const n = Number(s);
+                    if (Number.isFinite(n)) up('centerX', n);
+                  }
+                }}
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  background: 'var(--panel-bg-3)',
+                  border: '1px solid var(--border-strong)',
+                  borderRadius: 5,
+                  color: 'var(--text-main)',
+                  padding: '5px 8px',
+                  fontSize: 12,
+                }}
+              />
+            </Row>
+            <Row label="Y min">
+              <input
+                type="text"
+                value={Number.isFinite(selectedNode.yMin) ? String(selectedNode.yMin) : ''}
+                placeholder="auto"
+                onChange={e => {
+                  const s = e.target.value.trim();
+                  if (s === '') up('yMin', null);
+                  else {
+                    const n = Number(s);
+                    if (Number.isFinite(n)) up('yMin', n);
+                  }
+                }}
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  background: 'var(--panel-bg-3)',
+                  border: '1px solid var(--border-strong)',
+                  borderRadius: 5,
+                  color: 'var(--text-main)',
+                  padding: '5px 8px',
+                  fontSize: 12,
+                }}
+              />
+            </Row>
+            <Row label="Y max">
+              <input
+                type="text"
+                value={Number.isFinite(selectedNode.yMax) ? String(selectedNode.yMax) : ''}
+                placeholder="auto"
+                onChange={e => {
+                  const s = e.target.value.trim();
+                  if (s === '') up('yMax', null);
+                  else {
+                    const n = Number(s);
+                    if (Number.isFinite(n)) up('yMax', n);
+                  }
+                }}
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  background: 'var(--panel-bg-3)',
+                  border: '1px solid var(--border-strong)',
+                  borderRadius: 5,
+                  color: 'var(--text-main)',
+                  padding: '5px 8px',
+                  fontSize: 12,
+                }}
+              />
+            </Row>
+            <Row label="Center Y">
+              <input
+                type="text"
+                value={Number.isFinite(selectedNode.centerY) ? String(selectedNode.centerY) : ''}
+                placeholder="auto (0)"
+                onChange={e => {
+                  const s = e.target.value.trim();
+                  if (s === '') up('centerY', null);
+                  else {
+                    const n = Number(s);
+                    if (Number.isFinite(n)) up('centerY', n);
+                  }
+                }}
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  background: 'var(--panel-bg-3)',
+                  border: '1px solid var(--border-strong)',
+                  borderRadius: 5,
+                  color: 'var(--text-main)',
+                  padding: '5px 8px',
+                  fontSize: 12,
+                }}
+              />
+            </Row>
+            <Row label="Samples">
+              <NumberInput value={Number.isFinite(selectedNode.samples) ? selectedNode.samples : 400} min={50} max={2000} step={10} onChange={v => up('samples', v)} />
+            </Row>
+            <Row label="Axes">
+              <ToggleInput checked={selectedNode.showAxes ?? true} onChange={v => up('showAxes', v)} label="Show axes" />
+            </Row>
+            <Row label="Coords">
+              <ToggleInput checked={!!selectedNode.showCoords} onChange={v => up('showCoords', v)} label="Show coordinates (hover)" />
+            </Row>
+            {/* Points now appear at runtime based on vector playback when Sequential is enabled */}
+
+            <Section title="Vectors" />
+            <Row label="Color">
+              <ColorInput value={selectedNode.vectorColorDefault ?? '#FFFFFF'} onChange={v => up('vectorColorDefault', v)} />
+            </Row>
+            <Row label="Width">
+              <NumberInput value={Number.isFinite(selectedNode.vectorWidthDefault) ? selectedNode.vectorWidthDefault : 1.5} min={0.5} max={10} step={0.1} onChange={v => up('vectorWidthDefault', Math.max(0.5, v))} />
+            </Row>
+            <Row label="Head L">
+              <NumberInput value={Number.isFinite(selectedNode.vectorHeadLengthDefault) ? selectedNode.vectorHeadLengthDefault : 8} min={1} max={40} step={1} onChange={v => up('vectorHeadLengthDefault', Math.max(1, v))} />
+            </Row>
+            <Row label="Head W">
+              <NumberInput value={Number.isFinite(selectedNode.vectorHeadWidthDefault) ? selectedNode.vectorHeadWidthDefault : 8} min={1} max={40} step={1} onChange={v => up('vectorHeadWidthDefault', Math.max(1, v))} />
+            </Row>
+            <Row label="Speed">
+              <NumberInput
+                value={Number.isFinite(selectedNode.vectorSpeed) ? selectedNode.vectorSpeed : 0.2}
+                min={0.01}
+                max={10}
+                step={0.01}
+                onChange={v => up('vectorSpeed', Math.max(0.01, v))}
+              />
+              <span style={{ color: 'var(--text-dim)', fontSize: 11, marginLeft: 4 }}>s</span>
+            </Row>
+            <Row label="Chain">
+              <ToggleInput checked={!!selectedNode.graphChainPlayback} onChange={v => up('graphChainPlayback', v)} label="Chain points & vectors (join all points)" />
+            </Row>
+
+            <Section title="Point Defaults" />
+            <Row label="Size">
+              <NumberInput value={Number.isFinite(selectedNode.graphPointSizeDefault) ? selectedNode.graphPointSizeDefault : 4} min={1} max={24} step={1} onChange={v => up('graphPointSizeDefault', Math.max(1, v))} />
+            </Row>
+            <Row label="Fill">
+              <ColorInput value={selectedNode.graphPointFillDefault ?? '#A66BFF'} onChange={v => up('graphPointFillDefault', v)} />
+            </Row>
+            <Row label="Stroke">
+              <ColorInput value={selectedNode.graphPointStrokeDefault ?? '#FFFFFF'} onChange={v => up('graphPointStrokeDefault', v)} />
+            </Row>
+
+            <Section title="Points" />
+            {(selectedNode.graphPoints ?? []).length === 0 && (
+              <p style={{ color: 'var(--text-dim)', fontSize: 11, marginBottom: 8 }}>Shift+click on the graph to add a point. Alt+click a point to remove it.</p>
+            )}
+            {(selectedNode.graphPoints ?? []).map((pt, idx) => (
+              <div key={pt.id} style={{
+                marginBottom: 8,
+                padding: 8,
+                borderRadius: 8,
+                background: 'var(--panel-bg)',
+                border: '1px solid var(--border-strong)'
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                  <span style={{ color: 'var(--text-main)', fontSize: 11, fontWeight: 600 }}>Point {idx + 1}</span>
+                  <button
+                    onClick={() => updateNode(selectedNode.id, { graphPoints: (selectedNode.graphPoints ?? []).filter(p => p.id !== pt.id) })}
+                    style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--danger-bright)', fontSize: 10, padding: '2px 8px', cursor: 'pointer' }}
+                  >
+                    Remove
+                  </button>
+                </div>
+                <Row label="X">
+                  <NumberInput value={pt.x} min={-1e6} max={1e6} step={0.05} onChange={v => {
+                    const next = (selectedNode.graphPoints ?? []).map(p => p.id === pt.id ? { ...p, x: v } : p);
+                    updateNode(selectedNode.id, { graphPoints: next });
+                  }} />
+                </Row>
+                <Row label="Y">
+                  <NumberInput value={pt.y} min={-1e6} max={1e6} step={0.05} onChange={v => {
+                    const next = (selectedNode.graphPoints ?? []).map(p => p.id === pt.id ? { ...p, y: v } : p);
+                    updateNode(selectedNode.id, { graphPoints: next });
+                  }} />
+                </Row>
+                {/* In chain mode, point timing is derived from vectorSpeed; otherwise, per-point keyframes apply. */}
+                <Row label="Size">
+                  <NumberInput value={Number.isFinite(pt.size) ? pt.size : (selectedNode.graphPointSizeDefault ?? 4)} min={1} max={24} step={1} onChange={v => {
+                    const next = (selectedNode.graphPoints ?? []).map(p => p.id === pt.id ? { ...p, size: Math.max(1, v) } : p);
+                    updateNode(selectedNode.id, { graphPoints: next });
+                  }} />
+                </Row>
+                <Row label="Fill">
+                  <ColorInput value={pt.fill ?? (selectedNode.graphPointFillDefault ?? '#A66BFF')} onChange={v => {
+                    const next = (selectedNode.graphPoints ?? []).map(p => p.id === pt.id ? { ...p, fill: v } : p);
+                    updateNode(selectedNode.id, { graphPoints: next });
+                  }} />
+                </Row>
+                <Row label="Stroke">
+                  <ColorInput value={pt.stroke ?? (selectedNode.graphPointStrokeDefault ?? '#FFFFFF')} onChange={v => {
+                    const next = (selectedNode.graphPoints ?? []).map(p => p.id === pt.id ? { ...p, stroke: v } : p);
+                    updateNode(selectedNode.id, { graphPoints: next });
+                  }} />
+                </Row>
+
+                {/* Per-point vectors */}
+                {(() => {
+                  const pts = selectedNode.graphPoints ?? [];
+                  const others = pts.filter(p => p.id !== pt.id);
+                  const outgoing = (selectedNode.graphVectors ?? []).filter(v => v.fromId === pt.id);
+                  return (
+                    <div style={{ marginTop: 6 }}>
+                      <Row label="Vector to">
+                        <select
+                          value={''}
+                          disabled={others.length === 0}
+                          onChange={(e) => {
+                            const toId = e.target.value || null;
+                            if (!toId) return;
+                            const cur = selectedNode.graphVectors ?? [];
+                            if (cur.some(v => v.fromId === pt.id && v.toId === toId)) return; // avoid duplicates
+                            const next = [ ...cur, { id: uuid(), fromId: pt.id, toId } ];
+                            updateNode(selectedNode.id, { graphVectors: next });
+                          }}
+                          style={SELECT_INPUT_STYLE}
+                        >
+                          <option value="">{others.length ? 'Add vector…' : 'No other points'}</option>
+                          {others.map((p, i) => (
+                            <option key={p.id} value={p.id}>Point {pts.findIndex(x => x.id === p.id) + 1} ({(p.x ?? 0).toFixed(2)}, {(p.y ?? 0).toFixed(2)})</option>
+                          ))}
+                        </select>
+                      </Row>
+                      {outgoing.length > 0 && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                          {outgoing.map(v => {
+                            const toIdx = pts.findIndex(p => p.id === v.toId);
+                            return (
+                              <div key={v.id} style={{ display: 'grid', gridTemplateColumns: '1fr 72px 86px 86px 86px auto', alignItems: 'center', gap: 6, marginLeft: 72 }}>
+                                <span style={{ color: 'var(--text-main)', fontSize: 11 }}>
+                                  → Point {toIdx >= 0 ? toIdx + 1 : '?'}
+                                </span>
+                                <input
+                                  type="color"
+                                  value={v.color ?? (selectedNode.vectorColorDefault ?? '#FFFFFF')}
+                                  onChange={e => {
+                                    const next = (selectedNode.graphVectors ?? []).map(x => x.id === v.id ? { ...x, color: e.target.value } : x);
+                                    updateNode(selectedNode.id, { graphVectors: next });
+                                  }}
+                                  style={{ width: 28, height: 20, padding: 0, border: '1px solid var(--border-strong)', borderRadius: 4, background: 'transparent', cursor: 'pointer' }}
+                                />
+                                <input
+                                  type="number"
+                                  value={Number.isFinite(v.width) ? v.width : (selectedNode.vectorWidthDefault ?? 1.5)}
+                                  min={0.5}
+                                  max={10}
+                                  step={0.1}
+                                  onChange={e => {
+                                    const n = Number(e.target.value);
+                                    const next = (selectedNode.graphVectors ?? []).map(x => x.id === v.id ? { ...x, width: Math.max(0.5, n) } : x);
+                                    updateNode(selectedNode.id, { graphVectors: next });
+                                  }}
+                                  style={{ width: 86, background: 'var(--panel-bg)', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text-main)', padding: '3px 7px', fontSize: 12 }}
+                                />
+                                <input
+                                  type="number"
+                                  value={Number.isFinite(v.headLength) ? v.headLength : (selectedNode.vectorHeadLengthDefault ?? 8)}
+                                  min={1}
+                                  max={40}
+                                  step={1}
+                                  onChange={e => {
+                                    const n = Number(e.target.value);
+                                    const next = (selectedNode.graphVectors ?? []).map(x => x.id === v.id ? { ...x, headLength: Math.max(1, n) } : x);
+                                    updateNode(selectedNode.id, { graphVectors: next });
+                                  }}
+                                  style={{ width: 86, background: 'var(--panel-bg)', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text-main)', padding: '3px 7px', fontSize: 12 }}
+                                />
+                                <input
+                                  type="number"
+                                  value={Number.isFinite(v.headWidth) ? v.headWidth : (selectedNode.vectorHeadWidthDefault ?? 8)}
+                                  min={1}
+                                  max={40}
+                                  step={1}
+                                  onChange={e => {
+                                    const n = Number(e.target.value);
+                                    const next = (selectedNode.graphVectors ?? []).map(x => x.id === v.id ? { ...x, headWidth: Math.max(1, n) } : x);
+                                    updateNode(selectedNode.id, { graphVectors: next });
+                                  }}
+                                  style={{ width: 86, background: 'var(--panel-bg)', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text-main)', padding: '3px 7px', fontSize: 12 }}
+                                />
+                                <button
+                                  onClick={() => updateNode(selectedNode.id, { graphVectors: (selectedNode.graphVectors ?? []).filter(x => x.id !== v.id) })}
+                                  style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--danger-bright)', fontSize: 10, padding: '2px 8px', cursor: 'pointer', justifySelf: 'end' }}
+                                >
+                                  Remove
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            ))}
+          </>
+        )}
         {!isTextNode && (
           <Row label="Shape">
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
@@ -1504,6 +1825,77 @@ function PropertiesPanel() {
                 </>
               );
             })()}
+            {!isTextNode && (
+              <>
+                <Section title="Popup" />
+                <Row label="Popup">
+                  <ToggleInput
+                    checked={selectedNode.showSimplePopupInPlayback ?? false}
+                    onChange={value => up('showSimplePopupInPlayback', value)}
+                    label="Show simple popup"
+                  />
+                </Row>
+                <Row label="Value">
+                  <TextInput
+                    value={selectedNode.popupValue ?? ''}
+                    onChange={v => up('popupValue', v)}
+                  />
+                </Row>
+                <Row label="Tab color">
+                  <ColorInput
+                    value={selectedNode.popupFill ?? selectedNode.fill}
+                    onChange={v => up('popupFill', v)}
+                  />
+                </Row>
+                <Row label="Width">
+                  <NumberInput
+                    value={Number.isFinite(selectedNode.popupWidth) ? selectedNode.popupWidth : selectedNode.width}
+                    min={24}
+                    max={800}
+                    step={1}
+                    onChange={value => up('popupWidth', Math.max(24, value))}
+                  />
+                </Row>
+                <Row label="Height">
+                  <NumberInput
+                    value={Number.isFinite(selectedNode.popupHeight) ? selectedNode.popupHeight : 48}
+                    min={18}
+                    max={400}
+                    step={1}
+                    onChange={value => up('popupHeight', Math.max(18, value))}
+                  />
+                </Row>
+                {selectedNode.showSimplePopupInPlayback && (
+                  <>
+                    <Row label="Delay">
+                      <NumberInput
+                        value={selectedNode.simplePopupDelay ?? 0.2}
+                        min={0}
+                        max={10}
+                        step={0.05}
+                        onChange={value => up('simplePopupDelay', value)}
+                      />
+                    </Row>
+                    <Row label="Length">
+                      <NumberInput
+                        value={selectedNode.simplePopupDuration ?? 0.7}
+                        min={0.1}
+                        max={10}
+                        step={0.05}
+                        onChange={value => up('simplePopupDuration', value)}
+                      />
+                    </Row>
+                    <Row label="Stay popped up?">
+                      <ToggleInput
+                        checked={selectedNode.popupStayOpen ?? false}
+                        onChange={value => up('popupStayOpen', value)}
+                        label="Keep open after it appears"
+                      />
+                    </Row>
+                  </>
+                )}
+              </>
+            )}
           </>
         )}
 

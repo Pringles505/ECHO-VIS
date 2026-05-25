@@ -115,6 +115,7 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
   const renameInputRef = useRef(null);
   const lastPointerCanvasRef = useRef(null);
   const [dims, setDims] = useState({ w: 800, h: 600 });
+  
 
   const getNodeScreenRect = useCallback((node) => {
     const width = (node.width ?? 150) * scale;
@@ -1263,6 +1264,8 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
           viewportSize={dims}
         />
       )}
+
+      {/* ECC demo removed */}
 
     </div>
   );

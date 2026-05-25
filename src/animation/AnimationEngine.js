@@ -464,6 +464,35 @@ export class AnimationEngine {
       );
     }
 
+    // Compute simple popup window for non-subdiagram nodes that opt in.
+    for (const event of finalEvents) {
+      if (event.type !== 'node') continue;
+      const node = this.nodes.find(item => item.id === event.id);
+      if (!node) continue;
+      if (node.type === 'subdiagram') continue; // subdiagrams use nested popup windows
+
+      const enabled = !!node.showSimplePopupInPlayback;
+      if (!enabled) continue;
+
+      const delay = Math.max(0, node.simplePopupDelay ?? 0.2);
+      const dur   = Math.max(0.1, node.simplePopupDuration ?? 0.7);
+
+      // If this node is triggered by a link, align popup start to the later of
+      // node end + delay and trigger link end + delay (matches subdiagram logic).
+      const triggerLinkInfo = node.triggerAfterLinkId
+        ? scheduledLinkInfoMap[node.triggerAfterLinkId] ?? null
+        : null;
+      const candidateA = event.start + event.duration + delay;
+      const candidateB = triggerLinkInfo ? (triggerLinkInfo.start + triggerLinkInfo.duration + delay) : -Infinity;
+      const popupStart = Math.max(candidateA, candidateB);
+      const popupEnd = popupStart + dur;
+
+      event.popupStart = popupStart;
+      event.popupEnd = popupEnd;
+      event.popupStay = !!node.popupStayOpen;
+      event.displayDuration = Math.max(event.displayDuration ?? event.duration, popupEnd - event.start);
+    }
+
     this._contentDuration = 0;
     for (const event of finalEvents) {
       this._contentDuration = Math.max(
@@ -479,6 +508,55 @@ export class AnimationEngine {
       if (!node) continue;
       for (const morph of getNodeTextMorphs(node, { start: event.start, duration: event.duration })) {
         this._contentDuration = Math.max(this._contentDuration, morph.startTime + morph.duration);
+      }
+    }
+
+    // Extend to cover graph point keyframes and chain playback within graph nodes
+    const eventByNodeId = Object.fromEntries(finalEvents.filter(ev => ev.type === 'node').map(ev => [ev.id, ev]));
+    for (const node of this.nodes) {
+      if (node.type !== 'graph') continue;
+      const ev = eventByNodeId[node.id];
+      if (!ev) continue;
+      const baseStart = ev.start;
+      const chain = !!node.graphChainPlayback;
+      const vectors = node.graphVectors ?? [];
+      const points = node.graphPoints ?? [];
+      const speed = (Number.isFinite(node.vectorSpeed) && node.vectorSpeed > 0) ? node.vectorSpeed : 0.2;
+      const defaultPointDur = 0.35;
+      let maxLocalEnd = 0;  // seconds relative to chain anchor (for chain)
+      let maxGlobalEnd = 0; // absolute seconds (for non-chain)
+
+      if (chain) {
+        // Chain mode: join all points, alternate P(k) then V(k)
+        const n = points.length;
+        if (n > 0) {
+          // Last event could be point(n-1) fade if no trailing vector
+          const lastPointEnd = (2 * (n - 1) + 1) * speed; // start=2*(n-1)*S, end at +S
+          maxLocalEnd = Math.max(maxLocalEnd, lastPointEnd);
+        }
+        if (n > 1) {
+          // Final vector index = n-2, ends at (2*(n-2)+2)*S = (2n-2)*S
+          const lastVectorEnd = (2 * (n - 2) + 2) * speed;
+          maxLocalEnd = Math.max(maxLocalEnd, lastVectorEnd);
+        }
+      } else {
+        // Non-sequential: points follow their own keyframes (absolute within node window)
+        for (const p of points) {
+          const st = Number.isFinite(p.startTime) ? p.startTime : 0;
+          const dur = (Number.isFinite(p.duration) && p.duration > 0) ? p.duration : defaultPointDur;
+          const endP = st + dur;
+          if (endP > maxGlobalEnd) maxGlobalEnd = endP;
+        }
+        // Consider at least one vector draw when vectors exist
+        if (vectors.length) maxGlobalEnd = Math.max(maxGlobalEnd, speed);
+      }
+
+      if (chain) {
+        // Chain playback starts after the graph node finishes its own entry draw.
+        this._contentDuration = Math.max(this._contentDuration, baseStart + ev.duration + maxLocalEnd);
+      } else {
+        // Absolute keyframes extend the global timeline directly
+        this._contentDuration = Math.max(this._contentDuration, maxGlobalEnd);
       }
     }
 
@@ -514,9 +592,17 @@ export class AnimationEngine {
         const transformProgress = event.transformStart != null && event.transformEnd != null
           ? ease.easeInOut(clamp((t - event.transformStart) / Math.max(0.0001, event.transformEnd - event.transformStart), 0, 1))
           : 0;
-        const popupProgress = (event.popupStart != null && event.popupEnd != null && t >= event.popupStart && t <= event.popupEnd)
-          ? (t - event.popupStart) / Math.max(0.0001, event.popupEnd - event.popupStart)
-          : 0;
+        let popupProgress = 0;
+        if (event.popupStart != null && t >= event.popupStart) {
+          const end = event.popupEnd != null ? event.popupEnd : (event.popupStart + 0.6);
+          if (t <= end) {
+            popupProgress = (t - event.popupStart) / Math.max(0.0001, end - event.popupStart);
+          } else if (event.popupStay) {
+            popupProgress = 1; // hold open after the initial slide-in finishes
+          } else {
+            popupProgress = 0;
+          }
+        }
         const textState = node ? getTextMorphRenderState(node, { start: event.start, duration: event.duration }, t) : null;
         const styleState = node ? getStyleMorphRenderState(node, { start: event.start, duration: event.duration }, t) : null;
         const entryText = textState?.baseText ?? node?.label ?? '';
@@ -545,6 +631,9 @@ export class AnimationEngine {
           targetShape: event.transformTargetStyle?.shape ?? null,
           targetCornerRadius: event.transformTargetStyle?.cornerRadius ?? null,
           targetShowSubBadge: event.transformTargetStyle?.showSubBadge ?? null,
+          // Expose timing so renderer can align graph-local animations
+          eventStart: event.start,
+          eventDuration: event.duration,
         };
 
         // Apply morph-driven appearance (color/corner radius) when no explicit transform target

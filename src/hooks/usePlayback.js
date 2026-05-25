@@ -50,6 +50,11 @@ export function usePlayback({ layerRef }) {
   useEffect(() => { totalDurationRef.current = totalDuration; }, [totalDuration]);
   useEffect(() => { contentDurationRef.current = contentDuration; }, [contentDuration]);
 
+  const timelineStart = useMemo(() => {
+    const tl = engine.getTimeline();
+    return tl && tl.length ? Math.min(...tl.map(ev => ev.start)) : 0;
+  }, [engine]);
+
   const websRef = useRef(webs);
   const webByLinkIdRef = useRef(webByLinkId);
   const monitorsRef = useRef(monitors);
@@ -71,6 +76,7 @@ export function usePlayback({ layerRef }) {
       webByLinkId: webByLinkIdRef.current,
       monitors: monitorsRef.current,
       currentTime: t,
+      timelineStart,
       bindToTokenHopById,
       bindMetaById,
       linkStartOverrideById,

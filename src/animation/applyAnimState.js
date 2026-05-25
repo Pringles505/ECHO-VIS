@@ -83,6 +83,8 @@ function applyNodeStateToId(layer, id, state) {
   const body = getCachedNode(layer, `#node-body-${id}`);
   const badgeBg = getCachedNode(layer, `#node-sub-badge-bg-${id}`);
   const badgeText = getCachedNode(layer, `#node-sub-badge-text-${id}`);
+  const popupGroup = getCachedNode(layer, `#node-popup-${id}`);
+  const popupBg = getCachedNode(layer, `#node-popup-bg-${id}`);
   if (!group) return;
 
   // ── Area node handling ──────────────────────────────────────────────────────
@@ -117,9 +119,51 @@ function applyNodeStateToId(layer, id, state) {
   // ── end area handling ───────────────────────────────────────────────────────
 
   group.opacity(state.opacity);
-  const scale = state.scale * (state.popupProgress > 0 ? 1.04 : 1);
+  // Keep node scale stable during popup to avoid size jump
+  const scale = state.scale;
   group.scaleX(scale);
   group.scaleY(scale);
+
+  // Graph node draw animation (when present)
+  // Support single or split graph lines
+  const prefixes = [
+    `#graph-line-main-s`,
+    `#graph-line-top-s`,
+    `#graph-line-bot-s`,
+  ];
+  // Delay curve drawing so graph appears first, then stroke draws
+  const entry = state.textProgress ?? 0;
+  const DRAW_DELAY = 0.45; // first 45% = appear, then draw
+  const pDraw = clamp((entry - DRAW_DELAY) / Math.max(0.0001, 1 - DRAW_DELAY), 0, 1);
+  for (const pref of prefixes) {
+    for (let i = 0; i < 256; i += 1) {
+      const sel = `${pref}${i}-${id}`;
+      const gl = getCachedNode(layer, sel);
+      if (!gl) break;
+      const pts = Array.isArray(gl.points?.()) ? gl.points() : [];
+      let totalLen = gl.getAttr('baseLength');
+      if (!(Number.isFinite(totalLen) && totalLen > 0)) {
+        totalLen = 0;
+        for (let j = 0; j + 3 < pts.length; j += 2) {
+          const dx = pts[j + 2] - pts[j];
+          const dy = pts[j + 3] - pts[j + 1];
+          totalLen += Math.hypot(dx, dy);
+        }
+        gl.setAttr('baseLength', totalLen);
+      }
+      if (totalLen > 0) {
+        gl.dashEnabled(true);
+        gl.dash([totalLen, totalLen]);
+        gl.dashOffset((1 - pDraw) * totalLen);
+        gl.opacity(pDraw > 0.001 ? 1 : 0);
+      } else {
+        gl.dashEnabled(false);
+        gl.opacity(state.opacity);
+      }
+    }
+  }
+
+  // (Vector animation moved to applyAnimState where options is available)
 
   // If popup is active, ensure the node is on top of siblings (only once)
   if (state.popupProgress > 0) {
@@ -185,18 +229,11 @@ function applyNodeStateToId(layer, id, state) {
       if (highlight) highlight.opacity(1 - progress);
       if (transformHighlight) transformHighlight.opacity(progress);
 
-      // If popup is active, highlight the original body (which is still visible as it fades out/in)
-      if (isPopupActive) {
-        const baseStroke = body.getAttr('baseStroke') ?? body.stroke();
-        const baseStrokeWidth = body.getAttr('baseStrokeWidth') ?? body.strokeWidth();
-        body.stroke(mixColor(baseStroke, pageColors.purpleAccent, 0.6)); // Purple highlight
-        body.strokeWidth(baseStrokeWidth + 1.5);
-      } else {
-        const baseStroke = body.getAttr('baseStroke') ?? body.stroke();
-        const baseStrokeWidth = body.getAttr('baseStrokeWidth') ?? body.strokeWidth();
-        body.stroke(baseStroke);
-        body.strokeWidth(baseStrokeWidth);
-      }
+      // Keep original stroke during popup; no special highlight
+      const baseStroke = body.getAttr('baseStroke') ?? body.stroke();
+      const baseStrokeWidth = body.getAttr('baseStrokeWidth') ?? body.strokeWidth();
+      body.stroke(baseStroke);
+      body.strokeWidth(baseStrokeWidth);
     } else {
       // Legacy color-mix path
       const baseFill = ensureBaseAttr(body, 'baseFill', body.fill());
@@ -206,19 +243,13 @@ function applyNodeStateToId(layer, id, state) {
         ? ensureBaseAttr(body, 'baseCornerRadius', body.cornerRadius())
         : null;
 
-      if (isPopupActive) {
-        body.fill(baseFill);
-        body.stroke(mixColor(baseStroke, pageColors.purpleAccent, 0.6));
-        body.strokeWidth(baseStrokeWidth + 1.5);
-      } else {
-        body.fill(mixColor(baseFill, state.targetFill, progress));
-        body.stroke(mixColor(baseStroke, state.targetStroke, progress));
-        if (state.targetStrokeWidth != null) {
-          body.strokeWidth(lerp(baseStrokeWidth, state.targetStrokeWidth, progress));
-        }
-        if (baseCornerRadius != null && state.targetCornerRadius != null && typeof body.cornerRadius === 'function') {
-          body.cornerRadius(lerp(baseCornerRadius, state.targetCornerRadius, progress));
-        }
+      body.fill(mixColor(baseFill, state.targetFill, progress));
+      body.stroke(mixColor(baseStroke, state.targetStroke, progress));
+      if (state.targetStrokeWidth != null) {
+        body.strokeWidth(lerp(baseStrokeWidth, state.targetStrokeWidth, progress));
+      }
+      if (baseCornerRadius != null && state.targetCornerRadius != null && typeof body.cornerRadius === 'function') {
+        body.cornerRadius(lerp(baseCornerRadius, state.targetCornerRadius, progress));
       }
     }
   }
@@ -232,6 +263,19 @@ function applyNodeStateToId(layer, id, state) {
     const baseOpacity = ensureBaseAttr(badgeText, 'baseOpacity', badgeText.opacity());
     const targetOpacity = state.targetShowSubBadge == null || state.targetShowSubBadge ? 1 : 0;
     badgeText.opacity(lerp(baseOpacity, targetOpacity, state.transformProgress ?? 0));
+  }
+
+  // Simple popup control (if present in this layer)
+  if (popupGroup) {
+    const h = typeof popupBg?.height === 'function' ? popupBg.height() : 24;
+    const p = Math.max(0, Math.min(1, state.popupProgress ?? 0));
+    const eased = easeOut3(p);
+    const inside = Math.min(Math.floor(h * 0.35), 18);
+    const keepInside = Math.max(6, Math.min(inside, 12));
+    const targetY = inside + keepInside - h;
+    popupGroup.y(lerp(0, targetY, eased));
+    popupGroup.opacity(p > 0 ? Math.min(1, p * 1.25) : 0);
+    popupGroup.setAttr('animDriven', p > 0);
   }
 }
 
@@ -443,6 +487,84 @@ export function applyAnimState(layer, animState, linkRenders, mirrorBindings = n
     for (const mirrorId of mirrorBindings?.nodeIdsBySourceId?.[id] ?? []) {
       applyNodeStateToId(layer, mirrorId, state);
     }
+
+    // Graph vectors (arrows) draw timing per node
+    const vectorsGroup = getCachedNode(layer, `#graph-vectors-${id}`);
+    if (vectorsGroup && typeof vectorsGroup.getChildren === 'function') {
+      const tAbs = options.currentTime ?? 0;
+      const isChain = !!vectorsGroup.getAttr('gLocal');
+      const chainAnchor = (state.eventStart ?? 0) + (isChain ? (state.eventDuration ?? 0) : 0);
+      const tNow = tAbs - chainAnchor;
+      const children = vectorsGroup.getChildren() || [];
+      for (const child of children) {
+        const start = Number(child.getAttr('vStart')) || 0;
+        const dur = Math.max(0.0001, Number(child.getAttr('vDur')) || 0.4);
+        const raw = (tNow - start) / dur;
+        const p = Math.max(0, Math.min(1, raw));
+        const livePts = Array.isArray(child.points?.()) ? child.points() : [];
+        const basePts = Array.isArray(child.getAttr('basePoints'))
+          ? child.getAttr('basePoints')
+          : livePts.slice();
+        child.setAttr('basePoints', basePts);
+        let len = child.getAttr('baseLength');
+        if (!(Number.isFinite(len) && len > 0)) {
+          len = 0;
+          for (let i = 0; i + 3 < basePts.length; i += 2) {
+            const dx = basePts[i + 2] - basePts[i];
+            const dy = basePts[i + 3] - basePts[i + 1];
+            len += Math.hypot(dx, dy);
+          }
+          child.setAttr('baseLength', len);
+        }
+        if (len > 0 && basePts.length >= 4) {
+          child.dashEnabled(false);
+          const x1 = basePts[0];
+          const y1 = basePts[1];
+          const x2 = basePts[basePts.length - 2];
+          const y2 = basePts[basePts.length - 1];
+          child.points([x1, y1, x1 + (x2 - x1) * p, y1 + (y2 - y1) * p]);
+          child.opacity(p > 0.001 ? 1 : 0);
+        } else {
+          child.dashEnabled(false);
+          child.opacity(p);
+        }
+      }
+    }
+
+    // Graph points: when vectors are sequential, make points appear when their inbound vector completes.
+    // Fallback to point keyframes when not sequential or when no inbound vector exists.
+    const pointsGroup = getCachedNode(layer, `#graph-points-${id}`);
+    if (pointsGroup && typeof pointsGroup.getChildren === 'function') {
+      const tAbs = options.currentTime ?? 0;
+      const isChain = !!pointsGroup.getAttr('gLocal') || !!vectorsGroup?.getAttr('gLocal');
+      const chainAnchor = (state.eventStart ?? 0) + (isChain ? (state.eventDuration ?? 0) : 0);
+      const tNow = isChain ? (tAbs - chainAnchor) : tAbs; // chain starts after the graph node finishes its own entry
+      const isSeq = !!vectorsGroup?.getAttr('vSeq');
+      let inboundEndByToId = null;
+      if (isSeq && vectorsGroup && typeof vectorsGroup.getChildren === 'function') {
+        inboundEndByToId = new Map();
+        for (const v of vectorsGroup.getChildren() || []) {
+          const toId = v.getAttr('vTo');
+          if (!toId) continue;
+          const vs = Number(v.getAttr('vStart')) || 0;
+          const vd = Math.max(0.0001, Number(v.getAttr('vDur')) || 0.4);
+          const end = vs + vd;
+          const prev = inboundEndByToId.get(toId) ?? -Infinity;
+          if (end > prev) inboundEndByToId.set(toId, end);
+        }
+      }
+      const children = pointsGroup.getChildren() || [];
+      for (const child of children) {
+        const ptId = child.getAttr('pId') || null;
+        const startKF = Number(child.getAttr('pStart')) || 0;
+        const durKF = Math.max(0.0001, Number(child.getAttr('pDur')) || 0.35);
+        const start = (isSeq && ptId && inboundEndByToId?.has(ptId)) ? inboundEndByToId.get(ptId) : startKF;
+        const dur = durKF; // fade duration
+        const raw = (tNow - start) / dur;
+        const p = Math.max(0, Math.min(1, raw));
+        child.opacity(p);
+      }
+    }
   }
 
   for (const [id, state] of Object.entries(animState.linkStates)) {
@@ -463,6 +585,7 @@ function resetNodeById(layer, id) {
   const highlight = getCachedNode(layer, `#node-highlight-${id}`);
   const badgeBg = getCachedNode(layer, `#node-sub-badge-bg-${id}`);
   const badgeText = getCachedNode(layer, `#node-sub-badge-text-${id}`);
+  const popupGroup = getCachedNode(layer, `#node-popup-${id}`);
   if (!group) return;
   group.opacity(1);
   group.scaleX(1);
@@ -491,6 +614,46 @@ function resetNodeById(layer, id) {
   if (transformHighlightReset) transformHighlightReset.opacity(0);
   if (badgeBg) badgeBg.opacity(badgeBg.getAttr('baseOpacity') ?? 1);
   if (badgeText) badgeText.opacity(badgeText.getAttr('baseOpacity') ?? 1);
+  if (popupGroup) {
+    popupGroup.opacity(0);
+    popupGroup.y(0);
+    popupGroup.setAttr('animDriven', false);
+  }
+
+  // Reset graph points to hidden until their keyframe time
+  const pointsGroup = getCachedNode(layer, `#graph-points-${id}`);
+  if (pointsGroup && typeof pointsGroup.getChildren === 'function') {
+    for (const child of pointsGroup.getChildren()) {
+      child.opacity(0);
+    }
+  }
+
+  // Graph reset
+  for (const pref of [
+    `#graph-line-main-s`,
+    `#graph-line-top-s`,
+    `#graph-line-bot-s`,
+  ]) {
+    for (let i = 0; i < 256; i += 1) {
+      const sel = `${pref}${i}-${id}`;
+      const glr = getCachedNode(layer, sel);
+      if (!glr) break;
+      glr.dashEnabled(false);
+      glr.opacity(1);
+    }
+  }
+
+  const vectorsGroupReset = getCachedNode(layer, `#graph-vectors-${id}`);
+  if (vectorsGroupReset && typeof vectorsGroupReset.getChildren === 'function') {
+    for (const child of vectorsGroupReset.getChildren()) {
+      const basePts = child.getAttr('basePoints');
+      if (Array.isArray(basePts) && typeof child.points === 'function') {
+        child.points(basePts);
+      }
+      child.dashEnabled(false);
+      child.opacity(0);
+    }
+  }
 
   const failMark = getCachedNode(layer, `#node-fail-${id}`);
   if (failMark) failMark.opacity(1);

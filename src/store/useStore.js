@@ -83,6 +83,15 @@ const NODE_DEFAULTS = {
   triggerAfterLinkId: null,
   triggerMode: 'overlap',
   triggerDelay: 0,
+  popupValue: '',
+  // Simple popup bubble during playback (independent of subdiagram overlay popups)
+  showSimplePopupInPlayback: false,
+  simplePopupDelay: 0.2,
+  simplePopupDuration: 0.7,
+  popupStayOpen: false,
+  popupFill: null,
+  popupWidth: null,
+  popupHeight: null,
   // Per-variable kill switch at this node: when true for a variable id,
   // that variable's token stops here and does not traverse any downstream links.
   tokenKillFor: {},
@@ -160,6 +169,47 @@ const MONITOR_NODE_DEFAULTS = {
   monitorWatches: [],
   // Text shown before the variable's token has reached any watched node.
   initialValue: '',
+};
+
+const GRAPH_NODE_DEFAULTS = {
+  ...NODE_DEFAULTS,
+  type: 'graph',
+  label: 'Graph',
+  width: 260,
+  height: 160,
+  cornerRadius: 10,
+  // Keep a subtle purple tint to differentiate visually
+  fill: withAlpha(pageColors.purpleAccent, 0.10),
+  stroke: pageColors.purpleAccent,
+  textColor: pageColors.white,
+  strokeWidth: 2,
+  // Graph-specific
+  formula: 'y = sin(x)', // Accepts: 'y = …' or 'y^2 = …' (EC-style)
+  graphParams: 'a=-1, b=1',
+  xMin: -10,
+  xMax: 10,
+  yMin: null,
+  yMax: null,
+  centerX: null,
+  centerY: null,
+  samples: 400,
+  showAxes: true,
+  showCoords: false,
+  graphPoints: [], // { id, x, y, size?, fill?, stroke?, startTime?, duration?, afterVector? }
+  graphVectors: [], // { id, fromId, toId, color?, width?, headLength?, headWidth? }
+  vectorSpeed: 0.2, // seconds per vector animation
+  vectorSequential: true, // legacy (no-op): was 'play vectors one after another'
+  graphChainPlayback: true, // when true, auto-join points and alternate point/vector by vectorSpeed
+  // Deprecated: pointsFollowVectors/pointsSequentialWithVectors removed — points now
+  // appear at runtime based on vector playback when sequential is enabled.
+  // Styling defaults
+  graphPointSizeDefault: 4,
+  graphPointFillDefault: '#A66BFF',
+  graphPointStrokeDefault: '#FFFFFF',
+  vectorColorDefault: '#FFFFFF',
+  vectorWidthDefault: 1.5,
+  vectorHeadLengthDefault: 8,
+  vectorHeadWidthDefault: 8,
 };
 
 const MIRROR_NODE_DEFAULTS = {
@@ -401,7 +451,7 @@ const useStore = create((set, get) => ({
   isExporting: false,
   exportProgress: 0,
   exportStatus: '',
-  showGridLines: true,
+  showGridLines: false,
   showSymmetryLines: true,
   snapToSymmetryLines: true,
   symmetryGuides: [],
@@ -699,6 +749,20 @@ const useStore = create((set, get) => ({
     return id;
   },
 
+  addGraphNode: (canvasX, canvasY) => {
+    get()._pushHistory();
+    const id = uuid();
+    const node = normalizeNode({ id, ...GRAPH_NODE_DEFAULTS });
+    set(state => ({
+      nodes: [...state.nodes, { ...node, x: canvasX - node.width / 2, y: canvasY - node.height / 2 }],
+      contextMenu: null,
+      selectedId: id,
+      selectedJointId: null,
+      selectedIds: [],
+    }));
+    return id;
+  },
+
   setMonitorVariable: (monitorId, variableNodeId) => {
     if (!monitorId) return;
     get()._pushHistory();
@@ -785,9 +849,17 @@ const useStore = create((set, get) => ({
   },
 
   updateNode: (id, updates) =>
-    set(state => ({
-      nodes: state.nodes.map(node => (node.id === id ? normalizeNode(node, updates) : node)),
-    })),
+    set(state => {
+      // Graph point keyframes are no longer auto-recomputed from vectors.
+      const shouldRecompute = () => false;
+      const nextNodes = state.nodes.map(node => {
+        if (node.id !== id) return node;
+        let next = normalizeNode(node, updates);
+        // No auto point keyframe recomputation
+        return next;
+      });
+      return { nodes: nextNodes };
+    }),
 
   captureMirrorSelection: (mirrorId, selectionIds = []) => {
     const state = get();
@@ -1050,6 +1122,8 @@ const useStore = create((set, get) => ({
   setExporting: (value) => set({ isExporting: value }),
   setExportProgress: (value) => set({ exportProgress: value }),
   setExportStatus: (value) => set({ exportStatus: value }),
+
+  // ECC demo removed
 
   deleteSelected: () => {
     const { selectedId, selectedJointId, selectedIds, nodes, links } = get();

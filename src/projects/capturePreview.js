@@ -43,7 +43,8 @@ export function capturePreview(stageRef, layerRef, nodes, links) {
 
   // Apply the last frame of animation
   const animState = engine.getStateAtTime(engine.getTotalDuration());
-  applyAnimState(layer, animState, allLinkRenders, mirrorBindings);
+  const timelineStart = (() => { const tl = engine.getTimeline(); return tl && tl.length ? Math.min(...tl.map(ev => ev.start)) : 0; })();
+  applyAnimState(layer, animState, allLinkRenders, mirrorBindings, { currentTime: engine.getTotalDuration(), timelineStart });
   layer.draw();
 
   // Capture at ~480 px wide

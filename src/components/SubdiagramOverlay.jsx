@@ -554,18 +554,23 @@ const SubdiagramOverlay = forwardRef(function SubdiagramOverlayInner({
 
   // Expose setTime() so parent overlays and DiagramCanvas can drive us imperatively.
   // This is the hot path: called every animation frame with zero React re-renders.
+  const earliestStart = useMemo(() => {
+    const tl = engine.getTimeline();
+    return tl && tl.length ? Math.min(...tl.map(ev => ev.start)) : 0;
+  }, [engine]);
+
   useImperativeHandle(imperativeRef, () => ({
     setTime(t) {
       if (!layerRef.current || !engineRef.current || !linkRendersRef.current) return;
       const ct = Math.max(0, Math.min(engineRef.current.getContentDuration(), t));
       const state = engineRef.current.getStateAtTime(ct);
       applyAnimState(layerRef.current, state, linkRendersRef.current, null, {
-        webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: ct, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById,
+        webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: ct, timelineStart: earliestStart, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById,
       });
       layerRef.current.draw();
       updateNestedPopupImperatively(ct);
     },
-  }), [updateNestedPopupImperatively]);
+  }), [earliestStart, updateNestedPopupImperatively]);
 
   // Show end state on first render (after shapes are mounted)
   const showEndState = useCallback(() => {
@@ -573,11 +578,11 @@ const SubdiagramOverlay = forwardRef(function SubdiagramOverlayInner({
     const ct = engine.getContentDuration();
     const state = engine.getStateAtTime(ct);
     applyAnimState(layerRef.current, state, linkRenders, null, {
-      webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: ct,
+      webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: ct, timelineStart: earliestStart,
     });
     layerRef.current.draw();
     setDisplayTime(ct);
-  }, [engine, linkRenders, overlayMonitors, overlayWebByLinkId, overlayWebs]);
+  }, [earliestStart, engine, linkRenders, overlayMonitors, overlayWebByLinkId, overlayWebs]);
 
   useEffect(() => {
     if (isControlled) return undefined;
@@ -592,7 +597,7 @@ const SubdiagramOverlay = forwardRef(function SubdiagramOverlayInner({
     // Subsequent per-frame updates are driven imperatively via setTime() — no React re-renders.
     const state = engine.getStateAtTime(controlledDisplayTime);
     applyAnimState(layerRef.current, state, linkRenders, null, {
-      webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: controlledDisplayTime, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById,
+      webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: controlledDisplayTime, timelineStart: earliestStart, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById,
     });
     layerRef.current.draw();
   }, [controlledDisplayTime, engine, isControlled, linkRenders, overlayMonitors, overlayWebByLinkId, overlayWebs]);
@@ -623,7 +628,7 @@ const SubdiagramOverlay = forwardRef(function SubdiagramOverlayInner({
     if (layerRef.current) {
       const state = engine.getStateAtTime(0);
       applyAnimState(layerRef.current, state, linkRenders, null, {
-        webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: 0,
+        webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: 0, timelineStart: earliestStart,
       });
       layerRef.current.draw();
     }
@@ -644,7 +649,7 @@ const SubdiagramOverlay = forwardRef(function SubdiagramOverlayInner({
         setDisplayTime(contentDuration);
         if (layerRef.current) {
           applyAnimState(layerRef.current, state, linkRenders, null, {
-            webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: contentDuration, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById,
+            webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: contentDuration, timelineStart: earliestStart, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById,
           });
           layerRef.current.draw();
         }
@@ -654,7 +659,7 @@ const SubdiagramOverlay = forwardRef(function SubdiagramOverlayInner({
       const state = engine.getStateAtTime(elapsed);
       if (layerRef.current) {
         applyAnimState(layerRef.current, state, linkRenders, null, {
-          webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: elapsed, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById,
+          webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: elapsed, timelineStart: earliestStart, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById,
         });
         layerRef.current.draw();
       }

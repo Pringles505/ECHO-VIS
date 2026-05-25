@@ -20,6 +20,7 @@ function ContextMenu() {
     addNode,
     addVariableNode,
     addMonitorNode,
+    addGraphNode,
     addMirrorNode,
     addTextNode,
     addArea,
@@ -93,6 +94,11 @@ function ContextMenu() {
         icon: '⊡',
         label: 'Add Monitor',
         onClick: () => addMonitorNode(contextMenu.canvasX, contextMenu.canvasY),
+      });
+      menuItems.push({
+        icon: 'ƒ',
+        label: 'Add Graph',
+        onClick: () => addGraphNode(contextMenu.canvasX, contextMenu.canvasY),
       });
       menuItems.push({
         icon: '◇',
