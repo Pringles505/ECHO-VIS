@@ -116,6 +116,125 @@ export function collectGuideMatches(movingBox, allNodes) {
   return matches.sort((a, b) => a.delta - b.delta);
 }
 
+// ---------------------------------------------------------------------------
+// Orthogonal ("90°") joint snapping — draw.io style.
+//
+// When a link bend point (joint) is dragged, we want it to easily snap so the
+// segments connecting it to its immediate neighbours become exactly horizontal
+// or vertical. `neighbors` are the route points on either side of the joint
+// (already in the same render space as the dragged point).
+// ---------------------------------------------------------------------------
+const ORTHO_SNAP_DISTANCE = 8;
+const ORTHO_UNSNAP_DISTANCE = 16;
+const ORTHO_GUIDE_PAD = 24;
+
+// For a dragged joint at `point`, collect the candidate axis snaps that make a
+// segment to a neighbour orthogonal, plus the guide line to draw for each.
+export function collectOrthogonalMatches(point, neighbors) {
+  const matches = [];
+  for (const neighbor of neighbors) {
+    if (!neighbor) continue;
+    // Snapping x to the neighbour's x makes that segment vertical.
+    matches.push({
+      kind: 'ortho',
+      axis: 'x',
+      snapPos: neighbor.x,
+      delta: Math.abs(point.x - neighbor.x),
+      neighbor,
+    });
+    // Snapping y to the neighbour's y makes that segment horizontal.
+    matches.push({
+      kind: 'ortho',
+      axis: 'y',
+      snapPos: neighbor.y,
+      delta: Math.abs(point.y - neighbor.y),
+      neighbor,
+    });
+  }
+  return matches.sort((a, b) => a.delta - b.delta);
+}
+
+function buildOrthoGuide(point, match) {
+  // After snapping, build the dashed alignment line between joint and neighbour.
+  const style = { kind: 'ortho', stroke: '#22d3a6', strokeWidth: 1.25, dash: [4, 4], opacity: 0.95 };
+  if (match.axis === 'x') {
+    const x = match.snapPos;
+    const y1 = Math.min(point.y, match.neighbor.y) - ORTHO_GUIDE_PAD;
+    const y2 = Math.max(point.y, match.neighbor.y) + ORTHO_GUIDE_PAD;
+    return { id: `ortho-x-${x}`, points: [x, y1, x, y2], ...style };
+  }
+  const y = match.snapPos;
+  const x1 = Math.min(point.x, match.neighbor.x) - ORTHO_GUIDE_PAD;
+  const x2 = Math.max(point.x, match.neighbor.x) + ORTHO_GUIDE_PAD;
+  return { id: `ortho-y-${y}`, points: [x1, y, x2, y], ...style };
+}
+
+// Resolve orthogonal snapping for a dragged joint. Maintains its own sticky
+// snap state per-axis (passed in/out via `state`) so a snapped axis stays
+// snapped until dragged past the unsnap threshold — mirroring symmetry snap.
+// Returns { point, guides, state }.
+export function resolveOrthogonalSnap(rawPoint, neighbors, state) {
+  const next = { x: rawPoint.x, y: rawPoint.y };
+  const active = state ?? { x: null, y: null };
+  const nextState = { x: null, y: null };
+  const guides = [];
+
+  for (const axis of ['x', 'y']) {
+    const activeAxis = active[axis];
+    // Sticky: keep the existing snap while within the unsnap distance.
+    if (activeAxis != null && Math.abs(rawPoint[axis] - activeAxis.snapPos) <= ORTHO_UNSNAP_DISTANCE) {
+      next[axis] = activeAxis.snapPos;
+      nextState[axis] = activeAxis;
+      continue;
+    }
+    // Otherwise look for the nearest neighbour alignment on this axis.
+    let best = null;
+    for (const neighbor of neighbors) {
+      if (!neighbor) continue;
+      const delta = Math.abs(rawPoint[axis] - neighbor[axis]);
+      if (delta <= ORTHO_SNAP_DISTANCE && (!best || delta < best.delta)) {
+        best = { axis, snapPos: neighbor[axis], delta, neighbor };
+      }
+    }
+    if (best) {
+      next[axis] = best.snapPos;
+      nextState[axis] = best;
+    }
+  }
+
+  for (const axis of ['x', 'y']) {
+    if (nextState[axis]) guides.push(buildOrthoGuide(next, nextState[axis]));
+  }
+
+  return { point: next, guides, state: nextState };
+}
+
+// One-shot: snap a joint to the nearest orthogonal alignment with its
+// neighbours regardless of distance (used by the "Make 90°" action).
+export function orthogonalizeJointPoint(point, neighbors) {
+  const next = { x: point.x, y: point.y };
+  let bestX = null;
+  let bestY = null;
+  for (const neighbor of neighbors) {
+    if (!neighbor) continue;
+    const dx = Math.abs(point.x - neighbor.x);
+    const dy = Math.abs(point.y - neighbor.y);
+    if (bestX == null || dx < bestX.delta) bestX = { delta: dx, pos: neighbor.x };
+    if (bestY == null || dy < bestY.delta) bestY = { delta: dy, pos: neighbor.y };
+  }
+  // Snap the axis whose neighbour alignment is closest, so we square up the
+  // sharper corner first without collapsing both segments.
+  if (bestX && bestY) {
+    if (bestX.delta <= bestY.delta) next.x = bestX.pos;
+    else next.y = bestY.pos;
+  } else if (bestX) {
+    next.x = bestX.pos;
+  } else if (bestY) {
+    next.y = bestY.pos;
+  }
+  return next;
+}
+
 export function isSameGuideMatch(a, b) {
   return !!a && !!b &&
     a.stationaryId === b.stationaryId &&
@@ -144,4 +263,6 @@ export {
   SNAP_DISTANCE,
   UNSNAP_DISTANCE,
   GUIDE_SHOW_DISTANCE,
+  ORTHO_SNAP_DISTANCE,
+  ORTHO_UNSNAP_DISTANCE,
 };

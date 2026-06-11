@@ -14,9 +14,14 @@ export function readProject(id) {
   catch { return null; }
 }
 
+// Returns the saved project, or null when localStorage rejects the write
+// (typically QuotaExceededError on very large documents). Callers that care
+// about data loss (autosave) should surface the failure to the user.
 export function writeProject(project) {
   const updatedAt = new Date().toISOString();
   const full = { ...project, updatedAt };
+  const list = listProjects();
+  const idx = list.findIndex(p => p.id === full.id);
   const meta = {
     id: full.id,
     name: full.name,
@@ -24,14 +29,18 @@ export function writeProject(project) {
     updatedAt,
     nodeCount: full.nodes.length,
     linkCount: full.links.length,
-    preview: full.preview ?? null,
+    // Saves that don't capture a fresh thumbnail must not wipe the existing one.
+    preview: full.preview !== undefined ? full.preview : (idx >= 0 ? list[idx].preview ?? null : null),
   };
-  const list = listProjects();
-  const idx = list.findIndex(p => p.id === full.id);
   if (idx >= 0) list[idx] = meta;
   else list.unshift(meta);
-  localStorage.setItem(PROJECTS_KEY, JSON.stringify(list));
-  localStorage.setItem(PROJECT_DATA(full.id), JSON.stringify(full));
+  try {
+    localStorage.setItem(PROJECTS_KEY, JSON.stringify(list));
+    localStorage.setItem(PROJECT_DATA(full.id), JSON.stringify(full));
+  } catch (err) {
+    console.error('[projectStore] save failed (storage quota?):', err);
+    return null;
+  }
   return full;
 }
 
@@ -63,6 +72,7 @@ export function createBlankProject(name = 'Untitled') {
     updatedAt: new Date().toISOString(),
     nodes: [],
     links: [],
+    slideBreaks: [],
   };
 }
 
@@ -99,6 +109,8 @@ export function parseProjectFile(jsonString) {
     updatedAt: new Date().toISOString(),
     nodes: data.nodes,
     links: data.links,
+    slideBreaks: Array.isArray(data.slideBreaks) ? data.slideBreaks : (Array.isArray(data.slides) ? data.slides : []),
+    captureFrame: data.captureFrame ?? null,
   };
 }
 

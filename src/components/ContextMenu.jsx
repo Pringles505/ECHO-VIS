@@ -6,11 +6,13 @@ import { createJointForLink, getClosestNodeOutlinePosition } from '../links/link
 const NODE_SHAPE_MENU = [
   { key: 'rectangle', icon: '▭', label: 'Rectangle' },
   { key: 'pill', icon: '⬭', label: 'Pill' },
+  { key: 'database', icon: '⌭', label: 'Database' },
   { key: 'cylinder', icon: '⌭', label: 'Cylinder' },
   { key: 'diamond', icon: '◇', label: 'Diamond' },
   { key: 'hexagon', icon: '⬢', label: 'Hexagon' },
   { key: 'slanted', icon: '▱', label: 'Slanted' },
   { key: 'circle', icon: '◯', label: 'Circle' },
+  { key: 'protocol', icon: '▦', label: 'Protocol' },
 ];
 
 function ContextMenu() {
@@ -33,8 +35,13 @@ function ContextMenu() {
     addNodeAnchor,
     setSelected,
     setSelectedJoint,
+    updateLink,
     updateLinkJoint,
+    orthogonalizeJoint,
+    alignNodes,
+    distributeNodes,
     reverseLink,
+    stripAnimation,
   } = useStore();
   const menuRef = useRef(null);
   const [canvasMenuView, setCanvasMenuView] = useState('root');
@@ -134,6 +141,13 @@ function ContextMenu() {
   }
 
   if (contextMenu.type === 'link') {
+    const ctxLink = links.find(item => item.id === contextMenu.linkId);
+    const isOrthogonal = ctxLink?.routeStyle === 'orthogonal';
+    menuItems.push({
+      icon: isOrthogonal ? '╱' : '⌐',
+      label: isOrthogonal ? 'Straight route' : 'Right-angle route',
+      onClick: () => updateLink(contextMenu.linkId, { routeStyle: isOrthogonal ? null : 'orthogonal' }),
+    });
     menuItems.push({
       icon: '⇄',
       label: 'Reverse direction',
@@ -183,9 +197,45 @@ function ContextMenu() {
         setSelected(node.id);
       },
     });
+
+    const stripIds = [...new Set([
+      ...(selectedIds ?? []),
+      selectedId,
+      contextMenu.nodeId,
+    ].filter(Boolean))];
+    const nodeSelectionIds = stripIds.filter(id => nodes.some(node => node.id === id));
+    const stripCount = nodeSelectionIds.length;
+
+    if (stripCount >= 2) {
+      menuItems.push({ icon: '⊢', label: 'Align left', onClick: () => alignNodes(nodeSelectionIds, 'left') });
+      menuItems.push({ icon: '↔', label: 'Align center', onClick: () => alignNodes(nodeSelectionIds, 'hcenter') });
+      menuItems.push({ icon: '⊣', label: 'Align right', onClick: () => alignNodes(nodeSelectionIds, 'right') });
+      menuItems.push({ icon: '⊤', label: 'Align top', onClick: () => alignNodes(nodeSelectionIds, 'top') });
+      menuItems.push({ icon: '↕', label: 'Align middle', onClick: () => alignNodes(nodeSelectionIds, 'vcenter') });
+      menuItems.push({ icon: '⊥', label: 'Align bottom', onClick: () => alignNodes(nodeSelectionIds, 'bottom') });
+    }
+    if (stripCount >= 3) {
+      menuItems.push({ icon: '☰', label: 'Distribute horizontally', onClick: () => distributeNodes(nodeSelectionIds, 'horizontal') });
+      menuItems.push({ icon: '|||', label: 'Distribute vertically', onClick: () => distributeNodes(nodeSelectionIds, 'vertical') });
+    }
+
+    menuItems.push({
+      icon: '✂',
+      label: stripCount > 1 ? `Strip Animation (${stripCount})` : 'Strip Animation',
+      onClick: () => stripAnimation(stripIds),
+    });
   }
 
   if (contextMenu.type === 'joint') {
+    menuItems.push({
+      icon: '⌐',
+      label: 'Make 90°',
+      onClick: () => {
+        orthogonalizeJoint(contextMenu.linkId, contextMenu.jointId);
+        setSelected(contextMenu.linkId);
+        setSelectedJoint(contextMenu.jointId);
+      },
+    });
     menuItems.push({
       icon: '◎',
       label: 'Create Junction',

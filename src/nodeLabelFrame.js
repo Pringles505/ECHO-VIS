@@ -11,7 +11,7 @@ export function getNodeLabelFrame(node, options = {}) {
 
   if (node?.shape === 'pill') {
     padX = Math.max(20, h * 0.34);
-  } else if (node?.shape === 'pillar' || node?.shape === 'cylinder') {
+  } else if (node?.shape === 'pillar' || node?.shape === 'cylinder' || node?.shape === 'database') {
     padX = Math.max(20, w * 0.14);
   } else if (node?.shape === 'slanted') {
     padX = Math.max(22, w * 0.16);
@@ -25,6 +25,9 @@ export function getNodeLabelFrame(node, options = {}) {
     padY = Math.max(12, h * 0.18);
   } else if (node?.shape === 'rounded') {
     padX = Math.max(padX, 14 + (node.cornerRadius ?? 10) * 0.45);
+  } else if (node?.shape === 'protocol') {
+    // Keep the label clear of the side connector pins.
+    padX = Math.max(18, w * 0.13);
   }
 
   const bottomPad = options.reserveBottomRightBadge

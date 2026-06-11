@@ -1,33 +1,16 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Circle, Group, Line, Path, Rect, Text } from 'react-konva';
-import { pageColors } from '../../../colorThemes';
+import { pageColors } from '../../colorThemes';
 import { buildLinkRenderData, getLinkParallelOffset, getNodeAnchorCandidates, JOINT_HIT_RADIUS } from '../../links/linkGeometry';
 import useStore from '../../store/useStore';
 import { buildWebByLinkId, computeVariableWebs } from '../../variables/flow';
-import { collectGuideMatches, collectVisibleGuides, isSameGuideMatch, SNAP_DISTANCE, UNSNAP_DISTANCE } from './symmetryGuides';
+import { getManualTokenBaseText, normalizeManualTokenTextKeyframes } from '../../animation/manualTokenTiming';
+import { collectGuideMatches, collectVisibleGuides, isSameGuideMatch, resolveOrthogonalSnap, SNAP_DISTANCE, UNSNAP_DISTANCE } from './symmetryGuides';
+import LinkFailureMark from './LinkFailureMark';
 
 const END_HANDLE_RADIUS = 7;
 const ANCHOR_PAD = 12;
 
-function getLinkMidpoint(startPoint, jointRenderPoints, endPoint) {
-  const pts = [startPoint, ...jointRenderPoints, endPoint];
-  let totalLen = 0;
-  for (let i = 0; i < pts.length - 1; i++) {
-    totalLen += Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
-  }
-  if (totalLen === 0) return { x: (startPoint.x + endPoint.x) / 2, y: (startPoint.y + endPoint.y) / 2 };
-  const half = totalLen / 2;
-  let acc = 0;
-  for (let i = 0; i < pts.length - 1; i++) {
-    const segLen = Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
-    if (acc + segLen >= half) {
-      const t = (half - acc) / segLen;
-      return { x: pts[i].x + t * (pts[i + 1].x - pts[i].x), y: pts[i].y + t * (pts[i + 1].y - pts[i].y) };
-    }
-    acc += segLen;
-  }
-  return endPoint;
-}
 const SIDE_CENTER_SNAP = 10;
 const GRID_SPACING = 72;
 const GRID_SNAP_DISTANCE = 10;
@@ -97,6 +80,7 @@ function LinkShape({
     showGridLines,
     showSymmetryLines,
     snapToSymmetryLines,
+    snapToOrthogonal,
     setSymmetryGuides,
   } = useStore();
   const render = buildLinkRenderData(link, fromNode, toNode, allLinks, nodes);
@@ -105,15 +89,11 @@ function LinkShape({
   const sourceAnchors = getNodeAnchorCandidates(fromNode, parallelOffset);
   const targetAnchors = getNodeAnchorCandidates(toNode, parallelOffset);
   const isFailing = !!link.failing;
+  const showFailGroup = isFailing || !!link.failAtEnds || !!link.failOnTokenEnd;
   const color = isSelected ? pageColors.blueSelection
     : isInSelection ? pageColors.purpleAccent
     : isFailing ? pageColors.dangerBright
     : link.stroke;
-  const failSize = Math.max(7, 4 + (link.strokeWidth ?? 2) * 1.4);
-  const failStrokeWidth = Math.max(2, (link.strokeWidth ?? 2) * 0.85);
-  const failMidpoint = isFailing
-    ? getLinkMidpoint(render.startPoint, render.jointRenderPoints, render.endPoint)
-    : null;
   const hasJunctionSource = !!(link.fromJunctionLinkId && link.fromJunctionJointId);
   const [draggedStartPoint, setDraggedStartPoint] = useState(null);
   const [draggedEndPoint, setDraggedEndPoint] = useState(null);
@@ -121,6 +101,16 @@ function LinkShape({
   const endHandlePoint = draggedEndPoint ?? render.endPoint;
   const jointSnapRef = useRef(null);
   const jointGridSnapRef = useRef(null);
+  const jointOrthoSnapRef = useRef({ x: null, y: null });
+
+  // Neighbour route points (in render space) on either side of a joint, used
+  // for orthogonal/90° snapping while dragging.
+  const getJointNeighbors = (jointId) => {
+    const rp = render.routePoints;
+    const idx = rp.findIndex(p => p.id === jointId);
+    if (idx < 0) return [];
+    return [rp[idx - 1]?.point ?? null, rp[idx + 1]?.point ?? null];
+  };
 
   useEffect(() => {
     setDraggedStartPoint(null);
@@ -142,44 +132,92 @@ function LinkShape({
       ? ownerVariable[key]
       : (simulateOptions?.[key] ?? fallback)
   );
-  const tokenR = Math.max(2, Math.min(24, pick('tokenSize', 7)));
-  const tokenFill = pick('tokenFill', '#ffffff');
+  const inheritedTokenSize = pick('tokenSize', 7);
+  const inheritedTokenFill = pick('tokenFill', '#ffffff');
   const tokenStroke = pick('tokenStroke', pageColors.blueLink);
+  const tokenR = Math.max(2, Math.min(24,
+    link.manualTokenEnabled && Number.isFinite(link.manualTokenSize)
+      ? link.manualTokenSize
+      : inheritedTokenSize
+  ));
+  const tokenFill = link.manualTokenEnabled && link.manualTokenColor
+    ? link.manualTokenColor
+    : inheritedTokenFill;
   const baseTokenText = simulateOptions?.tokenText ?? '';
   const varTextOverride = (ownerVariable?.tokenText ?? '').trim();
   const sourceVar = (fromNode?.variableLabel ?? '').trim();
-  const eff = (link.messageLabel && link.messageLabel.trim())
-    ? link.messageLabel
-    : (varTextOverride || sourceVar || baseTokenText);
-  const effectiveTokenText = eff.slice(0, 6);
-  const tokenTextColor = pick('tokenTextColor', tokenStroke);
-  const tokenTextSize = Math.max(8, Math.min(24, pick('tokenTextSize', 10)));
+  const inheritedText = varTextOverride || sourceVar || baseTokenText;
+  const eff = link.manualTokenEnabled
+    ? getManualTokenBaseText(link, inheritedText)
+    : ((link.messageLabel && link.messageLabel.trim()) ? link.messageLabel : inheritedText);
+  const messageOverlapsToken = !link.manualTokenEnabled || link.manualTokenMessageOverlap !== false;
+  const manualTextKeyframes = normalizeManualTokenTextKeyframes(link.manualTokenTextKeyframes);
+  const longestTokenText = [eff, ...manualTextKeyframes.map(keyframe => keyframe.text)]
+    .reduce((longest, text) => text.length > longest.length ? text : longest, '');
+  const effectiveTokenText = eff.slice(0, messageOverlapsToken ? 6 : 24);
+  const longestVisibleTokenText = longestTokenText.slice(0, messageOverlapsToken ? 6 : 24);
+  const inheritedTokenTextColor = pick('tokenTextColor', tokenStroke);
+  const inheritedTokenTextSize = pick('tokenTextSize', 10);
+  const tokenTextColor = link.manualTokenEnabled && link.manualTokenTextColor
+    ? link.manualTokenTextColor
+    : inheritedTokenTextColor;
+  const tokenTextSize = Math.max(8, Math.min(24,
+    link.manualTokenEnabled && Number.isFinite(link.manualTokenTextSize)
+      ? link.manualTokenTextSize
+      : inheritedTokenTextSize
+  ));
   const tokenShape = pick('tokenShape', 'circle');
+  const tokenLabelWidth = messageOverlapsToken
+    ? tokenR * 2
+    : Math.max(tokenR * 2, Math.min(160, longestVisibleTokenText.length * tokenTextSize * 0.65 + 8));
+  const tokenLabelHeight = messageOverlapsToken ? tokenR * 2 : tokenTextSize * 1.4;
+  const tokenLabelY = messageOverlapsToken ? 0 : -(tokenR + tokenLabelHeight + 4);
 
   return (
-    <Group>
+    <Group id={`link-wrap-${link.id}`}>
       {renderPaths && (
         <>
           <Path
+            id={`link-shaft-${link.id}`}
             data={render.pathData}
-            stroke={pageColors.blackHitArea}
-            strokeWidth={Math.max(14, link.strokeWidth + 12)}
+            stroke={color}
+            baseStroke={color}
+            strokeWidth={isSelected ? link.strokeWidth + 1 : link.strokeWidth}
             lineCap="round"
             lineJoin="round"
+            hitStrokeWidth={Math.max(14, link.strokeWidth + 12)}
             onClick={(e) => { e.cancelBubble = true; onSelect?.(e.evt?.shiftKey); }}
             onTap={(e) => { e.cancelBubble = true; onSelect?.(false); }}
             onContextMenu={(e) => { e.cancelBubble = true; onContextMenu(e); }}
           />
 
+          {/* Fail tint overlay, controlled by applyAnimState (opacity only) */}
           <Path
-            id={`link-shaft-${link.id}`}
+            id={`link-shaft-fail-overlay-${link.id}`}
             data={render.pathData}
-            stroke={color}
+            stroke={pageColors.dangerBright}
             strokeWidth={isSelected ? link.strokeWidth + 1 : link.strokeWidth}
             lineCap="round"
             lineJoin="round"
+            opacity={0}
             listening={false}
           />
+
+          {/* Screen-centered fail X (opacity/scale controlled in applyAnimState) */}
+          <Group id={`link-fail-screen-x-${link.id}`} opacity={0} listening={false}>
+            <Line
+              points={[-28, -28, 28, 28]}
+              stroke={pageColors.dangerBright}
+              strokeWidth={4}
+              lineCap="round"
+            />
+            <Line
+              points={[-28, 28, 28, -28]}
+              stroke={pageColors.dangerBright}
+              strokeWidth={4}
+              lineCap="round"
+            />
+          </Group>
 
           <Line
             id={`link-head-${link.id}`}
@@ -203,16 +241,18 @@ function LinkShape({
             ) : (
               <Circle radius={tokenR} fill={tokenFill} stroke={tokenStroke} strokeWidth={2} />
             )}
-            {!!effectiveTokenText && (
+            {(!!effectiveTokenText || manualTextKeyframes.length > 0) && (
               <Text
                 id={`link-token-label-${link.id}`}
                 text={effectiveTokenText}
                 align="center"
                 verticalAlign="middle"
-                offsetX={tokenR}
-                offsetY={tokenR}
-                width={tokenR * 2}
-                height={tokenR * 2}
+                x={0}
+                y={tokenLabelY}
+                offsetX={tokenLabelWidth / 2}
+                offsetY={messageOverlapsToken ? tokenR : 0}
+                width={tokenLabelWidth}
+                height={tokenLabelHeight}
                 fill={tokenTextColor}
                 fontSize={tokenTextSize}
                 fontFamily="Inter, system-ui, sans-serif"
@@ -221,38 +261,7 @@ function LinkShape({
             )}
           </Group>
 
-          {isFailing && failMidpoint && (
-            <Group
-              id={`link-fail-${link.id}`}
-              x={failMidpoint.x}
-              y={failMidpoint.y}
-              listening={false}
-            >
-              <Circle
-                radius={failSize + 6}
-                fill={pageColors.dangerMain}
-                opacity={0.18}
-              />
-              <Circle
-                radius={failSize + 2}
-                stroke={pageColors.dangerBright}
-                strokeWidth={1}
-                opacity={0.35}
-              />
-              <Line
-                points={[-failSize, -failSize, failSize, failSize]}
-                stroke={pageColors.dangerBright}
-                strokeWidth={failStrokeWidth}
-                lineCap="round"
-              />
-              <Line
-                points={[failSize, -failSize, -failSize, failSize]}
-                stroke={pageColors.dangerBright}
-                strokeWidth={failStrokeWidth}
-                lineCap="round"
-              />
-            </Group>
-          )}
+      {showFailGroup && <LinkFailureMark link={link} render={render} />}
         </>
       )}
 
@@ -400,6 +409,7 @@ function LinkShape({
               e.cancelBubble = true;
               jointSnapRef.current = null;
               jointGridSnapRef.current = null;
+              jointOrthoSnapRef.current = { x: null, y: null };
               setSymmetryGuides([]);
               onJointDragStart(joint.id);
             }}
@@ -408,8 +418,32 @@ function LinkShape({
               let nextPoint = { x: e.target.x(), y: e.target.y(), width: 0, height: 0, id: `joint-${joint.id}` };
               const canShowGuides = showSymmetryLines;
               const canSnap = showSymmetryLines && snapToSymmetryLines;
+
+              // --- Orthogonal (90°) snapping: highest priority, per axis ---
+              let orthoGuides = [];
+              const orthoPinned = { x: false, y: false };
+              if (snapToOrthogonal) {
+                const ortho = resolveOrthogonalSnap(nextPoint, getJointNeighbors(joint.id), jointOrthoSnapRef.current);
+                jointOrthoSnapRef.current = ortho.state;
+                nextPoint = { ...nextPoint, x: ortho.point.x, y: ortho.point.y };
+                orthoGuides = ortho.guides;
+                orthoPinned.x = ortho.state.x != null;
+                orthoPinned.y = ortho.state.y != null;
+              } else {
+                jointOrthoSnapRef.current = { x: null, y: null };
+              }
+
               let guideMatches = (canShowGuides || canSnap) ? collectGuideMatches(nextPoint, nodes) : [];
               let guideMatch = guideMatches[0] ?? null;
+              // Don't let symmetry override an axis already pinned to 90°.
+              if (guideMatch && orthoPinned[guideMatch.axis]) {
+                guideMatch = guideMatches.find(match => !orthoPinned[match.axis]) ?? null;
+              }
+
+              // Release a symmetry snap whose axis is now pinned to 90°.
+              if (jointSnapRef.current && orthoPinned[jointSnapRef.current.axis]) {
+                jointSnapRef.current = null;
+              }
 
               if (canSnap && jointSnapRef.current) {
                 const activeSnap = jointSnapRef.current;
@@ -466,19 +500,26 @@ function LinkShape({
                 if (jointGridSnapRef.current) {
                   nextPoint = {
                     ...nextPoint,
-                    x: jointGridSnapRef.current.x ?? nextPoint.x,
-                    y: jointGridSnapRef.current.y ?? nextPoint.y,
+                    // Never let the grid move an axis already pinned to 90°.
+                    x: orthoPinned.x ? nextPoint.x : (jointGridSnapRef.current.x ?? nextPoint.x),
+                    y: orthoPinned.y ? nextPoint.y : (jointGridSnapRef.current.y ?? nextPoint.y),
                   };
                 } else {
-                  nextPoint = { ...nextPoint, ...getGridSnappedPoint(nextPoint) };
+                  const gridSnapped = getGridSnappedPoint(nextPoint);
+                  nextPoint = {
+                    ...nextPoint,
+                    x: orthoPinned.x ? nextPoint.x : gridSnapped.x,
+                    y: orthoPinned.y ? nextPoint.y : gridSnapped.y,
+                  };
                 }
               } else {
                 jointGridSnapRef.current = null;
               }
 
-              const visibleGuides = canShowGuides
-                ? collectVisibleGuides(guideMatches, jointSnapRef.current)
-                : [];
+              const visibleGuides = [
+                ...orthoGuides,
+                ...(canShowGuides ? collectVisibleGuides(guideMatches, jointSnapRef.current) : []),
+              ];
 
               setSymmetryGuides(visibleGuides);
               e.target.x(nextPoint.x);
@@ -492,6 +533,7 @@ function LinkShape({
               e.cancelBubble = true;
               jointSnapRef.current = null;
               jointGridSnapRef.current = null;
+              jointOrthoSnapRef.current = { x: null, y: null };
               setSymmetryGuides([]);
               onJointDragEnd(joint.id, {
                 x: e.target.x() - parallelOffset.x,

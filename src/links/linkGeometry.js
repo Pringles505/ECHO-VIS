@@ -683,6 +683,61 @@ function getClosestLengthOnQuadraticSegment(segment, target) {
   };
 }
 
+// Which boundary side of `node` the point sits closest to.
+function sideOfPointOnNode(point, node) {
+  const left = node.x;
+  const right = node.x + node.width;
+  const top = node.y;
+  const bottom = node.y + node.height;
+  const candidates = [
+    { side: 'left', d: Math.abs(point.x - left) },
+    { side: 'right', d: Math.abs(point.x - right) },
+    { side: 'top', d: Math.abs(point.y - top) },
+    { side: 'bottom', d: Math.abs(point.y - bottom) },
+  ];
+  return candidates.sort((a, b) => a.d - b.d)[0].side;
+}
+
+function sideNormal(side) {
+  switch (side) {
+    case 'left': return { x: -1, y: 0 };
+    case 'right': return { x: 1, y: 0 };
+    case 'top': return { x: 0, y: -1 };
+    default: return { x: 0, y: 1 };
+  }
+}
+
+// Generate intermediate right-angle waypoints between two anchored endpoints.
+// Each endpoint leaves its node along the outward normal of its side, then the
+// two stubs are joined with horizontal/vertical segments — draw.io's default
+// orthogonal connector behaviour.
+function buildOrthogonalWaypoints(start, fromNode, end, toNode) {
+  const STUB = 22;
+  const sideStart = sideOfPointOnNode(start, fromNode);
+  const sideEnd = sideOfPointOnNode(end, toNode);
+  const n0 = sideNormal(sideStart);
+  const n1 = sideNormal(sideEnd);
+  const a = { x: start.x + n0.x * STUB, y: start.y + n0.y * STUB };
+  const b = { x: end.x + n1.x * STUB, y: end.y + n1.y * STUB };
+  const horizA = sideStart === 'left' || sideStart === 'right';
+  const horizB = sideEnd === 'left' || sideEnd === 'right';
+
+  const points = [a];
+  if (horizA && horizB) {
+    const midX = (a.x + b.x) / 2;
+    points.push({ x: midX, y: a.y }, { x: midX, y: b.y });
+  } else if (!horizA && !horizB) {
+    const midY = (a.y + b.y) / 2;
+    points.push({ x: a.x, y: midY }, { x: b.x, y: midY });
+  } else if (horizA) {
+    points.push({ x: b.x, y: a.y });
+  } else {
+    points.push({ x: a.x, y: b.y });
+  }
+  points.push(b);
+  return points;
+}
+
 function buildSegments(routePoints) {
   const segments = [];
   let current = routePoints[0].point;
@@ -934,6 +989,19 @@ export function buildLinkRenderData(link, fromNode, toNode, allLinks = [], allNo
       point: translatePoint({ x: joint.x, y: joint.y }, anchors.offset),
     }));
 
+    // Orthogonal routing: when the link is set to right-angle style and has no
+    // manual bend points, auto-insert right-angle waypoints. These are render-
+    // only (type 'auto') and not draggable joints.
+    if (link.routeStyle === 'orthogonal' && joints.length === 0) {
+      const autoPoints = buildOrthogonalWaypoints(anchors.start, fromNode, anchors.end, toNode)
+        .map(point => ({ type: 'auto', point }));
+      return [
+        { type: 'endpoint', point: anchors.start },
+        ...autoPoints,
+        { type: 'endpoint', point: anchors.end },
+      ];
+    }
+
     return [
       { type: 'endpoint', point: anchors.start },
       ...joints,
@@ -954,7 +1022,7 @@ export function buildLinkRenderData(link, fromNode, toNode, allLinks = [], allNo
     !!(link.showArrowTip || link.toAnchorSide || link.toAnchorId || (link.toJunctionLinkId && link.toJunctionJointId))
   );
   const jointRenderPoints = routePoints
-    .filter(point => point.type !== 'endpoint')
+    .filter(point => point.type !== 'endpoint' && point.type !== 'auto')
     .map(point => ({
       id: point.id,
       x: point.point.x,

@@ -1,6 +1,10 @@
 import { getLinkJointProgress } from '../links/linkGeometry';
 import { computeVariableWebs } from '../variables/flow';
 import { getNodeTextMorphs, getTextMorphRenderState, getStyleMorphRenderState } from '../text/textMorphs';
+import { computeManualTokenTimingByLinkId, normalizeManualTokenTextKeyframes } from './manualTokenTiming';
+import { getNodeFailureOpacity, normalizeNodeFailureKeyframes } from './nodeFailureTiming';
+import { computeAreaScrollState } from './scrollGrid';
+import { normalizeScrollSteps } from './scrollStepTiming';
 
 const ease = {
   linear: t => t,
@@ -43,6 +47,18 @@ function getTransformMode(node) {
   return node.transformTargetNodeId ? 'existing' : 'none';
 }
 
+// For a link bound to a token hop, pick which variable's hop drives it: the
+// explicitly bound variable when present, otherwise the earliest-starting hop.
+// Shared by timeline building and per-frame rendering so they can't drift.
+function chooseHopCandidate(link, candidates) {
+  if (!candidates?.length) return null;
+  if (link.bindVariableId) {
+    const match = candidates.find(c => c.web.sourceNodeId === link.bindVariableId);
+    if (match) return match;
+  }
+  return candidates.slice().sort((a, b) => a.timing.start - b.timing.start)[0];
+}
+
 function buildExistingTransformStyle(sourceNode, fallbackNode, labelText = sourceNode?.label ?? '') {
   if (!isResolvableTargetNode(sourceNode)) return null;
   return {
@@ -78,6 +94,10 @@ export class AnimationEngine {
   constructor(nodes, links, options = {}) {
     this.nodes = nodes;
     this.links = links;
+    // getStateAtTime runs per animation frame; Map lookups keep it O(events)
+    // instead of O(events × elements) from repeated Array.find scans.
+    this._nodeById = new Map(nodes.map(node => [node.id, node]));
+    this._linkById = new Map(links.map(link => [link.id, link]));
     this.opts = {
       initialDelay: options.initialDelay ?? 0.3,
       nodeDuration: options.nodeDuration ?? 0.5,
@@ -106,7 +126,7 @@ export class AnimationEngine {
 
     const events = [];
     let t = initialDelay;
-    const linkMap = Object.fromEntries(this.links.map(link => [link.id, link]));
+    const linkMap = this._linkById;
     const junctionStartCache = new Map();
     const getSubdiagramPopupMetrics = (node, start, duration, triggerLinkInfo = null) => {
       if (
@@ -251,7 +271,7 @@ export class AnimationEngine {
       }
 
       const sourceJoint = link.fromJunctionLinkId && link.fromJunctionJointId
-        ? linkMap[link.fromJunctionLinkId]?.joints?.find(joint => joint.id === link.fromJunctionJointId) ?? null
+        ? linkMap.get(link.fromJunctionLinkId)?.joints?.find(joint => joint.id === link.fromJunctionJointId) ?? null
         : null;
       const syncBranches = !!sourceJoint?.syncBranches;
 
@@ -288,15 +308,7 @@ export class AnimationEngine {
 
       // If binding to token hop is enabled, override start/duration from tokenTiming
       if (link.bindToTokenHop) {
-        const candidates = timingByLinkId.get(link.id) ?? [];
-        let chosen = null;
-        if (link.bindVariableId) {
-          chosen = candidates.find(c => c.web.sourceNodeId === link.bindVariableId) ?? null;
-        }
-        if (!chosen && candidates.length) {
-          // pick earliest start among variables
-          chosen = candidates.slice().sort((a, b) => a.timing.start - b.timing.start)[0];
-        }
+        const chosen = chooseHopCandidate(link, timingByLinkId.get(link.id));
         if (chosen) {
           const offset = Number.isFinite(link.bindHopOffset) ? link.bindHopOffset : 0;
           const scale = Number.isFinite(link.bindHopScale) && link.bindHopScale > 0 ? link.bindHopScale : 1;
@@ -339,7 +351,7 @@ export class AnimationEngine {
     const scheduledEvents = [];
     const getCandidateStart = (event) => {
       if (event.type !== 'node') return event.start;
-      const node = this.nodes.find(item => item.id === event.id);
+      const node = this._nodeById.get(event.id);
       if (!node?.triggerAfterLinkId) return event.start;
       const triggerLinkInfo = scheduledLinkInfoMap[node.triggerAfterLinkId];
       if (!triggerLinkInfo) return null;
@@ -402,7 +414,7 @@ export class AnimationEngine {
         continue;
       }
 
-      const node = this.nodes.find(item => item.id === event.id);
+      const node = this._nodeById.get(event.id);
       const triggerLinkInfo = node?.triggerAfterLinkId ? scheduledLinkInfoMap[node.triggerAfterLinkId] : null;
       const popup = getSubdiagramPopupMetrics(node, event.start, event.duration, triggerLinkInfo);
       if (!popup) continue;
@@ -435,18 +447,17 @@ export class AnimationEngine {
 
     for (const event of finalEvents) {
       if (event.type !== 'node') continue;
-      const node = this.nodes.find(item => item.id === event.id);
+      const node = this._nodeById.get(event.id);
       if (!node || node.type === 'subdiagram') continue;
 
       const transformMode = getTransformMode(node);
       if (transformMode === 'none') continue;
 
-      const targetNode = transformMode === 'existing'
-        ? this.nodes.find(item => (
-          item.id === node.transformTargetNodeId &&
-          item.id !== node.id &&
-          isResolvableTargetNode(item)
-        ))
+      const candidate = transformMode === 'existing'
+        ? this._nodeById.get(node.transformTargetNodeId)
+        : null;
+      const targetNode = candidate && candidate.id !== node.id && isResolvableTargetNode(candidate)
+        ? candidate
         : null;
       const transformTargetStyle = transformMode === 'custom'
         ? buildCustomTransformStyle(node)
@@ -467,7 +478,7 @@ export class AnimationEngine {
     // Compute simple popup window for non-subdiagram nodes that opt in.
     for (const event of finalEvents) {
       if (event.type !== 'node') continue;
-      const node = this.nodes.find(item => item.id === event.id);
+      const node = this._nodeById.get(event.id);
       if (!node) continue;
       if (node.type === 'subdiagram') continue; // subdiagrams use nested popup windows
 
@@ -504,59 +515,65 @@ export class AnimationEngine {
     // Extend to cover text morph end times, which are not represented as timeline events
     for (const event of finalEvents) {
       if (event.type !== 'node') continue;
-      const node = this.nodes.find(n => n.id === event.id);
+      const node = this._nodeById.get(event.id);
       if (!node) continue;
       for (const morph of getNodeTextMorphs(node, { start: event.start, duration: event.duration })) {
         this._contentDuration = Math.max(this._contentDuration, morph.startTime + morph.duration);
       }
     }
 
-    // Extend to cover graph point keyframes and chain playback within graph nodes
-    const eventByNodeId = Object.fromEntries(finalEvents.filter(ev => ev.type === 'node').map(ev => [ev.id, ev]));
+    // Graph point keyframes use absolute timeline times in both chain and custom-vector modes.
     for (const node of this.nodes) {
       if (node.type !== 'graph') continue;
-      const ev = eventByNodeId[node.id];
-      if (!ev) continue;
-      const baseStart = ev.start;
-      const chain = !!node.graphChainPlayback;
-      const vectors = node.graphVectors ?? [];
       const points = node.graphPoints ?? [];
-      const speed = (Number.isFinite(node.vectorSpeed) && node.vectorSpeed > 0) ? node.vectorSpeed : 0.2;
       const defaultPointDur = 0.35;
-      let maxLocalEnd = 0;  // seconds relative to chain anchor (for chain)
-      let maxGlobalEnd = 0; // absolute seconds (for non-chain)
-
-      if (chain) {
-        // Chain mode: join all points, alternate P(k) then V(k)
-        const n = points.length;
-        if (n > 0) {
-          // Last event could be point(n-1) fade if no trailing vector
-          const lastPointEnd = (2 * (n - 1) + 1) * speed; // start=2*(n-1)*S, end at +S
-          maxLocalEnd = Math.max(maxLocalEnd, lastPointEnd);
-        }
-        if (n > 1) {
-          // Final vector index = n-2, ends at (2*(n-2)+2)*S = (2n-2)*S
-          const lastVectorEnd = (2 * (n - 2) + 2) * speed;
-          maxLocalEnd = Math.max(maxLocalEnd, lastVectorEnd);
-        }
-      } else {
-        // Non-sequential: points follow their own keyframes (absolute within node window)
-        for (const p of points) {
-          const st = Number.isFinite(p.startTime) ? p.startTime : 0;
-          const dur = (Number.isFinite(p.duration) && p.duration > 0) ? p.duration : defaultPointDur;
-          const endP = st + dur;
-          if (endP > maxGlobalEnd) maxGlobalEnd = endP;
-        }
-        // Consider at least one vector draw when vectors exist
-        if (vectors.length) maxGlobalEnd = Math.max(maxGlobalEnd, speed);
+      for (const point of points) {
+        const start = Number.isFinite(point.startTime) ? point.startTime : 0;
+        const duration = Number.isFinite(point.duration) && point.duration > 0
+          ? point.duration
+          : defaultPointDur;
+        this._contentDuration = Math.max(this._contentDuration, start + duration);
       }
+      // HKDF domain circles: cover both the appear keyframe and the optional
+      // "calculate" keyframe (scattered dots) so playback runs to their end.
+      for (const domain of node.graphDomains ?? []) {
+        const ds = Number.isFinite(domain.startTime) ? domain.startTime : 0;
+        const dd = Number.isFinite(domain.duration) && domain.duration > 0 ? domain.duration : 0.4;
+        this._contentDuration = Math.max(this._contentDuration, ds + dd);
+        if (domain.calc) {
+          const ct = Number.isFinite(domain.calc.time) ? domain.calc.time : 0;
+          const cd = Number.isFinite(domain.calc.duration) && domain.calc.duration > 0 ? domain.calc.duration : 1;
+          this._contentDuration = Math.max(this._contentDuration, ct + cd);
+        }
+      }
+    }
 
-      if (chain) {
-        // Chain playback starts after the graph node finishes its own entry draw.
-        this._contentDuration = Math.max(this._contentDuration, baseStart + ev.duration + maxLocalEnd);
-      } else {
-        // Absolute keyframes extend the global timeline directly
-        this._contentDuration = Math.max(this._contentDuration, maxGlobalEnd);
+    for (const node of this.nodes) {
+      for (const keyframe of normalizeNodeFailureKeyframes(node.failureKeyframes)) {
+        this._contentDuration = Math.max(
+          this._contentDuration,
+          keyframe.startTime + keyframe.duration
+        );
+      }
+    }
+
+    // Custom area-scroll steps are timeline keyframes too. Without extending the
+    // duration here, playback can end after the first step and never reach the
+    // remaining rotations.
+    for (const node of this.nodes) {
+      if (node.type !== 'area' || !node.scrollEnabled || node.scrollMode !== 'stepped') continue;
+      for (const step of normalizeScrollSteps(node.scrollSteps)) {
+        this._contentDuration = Math.max(this._contentDuration, step.time + step.duration);
+      }
+    }
+
+    const manualTokenTimingById = computeManualTokenTimingByLinkId(this.links, finalEvents);
+    for (const timing of Object.values(manualTokenTimingById)) {
+      this._contentDuration = Math.max(this._contentDuration, timing.start + timing.duration);
+    }
+    for (const link of this.links) {
+      for (const keyframe of normalizeManualTokenTextKeyframes(link.manualTokenTextKeyframes)) {
+        this._contentDuration = Math.max(this._contentDuration, keyframe.time);
       }
     }
 
@@ -577,7 +594,16 @@ export class AnimationEngine {
     return this._timeline;
   }
 
-  getStateAtTime(t) {
+  // Variable webs computed against the final timeline, cached so callers
+  // (playback, exporters) don't recompute what the engine already derived.
+  getVariableWebs() {
+    if (!this._variableWebs) {
+      this._variableWebs = computeVariableWebs(this.nodes, this.links, { timeline: this._timeline });
+    }
+    return this._variableWebs;
+  }
+
+  getStateAtTime(t, scrollTime = t) {
     const nodeStates = {};
     const linkStates = {};
 
@@ -585,10 +611,12 @@ export class AnimationEngine {
       const raw = clamp((t - event.start) / event.duration, 0, 1);
 
       if (event.type === 'node') {
-        const node = this.nodes.find(item => item.id === event.id);
+        const node = this._nodeById.get(event.id);
         const isWriteText = node?.type === 'text' && node?.textAnimMode === 'write';
         const duration = Math.max(event.duration, 0.0001);
-        const entryProgress = raw;
+        // Instant mode: skip the entry fade/scale-in and pop the node in fully the
+        // moment its keyframe is reached. Morphs/transforms keep their own timing.
+        const entryProgress = node?.disableAnimation ? (t >= event.start ? 1 : 0) : raw;
         const transformProgress = event.transformStart != null && event.transformEnd != null
           ? ease.easeInOut(clamp((t - event.transformStart) / Math.max(0.0001, event.transformEnd - event.transformStart), 0, 1))
           : 0;
@@ -624,6 +652,7 @@ export class AnimationEngine {
             : (textState?.overlayOpacity ?? 0),
           transformProgress,
           popupProgress,
+          failureOpacity: getNodeFailureOpacity(node, t),
           targetFill: event.transformTargetStyle?.fill ?? null,
           targetStroke: event.transformTargetStyle?.stroke ?? null,
           targetTextColor: event.transformTargetStyle?.textColor ?? null,
@@ -640,35 +669,56 @@ export class AnimationEngine {
         // is active. If a morph is actively transitioning, blend from committed base to target.
         // If past a morph, hold its style by setting progress to 1.
         if (!event.transformTargetStyle && styleState) {
-          const hasBaseStyle = !!(styleState.baseStyle.fill || styleState.baseStyle.stroke || styleState.baseStyle.textColor || styleState.baseStyle.strokeWidth != null || styleState.baseStyle.cornerRadius != null);
-          const hasTarget = !!(styleState.targetStyle && (styleState.targetStyle.fill != null || styleState.targetStyle.stroke != null || styleState.targetStyle.textColor != null || styleState.targetStyle.strokeWidth != null || styleState.targetStyle.cornerRadius != null));
+          const base = styleState.baseStyle;       // style committed by earlier morphs
+          const tgt = styleState.hasActive ? styleState.targetStyle : styleState.baseStyle;
+
+          // Alpha morph: blend the node's opacity from the committed value to this
+          // morph's target so a morph can fade a node out (disappear) or back in.
+          // Applied directly to opacity, independent of the fill/stroke cross-fade.
+          const hasAlphaMorph = base.alpha != null || (tgt && tgt.alpha != null);
+          if (hasAlphaMorph) {
+            const fromAlpha = base.alpha != null ? base.alpha : 1;
+            const toAlpha = (tgt && tgt.alpha != null) ? tgt.alpha : 1;
+            const alphaP = styleState.hasActive ? ease.easeInOut(styleState.progress) : 1;
+            baseState.opacity = baseState.opacity * lerp(fromAlpha, toAlpha, alphaP);
+          }
+
+          const hasBaseStyle = !!(base.fill || base.stroke || base.textColor || base.strokeWidth != null || base.cornerRadius != null);
+          const hasTarget = !!(tgt && (tgt.fill != null || tgt.stroke != null || tgt.textColor != null || tgt.strokeWidth != null || tgt.cornerRadius != null));
           if (hasTarget || hasBaseStyle) {
             const morphP = styleState.hasActive ? ease.easeInOut(styleState.progress) : (hasBaseStyle ? 1 : 0);
             baseState.transformProgress = Math.max(baseState.transformProgress, morphP);
-            const chosen = styleState.hasActive ? styleState.targetStyle : styleState.baseStyle;
-            baseState.targetFill = chosen.fill ?? null;
-            baseState.targetStroke = chosen.stroke ?? null;
-            baseState.targetTextColor = chosen.textColor ?? null;
-            baseState.targetStrokeWidth = chosen.strokeWidth ?? null;
-            baseState.targetCornerRadius = chosen.cornerRadius ?? null;
+            // tgt is this morph's fully-resolved form (its values, or the node default
+            // for anything it leaves unset). The latest morph defines the latest form.
+            baseState.targetFill = tgt.fill ?? null;
+            baseState.targetStroke = tgt.stroke ?? null;
+            baseState.targetTextColor = tgt.textColor ?? null;
+            baseState.targetStrokeWidth = tgt.strokeWidth ?? null;
+            baseState.targetCornerRadius = tgt.cornerRadius ?? null;
+            // Blend FROM the previously committed form (the prior morph's resolved
+            // values), so chained morphs transition form→form smoothly instead of
+            // snapping through the node's base color between keyframes.
+            baseState.morphFromFill = base.fill ?? null;
+            baseState.morphFromStroke = base.stroke ?? null;
+            baseState.morphFromTextColor = base.textColor ?? null;
+            baseState.morphFromStrokeWidth = base.strokeWidth ?? null;
+            baseState.morphFromCornerRadius = base.cornerRadius ?? null;
           }
         }
 
         nodeStates[event.id] = baseState;
       } else {
+        const link = this._linkById.get(event.id);
         // Default link progress from scheduled event
         let progress = ease.easeOut(raw);
+        // Instant mode: skip the draw-in and pop fully drawn at the keyframe.
+        if (link && link.disableAnimation) {
+          linkStates[event.id] = { progress: t >= event.start ? 1 : 0 };
+          continue;
+        }
         // If this link is bound to a token hop, override using hop timing
-        const link = this.links.find(l => l.id === event.id);
         if (link && link.bindToTokenHop && this._hopTimingByLinkId) {
-          const candidates = this._hopTimingByLinkId.get(link.id) ?? [];
-          let chosen = null;
-          if (link.bindVariableId) {
-            chosen = candidates.find(c => c.web.sourceNodeId === link.bindVariableId) ?? null;
-          }
-          if (!chosen && candidates.length) {
-            chosen = candidates.slice().sort((a, b) => a.timing.start - b.timing.start)[0];
-          }
+          const chosen = chooseHopCandidate(link, this._hopTimingByLinkId.get(link.id));
           if (chosen) {
             const offset = Number.isFinite(link.bindHopOffset) ? link.bindHopOffset : 0;
             const scale = Number.isFinite(link.bindHopScale) && link.bindHopScale > 0 ? link.bindHopScale : 1;
@@ -681,6 +731,83 @@ export class AnimationEngine {
           }
         }
         linkStates[event.id] = { progress };
+      }
+    }
+
+    // Scrolling areas continuously translate + wrap the nodes inside them so a
+    // static grid reads as endless message generation. Applied after per-node
+    // states are built so it layers on top of entry/morph animation.
+    let anyScroll = false;
+    const loopDuration = this._totalDuration ?? 0;
+    for (const area of this.nodes) {
+      if (area.type !== 'area' || !area.scrollEnabled) continue;
+      const scroll = computeAreaScrollState(area, this.nodes, scrollTime, loopDuration, this.links);
+      for (const id in scroll) {
+        const state = nodeStates[id];
+        if (!state) continue;
+        const s = scroll[id];
+        anyScroll = true;
+        state.scrollDX = (state.scrollDX ?? 0) + s.scrollDX;
+        state.scrollDY = (state.scrollDY ?? 0) + s.scrollDY;
+        // The area rect is a hard clip window: members are cut at the exact edge.
+        state.scrollClip = { x: s.clipX, y: s.clipY, w: s.clipW, h: s.clipH };
+        // Deterministic per-band wrap counter; drives node re-entry fade AND the manual
+        // token replay (the token fires once each time its tile wraps the viewport edge,
+        // re-entering as the freshest message). See applyAnimState.
+        state.scrollCycleIndex = s.cycleIndex;
+        state.scrollSeamless = s.seamless;
+        state.scrollCycleElapsed = s.cycleElapsed;
+        // Deterministic seconds-per-wrap for carried manual tokens (snapped onto the
+        // link's endpoints in computeAreaScrollState); undefined when not applicable.
+        if (s.cyclePeriodSeconds != null) state.scrollCyclePeriod = s.cyclePeriodSeconds;
+      }
+    }
+
+    // Carry links along with the scrolling nodes they connect. A link translates
+    // only when both endpoints share the same scroll phase (same offset); during a
+    // wrap mismatch — or when only one endpoint scrolls — it hides so it never
+    // rubber-bands across the viewport.
+    if (anyScroll) {
+      for (const link of this.links) {
+        const fromS = nodeStates[link.fromId];
+        const toS = nodeStates[link.toId];
+        const fromScroll = !!fromS && (fromS.scrollDX != null || fromS.scrollDY != null);
+        const toScroll = !!toS && (toS.scrollDX != null || toS.scrollDY != null);
+        if (!fromScroll && !toScroll) continue;
+        const ls = linkStates[link.id];
+        if (!ls) continue;
+        // Both endpoints share a band when carried; either one's cycle index marks
+        // when the link wraps the viewport edge (drives the re-entry fade + the manual
+        // token replay). Carried always so the manual token reset stays in sync.
+        ls.scrollCycleIndex = fromS?.scrollCycleIndex ?? toS?.scrollCycleIndex;
+        ls.scrollSeamless = fromS?.scrollSeamless ?? toS?.scrollSeamless;
+        ls.scrollCycleElapsed = fromS?.scrollCycleElapsed ?? toS?.scrollCycleElapsed;
+        // Deterministic seconds-per-wrap, used to size the token's pass so it completes
+        // within one wrap gap — including the first wrap (see applyAnimState).
+        ls.scrollCyclePeriod = fromS?.scrollCyclePeriod ?? toS?.scrollCyclePeriod;
+        if (fromScroll && toScroll) {
+          const dxf = fromS.scrollDX ?? 0;
+          const dyf = fromS.scrollDY ?? 0;
+          const dxt = toS.scrollDX ?? 0;
+          const dyt = toS.scrollDY ?? 0;
+          if (Math.abs(dxf - dxt) < 0.5 && Math.abs(dyf - dyt) < 0.5) {
+            // Same phase: translate with the endpoints and clip to the area edge.
+            ls.scrollDX = dxf;
+            ls.scrollDY = dyf;
+            ls.scrollClip = fromS.scrollClip ?? toS.scrollClip ?? null;
+            ls.scrollOpacity = 1;
+          } else {
+            // Wrap mismatch: one endpoint has looped — hide so it never stretches.
+            ls.scrollDX = 0;
+            ls.scrollDY = 0;
+            ls.scrollOpacity = 0;
+          }
+        } else {
+          // Endpoint straddles the scrolling area boundary — hide rather than stretch.
+          ls.scrollDX = 0;
+          ls.scrollDY = 0;
+          ls.scrollOpacity = 0;
+        }
       }
     }
 

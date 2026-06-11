@@ -1,13 +1,67 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { v4 as uuid } from 'uuid';
 import { Ellipse, Group, Line, Rect, Text, Circle, Path, Arrow } from 'react-konva';
-import { pageColors } from '../../../colorThemes';
+import { pageColors, withAlpha } from '../../colorThemes';
 import { getNodeLabelFrame } from '../../nodeLabelFrame';
 import useStore from '../../store/useStore';
 import { getClosestNodeOutlinePosition, getNodeAnchorPoint } from '../../links/linkGeometry';
+import { getTimelineCursor } from '../../timelineCursor';
+import { getNodeDisplayText, getNodeTextFontFamily } from '../../text/equationText';
 import { collectGuideMatches, collectVisibleGuides, isSameGuideMatch, SNAP_DISTANCE, UNSNAP_DISTANCE } from './symmetryGuides';
+import NodeStatusMark, { getNodeStatusDash, getNodeStatusStroke, getNodeStatusTextColor } from './NodeStatusMark';
 
 const PORT_R = 7;
+const GRAPH_MIN_W = 160;
+const GRAPH_MIN_H = 110;
+const GRAPH_RESIZE_HANDLE_R = 5;
+
+// Deterministic scatter for HKDF "calculate" dots: same seed → same layout every
+// render, so the dots don't jump around while the user edits or scrubs.
+function hashSeed(str, extra = 0) {
+  let h = (2166136261 ^ (extra >>> 0)) >>> 0;
+  const s = String(str ?? '');
+  for (let i = 0; i < s.length; i += 1) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function next() {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+// Generate `count` dots scattered uniformly inside a pixel-space circle, each with
+// an absolute appear time staggered across the calculate window.
+function buildCalcDots(domain, sx, sy, radPx) {
+  const calc = domain?.calc;
+  if (!calc) return [];
+  const count = Math.max(0, Math.min(400, Math.round(Number.isFinite(calc.count) ? calc.count : 12)));
+  if (count === 0) return [];
+  const time = Number.isFinite(calc.time) ? calc.time : 0;
+  const dur = Number.isFinite(calc.duration) && calc.duration > 0 ? calc.duration : 1;
+  const spread = dur * 0.7;          // dots finish scattering by ~70% of the window
+  const perFade = Math.max(0.1, dur * 0.22);
+  const rng = mulberry32(hashSeed(domain.id, calc.seed ?? 1));
+  const dots = [];
+  for (let i = 0; i < count; i += 1) {
+    const ang = rng() * Math.PI * 2;
+    const rr = Math.sqrt(rng()) * radPx * 0.9; // sqrt → uniform area fill
+    const tNorm = rng();
+    dots.push({
+      i,
+      x: sx + Math.cos(ang) * rr,
+      y: sy + Math.sin(ang) * rr,
+      cStart: time + tNorm * spread,
+      cDur: perFade,
+    });
+  }
+  return dots;
+}
 
 const PORT_POSITIONS = (w, h) => [
   { x: w / 2, y: 0,     side: 'top'    },
@@ -22,9 +76,7 @@ function getVisualStroke(node, isSelected, isInSelection) {
     ? pageColors.blueSelection
     : isInSelection
       ? pageColors.purpleAccent
-      : node.failing
-        ? pageColors.dangerBright
-        : node.stroke;
+      : getNodeStatusStroke(node, node.stroke);
 }
 
 function getNodeTransformStyle(node, resolvedTargetNode) {
@@ -56,7 +108,7 @@ function getNodeTransformStyle(node, resolvedTargetNode) {
 }
 
 function renderNodeHighlight(node, extraProps = {}) {
-  if (node.shape === 'diamond' || node.shape === 'hexagon' || node.shape === 'circle' || node.shape === 'pillar' || node.shape === 'cylinder' || node.shape === 'slanted') return null;
+  if (node.shape === 'diamond' || node.shape === 'hexagon' || node.shape === 'circle' || node.shape === 'pillar' || node.shape === 'cylinder' || node.shape === 'database' || node.shape === 'slanted' || node.shape === 'protocol') return null;
   return (
     <Rect
       x={node.shape === 'pill' ? node.height / 2 : node.cornerRadius}
@@ -70,12 +122,51 @@ function renderNodeHighlight(node, extraProps = {}) {
   );
 }
 
+// Shared metrics for the "protocol" module shape.
+function protocolMetrics(w, h) {
+  const s = Math.max(6, Math.min(16, w * 0.09));       // connector-pin depth / body inset
+  const bw = w - 2 * s;                                 // inner body width
+  const r = Math.max(4, Math.min(10, bw * 0.1, h * 0.2)); // body corner radius
+  const pins = 2;
+  const ph = Math.max(7, Math.min(14, h / (pins * 2.6))); // pin height
+  const ys = [];
+  for (let i = 0; i < pins; i += 1) ys.push((h * (i + 1)) / (pins + 1));
+  return { s, bw, r, pins, ph, ys };
+}
+
+// Single closed path: a rounded body inset on both sides with two connector pins
+// jutting out of each side — a clean "module" silhouette. One fillable/strokable
+// shape so entry fade, selection dashes and colour morphs all keep working.
+function buildProtocolPath(w, h) {
+  const { s, bw, r, ph, ys } = protocolMetrics(w, h);
+  const bx = s;
+  const rx = bx + bw; // right edge of inner body
+  const cmds = [`M ${bx + r} 0`, `L ${rx - r} 0`, `Q ${rx} 0 ${rx} ${r}`];
+  for (const y of ys) {
+    const top = y - ph / 2;
+    const bot = y + ph / 2;
+    cmds.push(`L ${rx} ${top}`, `L ${w} ${top}`, `L ${w} ${bot}`, `L ${rx} ${bot}`);
+  }
+  cmds.push(`L ${rx} ${h - r}`, `Q ${rx} ${h} ${rx - r} ${h}`, `L ${bx + r} ${h}`, `Q ${bx} ${h} ${bx} ${h - r}`);
+  for (let i = ys.length - 1; i >= 0; i -= 1) {
+    const y = ys[i];
+    const top = y - ph / 2;
+    const bot = y + ph / 2;
+    cmds.push(`L ${bx} ${bot}`, `L 0 ${bot}`, `L 0 ${top}`, `L ${bx} ${top}`);
+  }
+  cmds.push(`L ${bx} ${r}`, `Q ${bx} 0 ${bx + r} 0`, 'Z');
+  return cmds.join(' ');
+}
+
 function renderNodeBody(node, stroke, strokeWidth, isInSelection, fill, shadow = false, extraProps = {}) {
   const dashProps = isInSelection ? { dash: [6, 3], dashEnabled: true } : {};
   const common = {
     stroke,
     strokeWidth,
     fill,
+    // Konva's fill+stroke buffer can be clipped when exporting a cropped stage
+    // while an ancestor is fading. Draw directly so entrance frames stay whole.
+    perfectDrawEnabled: false,
     ...dashProps,
     ...extraProps,
   };
@@ -131,7 +222,7 @@ function renderNodeBody(node, stroke, strokeWidth, isInSelection, fill, shadow =
     );
   }
 
-  if (node.shape === 'pillar' || node.shape === 'cylinder') {
+  if (node.shape === 'pillar' || node.shape === 'cylinder' || node.shape === 'database') {
     const w = node.width;
     const h = node.height;
     // Flat cylinder: slightly concave vertical sides.
@@ -174,6 +265,17 @@ function renderNodeBody(node, stroke, strokeWidth, isInSelection, fill, shadow =
     );
   }
 
+  if (node.shape === 'protocol') {
+    return (
+      <Path
+        data={buildProtocolPath(node.width, node.height)}
+        {...common}
+        x={shadow ? 4 : 0}
+        y={shadow ? 4 : 0}
+      />
+    );
+  }
+
   const cornerRadius = node.shape === 'pill'
     ? Math.min(node.width, node.height) / 2
     : node.cornerRadius;
@@ -190,7 +292,8 @@ function renderNodeBody(node, stroke, strokeWidth, isInSelection, fill, shadow =
   );
 }
 
-function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onEndLink, onRenameStart, onContextMenu, isLinking, onGroupDragStart, onGroupDragMove }) {
+
+function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onEndLink, onRenameStart, onContextMenu, isLinking, onGroupDragStart, onGroupDragMove, renderEditorChrome = true }) {
   // Use individual selectors so NodeShape only re-renders when the specific values it needs change,
   // not on every node array update (which would cause O(n) re-renders per drag frame).
   const updateNode        = useStore(state => state.updateNode);
@@ -220,6 +323,8 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
   const popupTimerRef = useRef(null);
   const dragSnapRef   = useRef(null);
   const dragStartPosRef = useRef(null);
+  const dragWriteTimeRef = useRef(0);
+  const graphResizeRef = useRef(null);
   const isTextNode = node.type === 'text';
   const transformStyle = (!isTextNode && node.transformMode && node.transformMode !== 'none')
     ? getNodeTransformStyle(node, transformTargetNode)
@@ -228,7 +333,8 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
   const strokeWidth = isSelected ? node.strokeWidth + 1 : isInSelection ? node.strokeWidth + 1 : node.strokeWidth;
   const labelFrame = getNodeLabelFrame(node);
 
-  const showPorts = isSelected || hovered || isLinking;
+  const editorHovered = renderEditorChrome && hovered;
+  const showPorts = renderEditorChrome && (isSelected || hovered || isLinking);
 
   const cx = node.x + node.width  / 2;
   const cy = node.y + node.height / 2;
@@ -296,22 +402,91 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
 
     setSymmetryGuides(visibleGuides);
     applyDraggedPosition(e.target, nextPos);
-    updateNode(node.id, { x: nextPos.x, y: nextPos.y });
 
-    if (dragStartPosRef.current) {
-      const dx = nextPos.x - dragStartPosRef.current.x;
-      const dy = nextPos.y - dragStartPosRef.current.y;
-      onGroupDragMove?.(node.id, dx, dy);
+    // The Konva group above tracks the pointer at full frame rate; the store
+    // write is what makes links and co-selected nodes follow. Replacing the
+    // nodes array per mousemove rebuilds the entire animation timeline, so
+    // throttle store writes — the exact position is committed on drag end.
+    const now = performance.now();
+    if (now - dragWriteTimeRef.current >= 40) {
+      dragWriteTimeRef.current = now;
+      updateNode(node.id, { x: nextPos.x, y: nextPos.y });
+      if (dragStartPosRef.current) {
+        const dx = nextPos.x - dragStartPosRef.current.x;
+        const dy = nextPos.y - dragStartPosRef.current.y;
+        onGroupDragMove?.(node.id, dx, dy);
+      }
     }
   };
 
   const handleDragEnd = (e) => {
     dragSnapRef.current = null;
     setSymmetryGuides([]);
-    updateNode(node.id, {
-      x: e.target.x() - node.width  / 2,
-      y: e.target.y() - node.height / 2,
-    });
+    const x = e.target.x() - node.width  / 2;
+    const y = e.target.y() - node.height / 2;
+    updateNode(node.id, { x, y });
+    // Final group sync — the last throttled move may have been skipped.
+    if (dragStartPosRef.current) {
+      onGroupDragMove?.(node.id, x - dragStartPosRef.current.x, y - dragStartPosRef.current.y);
+    }
+  };
+
+  const getCanvasPointer = (e) => {
+    const stage = e.target.getStage();
+    const pointer = stage?.getPointerPosition();
+    if (!stage || !pointer) return null;
+    return stage.getAbsoluteTransform().copy().invert().point(pointer);
+  };
+
+  const startGraphResize = (e, handle) => {
+    e.cancelBubble = true;
+    const pointer = getCanvasPointer(e);
+    if (!pointer) return;
+    graphResizeRef.current = {
+      handle,
+      pointer,
+      initial: {
+        x: node.x,
+        y: node.y,
+        width: node.width,
+        height: node.height,
+      },
+    };
+  };
+
+  const resizeGraph = (e) => {
+    e.cancelBubble = true;
+    const resize = graphResizeRef.current;
+    const pointer = getCanvasPointer(e);
+    if (!resize || !pointer) return;
+
+    const dx = pointer.x - resize.pointer.x;
+    const dy = pointer.y - resize.pointer.y;
+    let { x, y, width, height } = resize.initial;
+
+    if (resize.handle.includes('l')) {
+      const nextWidth = Math.max(GRAPH_MIN_W, width - dx);
+      x += width - nextWidth;
+      width = nextWidth;
+    } else {
+      width = Math.max(GRAPH_MIN_W, width + dx);
+    }
+
+    if (resize.handle.includes('t')) {
+      const nextHeight = Math.max(GRAPH_MIN_H, height - dy);
+      y += height - nextHeight;
+      height = nextHeight;
+    } else {
+      height = Math.max(GRAPH_MIN_H, height + dy);
+    }
+
+    updateNode(node.id, { x, y, width, height });
+  };
+
+  const endGraphResize = (e) => {
+    e.cancelBubble = true;
+    resizeGraph(e);
+    graphResizeRef.current = null;
   };
 
   const ports = PORT_POSITIONS(node.width, node.height);
@@ -634,7 +809,18 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
 
     // Manage animation state
     // Place at node's top edge (y=0 inside node group) when hidden
-    if (!hovered) {
+    if (!renderEditorChrome) {
+      if (popupTimerRef.current) {
+        clearTimeout(popupTimerRef.current);
+        popupTimerRef.current = null;
+      }
+      g.stop();
+      g.y(0);
+      g.opacity(0);
+      return;
+    }
+
+    if (!editorHovered) {
       // Cancel any pending auto-hide
       if (popupTimerRef.current) {
         clearTimeout(popupTimerRef.current);
@@ -666,7 +852,7 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
         popupTimerRef.current = null;
       }
     };
-  }, [hovered, popupValue, popupFontSize, popupW, popupH, overlapInside, popupEnabled, node.popupStayOpen]);
+  }, [editorHovered, popupValue, popupFontSize, popupW, popupH, overlapInside, popupEnabled, node.popupStayOpen, renderEditorChrome]);
 
   return (
     <Group
@@ -755,21 +941,27 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
         const yn = 1 - (best.py - graphData.pad) / H;
         const gx = graphData.xmin + xn * (graphData.xmax - graphData.xmin);
         const gy = graphData.minY + yn * (graphData.maxY - graphData.minY);
-        updateNode(node.id, { graphPoints: [...(node.graphPoints ?? []), { id: uuid(), x: gx, y: gy }] });
+        updateNode(node.id, {
+          graphPoints: [...(node.graphPoints ?? []), {
+            id: uuid(),
+            x: gx,
+            y: gy,
+            startTime: Math.round(getTimelineCursor() * 100) / 100,
+            duration: 0.35,
+          }],
+        });
       }}
       onMouseUp={(e)  => { if (isLinking) { e.cancelBubble = true; onEndLink(node.id, null); }}}
     >
-      <Rect
-        width={node.width}
-        height={node.height}
-        fill={pageColors.blackHitArea}
-      />
-
-      {!isTextNode && (
-        renderNodeBody(node, pageColors.transparent, 0, false, pageColors.blackShadowNode, true, { id: `node-shadow-${node.id}` })
+      {renderEditorChrome && (
+        <Rect
+          width={node.width}
+          height={node.height}
+          fill={pageColors.blackHitArea}
+        />
       )}
 
-      {/* Popup sits between shadow and body so it appears to come from behind */}
+      {/* Popup sits behind the body so it appears to come from inside the node. */}
       {!isTextNode && popupEnabled && (
         <Group id={`node-popup-${node.id}`} ref={popupGroupRef} x={0} y={0} opacity={0} listening={false}>
           <Group x={(node.width - popupW) / 2} y={-overlapInside} listening={false}>
@@ -807,14 +999,127 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
         renderNodeBody(node, stroke, strokeWidth, isInSelection && !isSelected, node.fill, false, {
           id: `node-body-${node.id}`,
           baseFill: node.fill,
-          baseStroke: node.stroke,
+          baseStroke: getNodeStatusStroke(node, node.stroke),
           baseStrokeWidth: node.strokeWidth,
+          ...(node.offline ? { dash: getNodeStatusDash(node), dashEnabled: true } : {}),
         })
       )}
+
+
 
       {/* Graph content */}
       {node.type === 'graph' && graphData && (
         <>
+          {/* HKDF domain-separation circles — independent output domains, drawn behind the curve */}
+          {node.showDomains && (
+            <Group id={`graph-domains-${node.id}`} listening={false}>
+              {(() => {
+                const W = node.width - graphData.pad * 2;
+                const H = node.height - graphData.pad * 2;
+                const xScale = W / (graphData.xmax - graphData.xmin);
+                // Resolve every domain's pixel geometry first. List order is priority:
+                // index 0 is highest and wins any overlap ("clash").
+                const geos = (node.graphDomains ?? []).map((d, idx) => {
+                  const cx = Number.isFinite(d.cx) ? d.cx : 0;
+                  const cy = Number.isFinite(d.cy) ? d.cy : 0;
+                  const r = Number.isFinite(d.r) ? d.r : 1;
+                  const xn = (cx - graphData.xmin) / (graphData.xmax - graphData.xmin);
+                  const yn = (cy - graphData.minY) / (graphData.maxY - graphData.minY);
+                  return {
+                    d,
+                    idx,
+                    sx: graphData.pad + xn * W,
+                    sy: graphData.pad + (1 - yn) * H,
+                    rad: Math.max(2, r * xScale),
+                    start: Number.isFinite(d.startTime) ? d.startTime : 0,
+                  };
+                });
+                // Render lowest priority first so the highest-priority domain sits on
+                // top; each domain also subtracts the circles of every higher-priority
+                // domain so the overlap region shows only the winner (no alpha blend).
+                const sorted = [...geos].sort((a, b) => b.idx - a.idx);
+
+                // Pass 1 — domain bodies (fill + dots), clipped by higher-priority circles.
+                const bodies = sorted.map(({ d, idx, sx, sy, rad }) => {
+                  const color = d.color ?? pageColors.purpleAccent;
+                  const dStart = Number.isFinite(d.startTime) ? d.startTime : 0;
+                  const dDur = Number.isFinite(d.duration) && d.duration > 0 ? d.duration : 0.4;
+                  const dots = buildCalcDots(d, sx, sy, rad);
+                  const dotColor = d.calc?.dotColor ?? color;
+                  const dotSize = Number.isFinite(d.calc?.dotSize) ? d.calc.dotSize : 2.5;
+                  // Geometry of every higher-priority domain that may override this one.
+                  // The actual clip is built per-frame in applyAnimState so an overriding
+                  // domain only punches its hole once it has appeared.
+                  const overrideCircles = geos
+                    .filter(g => g.idx < idx)
+                    .map(g => ({ sx: g.sx, sy: g.sy, rad: g.rad, start: g.start }));
+                  return (
+                    <Group key={`body-${d.id}`} id={`graph-domain-${d.id}-${node.id}`} dStart={dStart} dDur={dDur} overrideCircles={overrideCircles}>
+                      <Circle
+                        x={sx}
+                        y={sy}
+                        radius={rad}
+                        fill={withAlpha(color, 0.18)}
+                        stroke={color}
+                        strokeWidth={1.5}
+                        dash={[6, 4]}
+                        listening={false}
+                        perfectDrawEnabled={false}
+                      />
+                      {/* "Calculate" keyframe: derived outputs scatter inside the domain */}
+                      {dots.length > 0 && (
+                        <Group name="calc-dots" listening={false}>
+                          {dots.map((dot) => (
+                            <Circle
+                              key={dot.i}
+                              x={dot.x}
+                              y={dot.y}
+                              radius={dotSize}
+                              fill={dotColor}
+                              opacity={0}
+                              cStart={dot.cStart}
+                              cDur={dot.cDur}
+                              listening={false}
+                              perfectDrawEnabled={false}
+                            />
+                          ))}
+                        </Group>
+                      )}
+                    </Group>
+                  );
+                });
+
+                // Pass 2 — labels, drawn after every body so they always sit ON TOP of
+                // the scattered dots (and stay readable). Unclipped, but still fades in
+                // with its domain via dStart/dDur.
+                const labels = sorted
+                  .filter(({ d }) => d.label)
+                  .map(({ d, sx, sy, rad }) => {
+                    const dStart = Number.isFinite(d.startTime) ? d.startTime : 0;
+                    const dDur = Number.isFinite(d.duration) && d.duration > 0 ? d.duration : 0.4;
+                    const labelColor = d.labelColor ?? d.color ?? pageColors.white;
+                    const labelSize = Number.isFinite(d.labelSize) ? d.labelSize : 11;
+                    return (
+                      <Group key={`label-${d.id}`} dStart={dStart} dDur={dDur} listening={false}>
+                        <Text
+                          x={sx - rad}
+                          y={sy - labelSize / 2 - 1}
+                          width={rad * 2}
+                          text={d.label}
+                          align="center"
+                          fontSize={labelSize}
+                          fontStyle="600"
+                          fill={labelColor}
+                          listening={false}
+                        />
+                      </Group>
+                    );
+                  });
+
+                return [...bodies, ...labels];
+              })()}
+            </Group>
+          )}
           {/* Axes */}
           {(node.showAxes === true) && graphData.axes.map((ax, idx) => (
             <Line
@@ -870,8 +1175,12 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
               const a = ptsById[v.fromId];
               const b = ptsById[v.toId];
               if (!a || !b) { continue; }
-              const start = chain ? ((2 * idx + 1) * speed) : 0; // in chain mode: after P(idx) fade
-              const dur = speed;
+              const destination = allPts.find(point => point.id === v.toId);
+              const destinationStart = Number.isFinite(destination?.startTime) ? destination.startTime : 0;
+              // Point keyframes are absolute timeline times. Draw the incoming
+              // line immediately before the destination point begins to appear.
+              const start = Math.max(0, destinationStart - speed);
+              const dur = Math.max(0.0001, destinationStart - start);
               const strokeCol = v.color ?? node.vectorColorDefault ?? '#FFFFFF';
               const width = Number.isFinite(v.width) ? v.width : (Number.isFinite(node.vectorWidthDefault) ? node.vectorWidthDefault : 1.5);
               const headL = Number.isFinite(v.headLength) ? v.headLength : (Number.isFinite(node.vectorHeadLengthDefault) ? node.vectorHeadLengthDefault : 8);
@@ -899,12 +1208,17 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
           })()}
           </Group>
           {/* User-added points */}
-          <Group id={`graph-points-${node.id}`} listening={true} bindToCurve={node.pointsBindToCurve ? 1 : 0} gLocal={node.graphChainPlayback ? 1 : 0}>
+          <Group
+            id={`graph-points-${node.id}`}
+            listening={true}
+            bindToCurve={node.pointsBindToCurve ? 1 : 0}
+            gLocal={node.graphChainPlayback ? 1 : 0}
+          >
           {(() => {
             const speed = Number.isFinite(node.vectorSpeed) && node.vectorSpeed > 0 ? node.vectorSpeed : 0.2;
             const chain = !!node.graphChainPlayback;
             const pts = node.graphPoints ?? [];
-            return pts.map((p, k) => {
+            return pts.map((p) => {
               const W = node.width - graphData.pad * 2;
               const H = node.height - graphData.pad * 2;
               const xn = (p.x - graphData.xmin) / (graphData.xmax - graphData.xmin);
@@ -914,32 +1228,46 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
               const radius = Math.max(1, Number.isFinite(p.size) ? p.size : (Number.isFinite(node.graphPointSizeDefault) ? node.graphPointSizeDefault : 4));
               const fill = p.fill ?? (node.graphPointFillDefault ?? pageColors.purpleAccent);
               const stroke = p.stroke ?? (node.graphPointStrokeDefault ?? pageColors.white);
-              // In chain mode: point k fades at t = 2*k*speed with duration = speed
-              const pStart = chain ? (2 * k * speed) : (Number.isFinite(p.startTime) ? p.startTime : 0);
-              const pDur = chain ? speed : (Number.isFinite(p.duration) && p.duration > 0 ? p.duration : 0.35);
+              const pStart = Number.isFinite(p.startTime) ? p.startTime : 0;
+              const pDur = Number.isFinite(p.duration) && p.duration > 0 ? p.duration : 0.35;
               return (
-                <Group key={p.id} id={`graph-point-${p.id}-${node.id}`} x={sx} y={sy}
-                  pId={p.id}
-                  pStart={pStart}
-                  pDur={pDur}
-                  pNX={Math.max(0, Math.min(1, xn))}
-                  opacity={chain ? 0 : 1}
-                  onMouseDown={(ev)=>{
-                  if (ev.evt.altKey) {
-                    // Alt+click to remove point
-                    ev.cancelBubble = true;
-                    updateNode(node.id, { graphPoints: (node.graphPoints ?? []).filter(q => q.id !== p.id) });
-                  }
-                }}
-              >
-                <Circle radius={radius} fill={fill} stroke={stroke} strokeWidth={1} />
-              </Group>
-            );
+                <React.Fragment key={p.id}>
+                  <Group id={`graph-point-${p.id}-${node.id}`} x={sx} y={sy}
+                    pId={p.id}
+                    pStart={pStart}
+                    pDur={pDur}
+                    pNX={Math.max(0, Math.min(1, xn))}
+                    opacity={0}
+                    onMouseDown={(ev)=>{
+                    if (ev.evt.altKey) {
+                      // Alt+click to remove point
+                      ev.cancelBubble = true;
+                      updateNode(node.id, { graphPoints: (node.graphPoints ?? []).filter(q => q.id !== p.id) });
+                    }
+                  }}
+                  >
+                    <Circle radius={radius} fill={fill} stroke={stroke} strokeWidth={1} />
+                  </Group>
+                  {renderEditorChrome && isSelected && (
+                    <Circle
+                      x={sx}
+                      y={sy}
+                      radius={radius + 3}
+                      stroke={fill}
+                      strokeWidth={1}
+                      dash={[3, 2]}
+                      opacity={0.65}
+                      editorPreview={1}
+                      listening={false}
+                    />
+                  )}
+                </React.Fragment>
+              );
             });
           })()}
           </Group>
           {/* Crosshair and coordinate readout */}
-          {node.showCoords && hovered && graphPointer && (() => {
+          {node.showCoords && editorHovered && graphPointer && (() => {
             const lx = Math.max(graphData.pad, Math.min(node.width - graphData.pad, graphPointer.lx));
             const ly = Math.max(graphData.pad, Math.min(node.height - graphData.pad, graphPointer.ly));
             const innerLeft = graphData.pad;
@@ -985,6 +1313,19 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
         );
       })()}
 
+      {/* Failure tint overlay: above both base and transform bodies, below label */}
+      {!isTextNode && (
+        renderNodeBody(
+          node,
+          pageColors.transparent,
+          0,
+          false,
+          pageColors.dangerSurfaceSoft,
+          false,
+          { id: `node-fail-tint-${node.id}`, opacity: node.failing ? 1 : 0, listening: false }
+        )
+      )}
+
       {!isTextNode && renderNodeHighlight(node, { id: `node-highlight-${node.id}` })}
 
       {isTextNode && showPorts && (
@@ -1002,6 +1343,65 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
 
       {/* Simple hover popup: slides out from the top, shows a short value, then hides */}
 
+      {/* Highlight aura: either background cutout (destination-out) or solid colour plate */}
+      {node.textAura && (() => {
+        const graphPad = Math.max(8, Math.min(18, Math.round(Math.min(node.width, node.height) * 0.08)));
+        const approxTextH = Math.ceil((node.fontSize ?? 13) * 1.3);
+        const ly = node.type === 'graph'
+          ? Math.max(0, node.height - graphPad - approxTextH)
+          : labelFrame.y;
+        const lh = node.type === 'graph' ? approxTextH : labelFrame.height;
+        const pad = 6;
+        const mode = node.textAuraMode ?? 'cutout';
+        const auraOpacity = Number.isFinite(node.textAuraOpacity) ? node.textAuraOpacity : 1;
+        const blur = Number.isFinite(node.textAuraSize) ? node.textAuraSize : 16;
+        const extra = pad + blur * 0.5; // the cleared zone extends past the text
+        const w = labelFrame.width + extra * 2;
+        const h = lh + extra * 2;
+        if (mode === 'cutout') {
+          return (
+            <Rect
+              id={`node-aura-${node.id}`}
+              x={labelFrame.x - extra}
+              y={ly - extra}
+              width={w}
+              height={h}
+              cornerRadius={Math.min(h / 2, 18)}
+              fill={pageColors.black}
+              opacity={auraOpacity}
+              shadowColor={pageColors.black}
+              shadowBlur={blur}
+              shadowOpacity={auraOpacity}
+              shadowOffsetX={0}
+              shadowOffsetY={0}
+              globalCompositeOperation="destination-out"
+              listening={false}
+              perfectDrawEnabled={false}
+            />
+          );
+        }
+        const plateColor = node.textAuraColor || pageColors.canvasBackground;
+        return (
+          <Rect
+            id={`node-aura-${node.id}`}
+            x={labelFrame.x - extra}
+            y={ly - extra}
+            width={w}
+            height={h}
+            cornerRadius={Math.min(h / 2, 18)}
+            fill={plateColor}
+            opacity={auraOpacity}
+            shadowColor={plateColor}
+            shadowBlur={blur}
+            shadowOpacity={auraOpacity}
+            shadowOffsetX={0}
+            shadowOffsetY={0}
+            listening={false}
+            perfectDrawEnabled={false}
+          />
+        );
+      })()}
+
       {(() => {
         const graphPad = Math.max(8, Math.min(18, Math.round(Math.min(node.width, node.height) * 0.08)));
         const approxTextH = Math.ceil((node.fontSize ?? 13) * 1.3);
@@ -1014,18 +1414,19 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
           <Text
             id={`node-label-${node.id}`}
             baseText={node.label}
+            equationMode={!!node.equationMode}
             x={labelFrame.x}
             y={labelY}
             width={labelFrame.width}
             height={labelH}
-            text={node.label}
+            text={getNodeDisplayText(node)}
             align="center"
             verticalAlign={vAlign}
             fontSize={node.fontSize}
-            fill={node.textColor}
-            baseFill={node.textColor}
-            fontFamily="Inter, system-ui, sans-serif"
-            fontStyle="500"
+            fill={getNodeStatusTextColor(node, node.textColor)}
+            baseFill={getNodeStatusTextColor(node, node.textColor)}
+            fontFamily={getNodeTextFontFamily(node)}
+            fontStyle={node.bold ? '700' : '500'}
             listening={false}
           />
         );
@@ -1042,6 +1443,7 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
         return (
           <Text
             id={`node-label-morph-${node.id}`}
+            equationMode={!!node.equationMode}
             x={labelFrame.x}
             y={morphY}
             width={labelFrame.width}
@@ -1050,30 +1452,17 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
             align="center"
             verticalAlign={vAlign}
             fontSize={node.fontSize}
-            fill={node.textColor}
-            baseFill={node.textColor}
-            fontFamily="Inter, system-ui, sans-serif"
-            fontStyle="500"
+            fill={getNodeStatusTextColor(node, node.textColor)}
+            baseFill={getNodeStatusTextColor(node, node.textColor)}
+            fontFamily={getNodeTextFontFamily(node)}
+            fontStyle={node.bold ? '700' : '500'}
             opacity={0}
             listening={false}
           />
         );
       })()}
 
-      {node.failing && (() => {
-        const cx = node.width / 2;
-        const cy = node.height / 2;
-        const sz = Math.max(9, Math.min(node.width, node.height) * 0.28);
-        const sw = Math.max(2.5, node.strokeWidth * 1.1);
-        return (
-          <Group id={`node-fail-${node.id}`} x={cx} y={cy} listening={false}>
-            <Circle radius={sz + 7} fill={pageColors.dangerMain} opacity={0.18} />
-            <Circle radius={sz + 3} stroke={pageColors.dangerBright} strokeWidth={1} opacity={0.35} />
-            <Line points={[-sz, -sz, sz, sz]} stroke={pageColors.dangerBright} strokeWidth={sw} lineCap="round" />
-            <Line points={[sz, -sz, -sz, sz]} stroke={pageColors.dangerBright} strokeWidth={sw} lineCap="round" />
-          </Group>
-        );
-      })()}
+      <NodeStatusMark node={node} />
 
       {showPorts && ports.map((p, i) => {
         const isCenter = p.side === 'center';
@@ -1103,40 +1492,140 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
 
       {showPorts && (node.anchors ?? []).map((anchor) => {
         const point = getNodeAnchorPoint(node, anchor);
+        const ax = point.x - node.x;
+        const ay = point.y - node.y;
+        // Offset the pull handle outward from the node based on the anchor side
+        // so it doesn't sit on top of the body.
+        const pull = anchor.side === 'top'    ? { x: 0,   y: -18 }
+                   : anchor.side === 'bottom' ? { x: 0,   y: 18  }
+                   : anchor.side === 'left'   ? { x: -18, y: 0   }
+                   : anchor.side === 'right'  ? { x: 18,  y: 0   }
+                   : { x: 16, y: -16 };
+        const isJunction = anchor.isJunction !== false;
         return (
-          <Circle
-            key={anchor.id}
-            x={point.x - node.x}
-            y={point.y - node.y}
-            radius={6}
-            fill={pageColors.purpleAccent}
-            stroke={pageColors.white}
-            strokeWidth={1.5}
-            draggable={isSelected && !isLinking}
-            onDragStart={(e) => {
-              e.cancelBubble = true;
-            }}
-            onDragMove={(e) => {
-              e.cancelBubble = true;
-              const next = getClosestNodeOutlinePosition(node, {
-                x: node.x + e.target.x(),
-                y: node.y + e.target.y(),
-              });
-              e.target.x(next.point.x - node.x);
-              e.target.y(next.point.y - node.y);
-              updateNodeAnchor(node.id, anchor.id, { side: next.side, along: next.along });
-            }}
-            onDragEnd={(e) => {
-              e.cancelBubble = true;
-            }}
-            onMouseUp={(e) => {
-              e.cancelBubble = true;
-              if (!isLinking) return;
-              onEndLink(node.id, { side: anchor.side, along: anchor.along ?? 0, anchorId: anchor.id });
-            }}
-          />
+          <React.Fragment key={anchor.id}>
+            <Circle
+              x={ax}
+              y={ay}
+              radius={6}
+              fill={isJunction ? pageColors.purpleAccent : pageColors.blueSurfaceSoft}
+              stroke={pageColors.white}
+              strokeWidth={1.5}
+              draggable={isSelected && !isLinking}
+              onDragStart={(e) => {
+                e.cancelBubble = true;
+              }}
+              onDragMove={(e) => {
+                e.cancelBubble = true;
+                const next = getClosestNodeOutlinePosition(node, {
+                  x: node.x + e.target.x(),
+                  y: node.y + e.target.y(),
+                });
+                e.target.x(next.point.x - node.x);
+                e.target.y(next.point.y - node.y);
+                updateNodeAnchor(node.id, anchor.id, { side: next.side, along: next.along });
+              }}
+              onDragEnd={(e) => {
+                e.cancelBubble = true;
+              }}
+              onMouseUp={(e) => {
+                e.cancelBubble = true;
+                if (!isLinking) return;
+                onEndLink(node.id, { side: anchor.side, along: anchor.along ?? 0, anchorId: anchor.id });
+              }}
+              onContextMenu={(e) => {
+                // Right-click an anchor to toggle whether it acts as a junction.
+                e.cancelBubble = true;
+                e.evt?.preventDefault?.();
+                updateNodeAnchor(node.id, anchor.id, { isJunction: !isJunction });
+              }}
+            />
+            {isJunction && (
+              <>
+                <Circle
+                  x={ax}
+                  y={ay}
+                  radius={10}
+                  stroke={pageColors.blueSelection}
+                  strokeWidth={1.5}
+                  dash={[4, 3]}
+                  listening={false}
+                />
+                {isSelected && !isLinking && (
+                  <Group
+                    x={ax + pull.x}
+                    y={ay + pull.y}
+                    onMouseDown={(e) => {
+                      e.cancelBubble = true;
+                      onStartLink(node.id, {
+                        side: anchor.side,
+                        along: anchor.along ?? 0,
+                        anchorId: anchor.id,
+                        centered: false,
+                      });
+                    }}
+                    onTouchStart={(e) => {
+                      e.cancelBubble = true;
+                      onStartLink(node.id, {
+                        side: anchor.side,
+                        along: anchor.along ?? 0,
+                        anchorId: anchor.id,
+                        centered: false,
+                      });
+                    }}
+                    onMouseEnter={(e) => { e.target.getStage().container().style.cursor = 'crosshair'; }}
+                    onMouseLeave={(e) => { e.target.getStage().container().style.cursor = 'default'; }}
+                  >
+                    <Circle
+                      radius={8}
+                      fill={pageColors.blueMain}
+                      stroke={pageColors.blueSelection}
+                      strokeWidth={2}
+                    />
+                    <Line
+                      points={[-3, 0, 3, 0, 0, 0, 0, -3, 0, 3]}
+                      stroke={pageColors.white}
+                      strokeWidth={1.8}
+                      lineCap="round"
+                      listening={false}
+                    />
+                  </Group>
+                )}
+              </>
+            )}
+          </React.Fragment>
         );
       })}
+
+      {renderEditorChrome && isSelected && node.type === 'graph' && !isLinking && [
+        { id: 'tl', x: 0, y: 0, cursor: 'nwse-resize' },
+        { id: 'tr', x: node.width, y: 0, cursor: 'nesw-resize' },
+        { id: 'bl', x: 0, y: node.height, cursor: 'nesw-resize' },
+        { id: 'br', x: node.width, y: node.height, cursor: 'nwse-resize' },
+      ].map(handle => (
+        <Group
+          key={handle.id}
+          x={handle.x}
+          y={handle.y}
+          draggable
+          onMouseDown={(e) => { e.cancelBubble = true; }}
+          onTouchStart={(e) => { e.cancelBubble = true; }}
+          onDragStart={(e) => startGraphResize(e, handle.id)}
+          onDragMove={resizeGraph}
+          onDragEnd={endGraphResize}
+          onMouseEnter={(e) => { e.target.getStage().container().style.cursor = handle.cursor; }}
+          onMouseLeave={(e) => { e.target.getStage().container().style.cursor = 'default'; }}
+        >
+          <Rect x={-9} y={-9} width={18} height={18} fill={pageColors.blackHitArea} />
+          <Circle
+            radius={GRAPH_RESIZE_HANDLE_R}
+            fill={pageColors.blueBright}
+            stroke={pageColors.blueSelection}
+            strokeWidth={1.5}
+            listening={false}
+          />
+        </Group>
+      ))}
     </Group>
   );
 }

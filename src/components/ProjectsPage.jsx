@@ -227,7 +227,13 @@ function ProjectCard({
         justifyContent: 'center',
         overflow: 'hidden',
       }}>
-        {meta.nodeCount > 0 ? (
+        {meta.preview ? (
+          <img
+            src={meta.preview}
+            alt=""
+            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+          />
+        ) : meta.nodeCount > 0 ? (
           <MiniPreview nodeCount={meta.nodeCount} linkCount={meta.linkCount} />
         ) : (
           <span style={{ color: 'var(--text-faint)', fontSize: 12 }}>Empty</span>

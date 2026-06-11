@@ -1,10 +1,13 @@
 import React, { useRef, useState } from 'react';
 import { Circle, Ellipse, Group, Line, Path, Rect, Text } from 'react-konva';
-import { pageColors, withAlpha } from '../../../colorThemes';
+import { pageColors, withAlpha } from '../../colorThemes';
 import { getNodeLabelFrame } from '../../nodeLabelFrame';
 import useStore from '../../store/useStore';
 import { getSourceCenterFromMirrorPoint } from '../../mirror/mirrorData';
+import { getNodeDisplayText, getNodeTextFontFamily } from '../../text/equationText';
 import { collectGuideMatches, collectVisibleGuides, isSameGuideMatch, SNAP_DISTANCE, UNSNAP_DISTANCE } from './symmetryGuides';
+import NodeStatusMark, { getNodeStatusDash, getNodeStatusStroke, getNodeStatusTextColor } from './NodeStatusMark';
+import LinkFailureMark from './LinkFailureMark';
 
 const PORT_R = 7;
 const PORT_POSITIONS = (w, h) => [
@@ -17,9 +20,11 @@ const PORT_POSITIONS = (w, h) => [
 
 function renderNodeBody(node, stroke, strokeWidth, fill) {
   const common = {
-    stroke,
+    stroke: getNodeStatusStroke(node, stroke),
     strokeWidth,
     fill,
+    dash: getNodeStatusDash(node),
+    dashEnabled: !!node.offline,
   };
 
   if (node.shape === 'diamond') {
@@ -67,7 +72,7 @@ function renderNodeBody(node, stroke, strokeWidth, fill) {
     );
   }
 
-  if (node.shape === 'pillar' || node.shape === 'cylinder') {
+  if (node.shape === 'pillar' || node.shape === 'cylinder' || node.shape === 'database') {
     const w = node.width;
     const h = node.height;
     const curve = Math.min(w, h) * 0.12;
@@ -126,6 +131,7 @@ function MirrorChildNode({
   onEndSourceLink,
   onGroupDragStart,
   onGroupDragMove,
+  renderEditorChrome = true,
 }) {
   const { updateNode } = useStore();
   const isTextNode = node.type === 'text';
@@ -146,7 +152,7 @@ function MirrorChildNode({
     return nextSourcePos;
   };
 
-  const showPorts = isSelected || isInSelection || hovered || isLinking;
+  const showPorts = renderEditorChrome && (isSelected || isInSelection || hovered || isLinking);
   const ports = PORT_POSITIONS(node.width, node.height);
 
   return (
@@ -209,7 +215,7 @@ function MirrorChildNode({
           width={node.width}
           height={node.height}
           cornerRadius={6}
-          stroke={withAlpha(node.textColor, 0.2)}
+          stroke={getNodeStatusStroke(node, withAlpha(node.textColor, 0.2))}
           strokeWidth={1}
           dash={[5, 4]}
           opacity={0.4}
@@ -231,23 +237,25 @@ function MirrorChildNode({
       <Text
         id={`node-label-${node.id}`}
         baseText={node.label}
+        equationMode={!!node.equationMode}
         independentText
         x={labelFrame.x}
         y={labelFrame.y}
         width={labelFrame.width}
         height={labelFrame.height}
-        text={node.label}
+        text={getNodeDisplayText(node)}
         align="center"
         verticalAlign="middle"
         fontSize={node.fontSize}
-        fill={node.textColor}
-        fontFamily="Inter, system-ui, sans-serif"
-        fontStyle="500"
+        fill={getNodeStatusTextColor(node, node.textColor)}
+        fontFamily={getNodeTextFontFamily(node)}
+        fontStyle={node.bold ? '700' : '500'}
         listening={false}
       />
       <Text
         id={`node-label-morph-${node.id}`}
         independentText
+        equationMode={!!node.equationMode}
         x={labelFrame.x}
         y={labelFrame.y}
         width={labelFrame.width}
@@ -256,12 +264,13 @@ function MirrorChildNode({
         align="center"
         verticalAlign="middle"
         fontSize={node.fontSize}
-        fill={node.textColor}
-        fontFamily="Inter, system-ui, sans-serif"
-        fontStyle="500"
+        fill={getNodeStatusTextColor(node, node.textColor)}
+        fontFamily={getNodeTextFontFamily(node)}
+        fontStyle={node.bold ? '700' : '500'}
         opacity={0}
         listening={false}
       />
+      <NodeStatusMark node={node} />
       {showPorts && ports.map((port, index) => {
         const isCenter = port.side === 'center';
         return (
@@ -313,6 +322,7 @@ function MirrorShape({
   onResizeMirror,
   onSourceGroupDragStart,
   onSourceGroupDragMove,
+  renderEditorChrome = true,
 }) {
   const {
     nodes,
@@ -412,7 +422,9 @@ function MirrorShape({
           onContextMenu?.(e, mirror.id);
         }}
       >
-        <Rect width={frameWidth} height={frameHeight} fill={pageColors.blackHitArea} />
+        {renderEditorChrome && (
+          <Rect width={frameWidth} height={frameHeight} fill={pageColors.blackHitArea} />
+        )}
         <Group id={`mirror-chrome-${mirror.id}`}>
           <Rect
             width={frameWidth}
@@ -471,6 +483,7 @@ function MirrorShape({
         {binding.childLinks.map((link) => {
           const render = binding.linkRenders[link.id];
           if (!render) return null;
+          const linkColor = link.failing ? pageColors.dangerBright : link.stroke;
           return (
             <Group
               key={link.id}
@@ -498,24 +511,36 @@ function MirrorShape({
               <Path
                 id={`link-shaft-${link.id}`}
                 data={render.pathData}
-                stroke={link.stroke}
+                stroke={linkColor}
+                baseStroke={linkColor}
                 strokeWidth={link.strokeWidth}
                 lineCap="round"
                 lineJoin="round"
+                listening={false}
+              />
+              <Path
+                id={`link-shaft-fail-overlay-${link.id}`}
+                data={render.pathData}
+                stroke={pageColors.dangerBright}
+                strokeWidth={link.strokeWidth}
+                lineCap="round"
+                lineJoin="round"
+                opacity={0}
                 listening={false}
               />
               <Line
                 id={`link-head-${link.id}`}
                 points={render.arrowHeadPoints}
                 basePoints={render.arrowHeadPoints}
-                showTip={render.showArrowTip}
+                showTip={render.showArrowTip && !link.failing}
                 closed
-                fill={link.stroke}
-                stroke={link.stroke}
+                fill={linkColor}
+                stroke={linkColor}
                 strokeWidth={1}
-                opacity={render.showArrowTip ? 1 : 0}
+                opacity={render.showArrowTip && !link.failing ? 1 : 0}
                 listening={false}
               />
+              <LinkFailureMark link={link} render={render} />
             </Group>
           );
         })}
@@ -539,6 +564,7 @@ function MirrorShape({
             onEndSourceLink={onEndSourceLink}
             onGroupDragStart={onSourceGroupDragStart}
             onGroupDragMove={onSourceGroupDragMove}
+            renderEditorChrome={renderEditorChrome}
           />
         ))}
       </Group>

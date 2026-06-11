@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimationEngine } from '../animation/AnimationEngine';
 import { applyAnimState, computeLinkRenders, resetAnimState } from '../animation/applyAnimState';
+import { computeManualTokenTimingByLinkId } from '../animation/manualTokenTiming';
 import { buildMirrorBindings } from '../mirror/mirrorData';
 import useStore from '../store/useStore';
-import { buildWebByLinkId, computeVariableWebs } from '../variables/flow';
+import { buildWebByLinkId } from '../variables/flow';
 
 export function usePlayback({ layerRef }) {
   const { nodes, links } = useStore();
@@ -13,10 +14,15 @@ export function usePlayback({ layerRef }) {
 
   const isPlayingRef = useRef(false);
   const currentTimeRef = useRef(0);
+  // Unwrapped playback time keeps completed node animations at their final state
+  // while the area scroll clock repeats from zero.
+  const playbackTimeRef = useRef(0);
   const clockStartRef = useRef(0);
   const timeStartRef = useRef(0);
   const rafRef = useRef(null);
   const lastUIUpdateRef = useRef(0);
+  // Set once if a frame render throws, so we log the cause without spamming the console.
+  const frameErrorLoggedRef = useRef(false);
   // Callers (e.g. KeyframePanel) can set this to receive every animation frame imperatively,
   // bypassing the 30fps React state throttle used for UI updates.
   const frameCallbackRef = useRef(null);
@@ -27,10 +33,25 @@ export function usePlayback({ layerRef }) {
   const engine = useMemo(() => new AnimationEngine(nodes, links), [nodes, links]);
   const totalDuration   = engine.getTotalDuration();
   const contentDuration = engine.getContentDuration();
+  const loopPlayback = useMemo(() => nodes.some(node => (
+    node.type === 'area' && node.scrollEnabled && node.scrollSeamless !== false
+  )), [nodes]);
+  // A scrolling area imperatively clips + offsets the nodes inside it. That clip is
+  // only undone the next time a frame is applied. Moving/resizing an area or toggling
+  // its scroll off changes which nodes it clips but NOT the node count, so the
+  // structural-edit reset below won't fire and the paused-frame refresh (keyed on
+  // applyFrame) won't either. Without re-applying the frame, a node left clipped by a
+  // now-removed area stays pinned inside the stale clip rect and can't be dragged free.
+  // This signature changes whenever a scroll area's geometry or enabled-state changes,
+  // so the paused frame gets refreshed and clearScrollClip runs for freed nodes.
+  const areaScrollSignature = useMemo(() => nodes
+    .filter(node => node.type === 'area')
+    .map(a => `${a.id}:${a.scrollEnabled ? 1 : 0}:${a.x}:${a.y}:${a.width}:${a.height}`)
+    .join('|'), [nodes]);
   const timeline = useMemo(() => engine.getTimeline(), [engine]);
   const linkRenders = useMemo(() => computeLinkRenders(nodes, links), [nodes, links]);
   const mirrorBindings = useMemo(() => buildMirrorBindings(nodes, links), [nodes, links]);
-  const webs = useMemo(() => computeVariableWebs(nodes, links, { timeline }), [nodes, links, timeline]);
+  const webs = useMemo(() => engine.getVariableWebs(), [engine]);
   const webByLinkId = useMemo(() => buildWebByLinkId(webs), [webs]);
   const monitors = useMemo(() => nodes.filter(n => n.type === 'monitor'), [nodes]);
   const allLinkRenders = useMemo(() => ({
@@ -43,12 +64,14 @@ export function usePlayback({ layerRef }) {
   const mirrorBindingsRef = useRef(mirrorBindings);
   const totalDurationRef = useRef(totalDuration);
   const contentDurationRef = useRef(contentDuration);
+  const loopPlaybackRef = useRef(loopPlayback);
 
   useEffect(() => { engineRef.current = engine; }, [engine]);
   useEffect(() => { linkRendersRef.current = allLinkRenders; }, [allLinkRenders]);
   useEffect(() => { mirrorBindingsRef.current = mirrorBindings; }, [mirrorBindings]);
   useEffect(() => { totalDurationRef.current = totalDuration; }, [totalDuration]);
   useEffect(() => { contentDurationRef.current = contentDuration; }, [contentDuration]);
+  useEffect(() => { loopPlaybackRef.current = loopPlayback; }, [loopPlayback]);
 
   const timelineStart = useMemo(() => {
     const tl = engine.getTimeline();
@@ -66,24 +89,74 @@ export function usePlayback({ layerRef }) {
   const bindMetaById = useMemo(() => Object.fromEntries(links.map(l => [l.id, { offset: Number.isFinite(l.bindHopOffset) ? l.bindHopOffset : 0, scale: Number.isFinite(l.bindHopScale) && l.bindHopScale > 0 ? l.bindHopScale : 1 }])), [links]);
   const linkStartOverrideById = useMemo(() => Object.fromEntries(links.map(l => [l.id, (l.bindToTokenHop && Number.isFinite(l.animStartTime)) ? l.animStartTime : null])), [links]);
   const linkDurationOverrideById = useMemo(() => Object.fromEntries(links.map(l => [l.id, (l.bindToTokenHop && Number.isFinite(l.animDuration)) ? l.animDuration : null])), [links]);
+  const failAtEndsById = useMemo(() => Object.fromEntries(links.map(l => [l.id, !!l.failAtEnds])), [links]);
+  const failOnTokenEndById = useMemo(() => Object.fromEntries(links.map(l => [l.id, !!l.failOnTokenEnd])), [links]);
+  const failingById = useMemo(() => Object.fromEntries(links.map(l => [l.id, !!l.failing])), [links]);
 
-  const applyFrame = useCallback((t) => {
+  const manualTokenTimingById = useMemo(
+    () => computeManualTokenTimingByLinkId(links, timeline),
+    [links, timeline]
+  );
+
+  const applyFrame = useCallback((t, scrollTime = t) => {
     const layer = layerRef.current;
     if (!layer) return;
-    const state = engineRef.current.getStateAtTime(t);
-    applyAnimState(layer, state, linkRendersRef.current, mirrorBindingsRef.current, {
-      webs: websRef.current,
-      webByLinkId: webByLinkIdRef.current,
-      monitors: monitorsRef.current,
-      currentTime: t,
-      timelineStart,
-      bindToTokenHopById,
-      bindMetaById,
-      linkStartOverrideById,
-      linkDurationOverrideById,
-    });
-    layer.draw();
-  }, [layerRef, bindToTokenHopById]);
+    // Contain per-frame render errors here so a single bad time `t` can't break
+    // the caller: during playback it would otherwise kill the RAF loop, and while
+    // scrubbing it would freeze the canvas mid-drag. Log the cause once.
+    try {
+      const state = engineRef.current.getStateAtTime(t, scrollTime);
+      applyAnimState(layer, state, linkRendersRef.current, mirrorBindingsRef.current, {
+        webs: websRef.current,
+        webByLinkId: webByLinkIdRef.current,
+        monitors: monitorsRef.current,
+        currentTime: t,
+        timelineStart,
+        bindToTokenHopById,
+        bindMetaById,
+        linkStartOverrideById,
+        linkDurationOverrideById,
+        manualTokenTimingById,
+        failAtEndsById,
+        failOnTokenEndById,
+        failingById,
+        isPlaying: isPlayingRef.current,
+      });
+      layer.draw();
+    } catch (err) {
+      if (!frameErrorLoggedRef.current) {
+        frameErrorLoggedRef.current = true;
+        console.error('[usePlayback] frame render error:', err);
+      }
+    }
+  }, [
+    bindMetaById,
+    bindToTokenHopById,
+    layerRef,
+    linkDurationOverrideById,
+    linkStartOverrideById,
+    manualTokenTimingById,
+    timelineStart,
+    failAtEndsById,
+    failOnTokenEndById,
+    failingById,
+  ]);
+
+  // Latest applyFrame, callable from effects that must NOT re-run on every render
+  // (applyFrame changes each render), e.g. the structural-edit reset below.
+  const applyFrameRef = useRef(applyFrame);
+  useEffect(() => { applyFrameRef.current = applyFrame; }, [applyFrame]);
+
+  // Configuration edits (monitor source/watch, token text keys, styling) do
+  // not move the playhead, so explicitly refresh the paused frame.
+  useEffect(() => {
+    if (isPlayingRef.current) return undefined;
+    const frameId = requestAnimationFrame(() => applyFrame(
+      playbackTimeRef.current,
+      currentTimeRef.current
+    ));
+    return () => cancelAnimationFrame(frameId);
+  }, [applyFrame, areaScrollSignature]);
 
   const stopLoop = useCallback(() => {
     if (rafRef.current) {
@@ -97,38 +170,58 @@ export function usePlayback({ layerRef }) {
   const play = useCallback(() => {
     if (isPlayingRef.current) return;
 
-    if (currentTimeRef.current >= totalDurationRef.current - 0.05) {
+    if (!loopPlaybackRef.current && currentTimeRef.current >= totalDurationRef.current - 0.05) {
       currentTimeRef.current = 0;
+      playbackTimeRef.current = 0;
       setCurrentTime(0);
     }
 
     clockStartRef.current = performance.now();
-    timeStartRef.current = currentTimeRef.current;
+    timeStartRef.current = playbackTimeRef.current;
     isPlayingRef.current = true;
+    frameErrorLoggedRef.current = false;
     setIsPlaying(true);
 
     function frame() {
       if (!isPlayingRef.current) return;
 
       const elapsed = (performance.now() - clockStartRef.current) / 1000;
-      const t = Math.min(timeStartRef.current + elapsed, totalDurationRef.current);
+      const duration = totalDurationRef.current;
+      const rawTime = timeStartRef.current + elapsed;
+      const shouldLoop = loopPlaybackRef.current && duration > 0.0001;
+      const displayTime = shouldLoop
+        ? ((rawTime % duration) + duration) % duration
+        : Math.min(rawTime, duration);
+      const animationTime = shouldLoop ? rawTime : displayTime;
 
-      currentTimeRef.current = t;
-      applyFrame(t);
-      frameCallbackRef.current?.(t);
-      subdiagramFrameCallbackRef.current?.(t);
+      playbackTimeRef.current = animationTime;
+      currentTimeRef.current = displayTime;
+      // A throw inside any per-frame work must NOT skip the reschedule below —
+      // otherwise the RAF loop dies and the playhead freezes ("stuck") for the
+      // rest of playback. Contain it here so the timeline keeps advancing, and
+      // surface the underlying error once so the root cause stays visible.
+      try {
+        applyFrame(animationTime, displayTime);
+        frameCallbackRef.current?.(displayTime);
+        subdiagramFrameCallbackRef.current?.(displayTime);
+      } catch (err) {
+        if (!frameErrorLoggedRef.current) {
+          frameErrorLoggedRef.current = true;
+          console.error('[usePlayback] frame render error (playback continues):', err);
+        }
+      }
 
       // Throttle React state updates to ~30fps — animation runs imperatively at full 60fps
       const now = performance.now();
       if (now - lastUIUpdateRef.current >= 33) {
         lastUIUpdateRef.current = now;
-        setCurrentTime(t);
+        setCurrentTime(displayTime);
       }
 
-      if (t < totalDurationRef.current) {
+      if (shouldLoop || displayTime < duration) {
         rafRef.current = requestAnimationFrame(frame);
       } else {
-        setCurrentTime(t);
+        setCurrentTime(displayTime);
         stopLoop();
       }
     }
@@ -143,14 +236,20 @@ export function usePlayback({ layerRef }) {
   const stop = useCallback(() => {
     stopLoop();
     currentTimeRef.current = 0;
+    playbackTimeRef.current = 0;
     setCurrentTime(0);
     const layer = layerRef.current;
     if (layer) resetAnimState(layer, nodes, links, mirrorBindingsRef.current);
   }, [layerRef, links, nodes, stopLoop]);
 
-  const seek = useCallback((t) => {
-    const clamped = Math.max(0, Math.min(totalDurationRef.current, t));
+  const seek = useCallback((t, maxTime) => {
+    // Manual scrubbing may target the timeline's "breathing room" past the content
+    // (to place future keyframes), so callers can pass a larger max than the
+    // playback duration. Defaults to totalDuration when omitted.
+    const upper = Number.isFinite(maxTime) ? Math.max(0, maxTime) : totalDurationRef.current;
+    const clamped = Math.max(0, Math.min(upper, t));
     currentTimeRef.current = clamped;
+    playbackTimeRef.current = clamped;
 
     if (isPlayingRef.current) {
       clockStartRef.current = performance.now();
@@ -158,8 +257,17 @@ export function usePlayback({ layerRef }) {
     }
 
     applyFrame(clamped);
-    frameCallbackRef.current?.(clamped);
-    subdiagramFrameCallbackRef.current?.(clamped);
+    // The playhead/subdiagram callbacks update the DOM directly; a throw here must
+    // not abort the scrub (which would leave the playhead stuck mid-drag).
+    try {
+      frameCallbackRef.current?.(clamped);
+      subdiagramFrameCallbackRef.current?.(clamped);
+    } catch (err) {
+      if (!frameErrorLoggedRef.current) {
+        frameErrorLoggedRef.current = true;
+        console.error('[usePlayback] seek callback error:', err);
+      }
+    }
 
     // Throttle React state updates — callers that need immediate visual feedback
     // (e.g. the timeline playhead) update the DOM directly via refs instead.
@@ -173,17 +281,34 @@ export function usePlayback({ layerRef }) {
   const nodesLen = nodes.length;
   const linksLen = links.length;
   useEffect(() => {
+    // A node/link was added or removed. Preserve the playhead position — snapping
+    // back to 0 on every structural edit throws away the user's place in the
+    // timeline. Stop any running loop, clamp the time to the (possibly shorter)
+    // new duration, then reset the layer to a clean baseline and re-render the
+    // current frame so new/removed items appear in the correct animation state.
     stopLoop();
-    currentTimeRef.current = 0;
-    setCurrentTime(0);
+    const clamped = Math.max(0, Math.min(currentTimeRef.current, totalDurationRef.current));
+    currentTimeRef.current = clamped;
+    playbackTimeRef.current = clamped;
+    setCurrentTime(clamped);
     const id = setTimeout(() => {
       const layer = layerRef.current;
-      if (layer) resetAnimState(layer, nodes, links, mirrorBindingsRef.current);
+      if (!layer) return;
+      resetAnimState(layer, nodes, links, mirrorBindingsRef.current);
+      applyFrameRef.current(clamped);
     }, 60);
     return () => clearTimeout(id);
   }, [layerRef, linksLen, nodesLen, stopLoop]);
 
   useEffect(() => () => stopLoop(), [stopLoop]);
 
-  return { isPlaying, currentTime, currentTimeRef, totalDuration, contentDuration, timeline, play, pause, stop, seek, frameCallbackRef, subdiagramFrameCallbackRef };
+  // Force the React `currentTime` state to match the imperative ref. Scrubbing
+  // updates the playhead DOM directly and only throttles state updates, so the
+  // state can lag; callers (e.g. on scrub end) use this so a later re-render
+  // doesn't snap the playhead back to a stale position.
+  const commitTime = useCallback(() => {
+    setCurrentTime(currentTimeRef.current);
+  }, []);
+
+  return { isPlaying, currentTime, currentTimeRef, totalDuration, contentDuration, timeline, play, pause, stop, seek, commitTime, frameCallbackRef, subdiagramFrameCallbackRef };
 }

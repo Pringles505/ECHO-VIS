@@ -1,14 +1,23 @@
 import React, {
   useCallback, useEffect, useMemo, useRef, useState,
 } from 'react';
+import { toColorInputValue } from '../colorValue';
 import { v4 as uuid } from 'uuid';
-import { pageColors, withAlpha } from '../../colorThemes';
+import { pageColors, withAlpha } from '../colorThemes';
 import useStore from '../store/useStore';
 import { AnimationEngine } from '../animation/AnimationEngine';
 import { buildLinkRenderData, getLinkJointProgress } from '../links/linkGeometry';
 import { isMirrorNode } from '../mirror/mirrorData';
 import { getNextTextMorphStart, getNodeTextMorphs, getTextMorphById, normalizeTextMorphList } from '../text/textMorphs';
 import { computeVariableWebs } from '../variables/flow';
+import { setTimelineCursor } from '../timelineCursor';
+import {
+  computeManualTokenTimingByLinkId,
+  getManualTokenTextAtTime,
+  normalizeManualTokenTextKeyframes,
+} from '../animation/manualTokenTiming';
+import { DEFAULT_NODE_FAILURE_DURATION, normalizeNodeFailureKeyframes } from '../animation/nodeFailureTiming';
+import { DEFAULT_SCROLL_STEP_DURATION, normalizeScrollSteps } from '../animation/scrollStepTiming';
 
 const LEFT_W     = 240;
 const ROW_H      = 36;
@@ -25,6 +34,8 @@ const LINK_HUE      = { solid: pageColors.blueMain, bright: pageColors.blueLink 
 const MORPH_HUE     = { solid: pageColors.white, bright: pageColors.white };
 const TRANSFORM_HUE = { solid: pageColors.warningBright, bright: pageColors.warningBright };
 const TOKEN_HUE     = { solid: pageColors.blueLink, bright: pageColors.blueLink };
+const FAILURE_HUE   = { solid: pageColors.dangerMain, bright: pageColors.dangerBright };
+const SCROLL_HUE    = { solid: pageColors.purpleAccent, bright: pageColors.purpleAccent };
 
 const r2    = v => Math.round(v * 100) / 100;
 const trunc = (s, n = 13) => (s ?? '?').length > n ? (s ?? '?').slice(0, n - 1) + '…' : (s ?? '?');
@@ -87,7 +98,8 @@ function speedColor(dur) {
   return pageColors.dangerBright;
 }
 
-function Ruler({ total, contentDur }) {
+function Ruler({ total, contentDur, slideBreaks = [], onRemoveBreak, onMoveBreak }) {
+  const rulerRef = useRef(null);
   const ticks = [];
   const step = total > 15 ? 2 : total > 8 ? 1 : 0.5;
   for (let t = 0; t <= total + 0.01; t = r2(t + step)) {
@@ -106,9 +118,68 @@ function Ruler({ total, contentDur }) {
   // End-of-content marker — a clear vertical line with "END" label so users
   // can see exactly where timeline content stops and the buffer zone starts.
   const endPx = contentDur * PX_PER_SEC;
+  const startDrag = (initialTime, e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    document.body.style.userSelect = 'none';
+    let currentFrom = initialTime;
+    const rect = rulerRef.current?.getBoundingClientRect();
+    const baseLeft = rect ? rect.left : 0;
+    const onMove = (me) => {
+      const scrollHost = rulerRef.current?.parentElement?.parentElement;
+      const scrollLeft = scrollHost && typeof scrollHost.scrollLeft === 'number' ? scrollHost.scrollLeft : 0;
+      const relX = Math.max(0, me.clientX - baseLeft + scrollLeft);
+      const t = Math.max(0, relX / PX_PER_SEC);
+      if (onMoveBreak) {
+        const target = r2(t);
+        if (Math.abs(target - currentFrom) >= 0.001) {
+          onMoveBreak(currentFrom, target);
+          currentFrom = target;
+        }
+      }
+    };
+    const onUp = () => {
+      document.body.style.userSelect = '';
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  };
+
   return (
-    <div style={{ height: RULER_H, background: 'var(--panel-bg)', borderBottom: '1px solid var(--border-strong)', position: 'relative', flexShrink: 0 }}>
+    <div ref={rulerRef} style={{ height: RULER_H, background: 'var(--panel-bg)', borderBottom: '1px solid var(--border-strong)', position: 'relative', flexShrink: 0 }}>
       {ticks}
+      {/* Manual GIF divider markers */}
+      {slideBreaks.map((t, i) => {
+        const x = t * PX_PER_SEC;
+        return (
+          <div
+            key={`sb-${i}-${t}`}
+            style={{ position: 'absolute', left: x - 1, top: 0, bottom: 0, width: 2, background: withAlpha(pageColors.purpleAccent, 0.9), cursor: 'ew-resize' }}
+            onMouseDown={(e) => startDrag(t, e)}
+          >
+            <div
+              title={`GIF divider @ ${t.toFixed(2)}s (right-click to remove)`}
+              onContextMenu={e => { e.preventDefault(); onRemoveBreak?.(t); }}
+              style={{
+                position: 'absolute', top: 2, left: -6,
+                background: pageColors.purpleAccent,
+                color: pageColors.white,
+                fontSize: 9,
+                padding: '0px 4px',
+                borderRadius: 3,
+                cursor: 'ew-resize',
+                userSelect: 'none',
+                boxShadow: `0 0 6px ${withAlpha(pageColors.purpleAccent, 0.55)}`,
+              }}
+              onMouseDown={(e) => startDrag(t, e)}
+            >
+              S{i + 1}
+            </div>
+          </div>
+        );
+      })}
       <div style={{
         position: 'absolute', left: endPx, top: 0, bottom: 0,
         width: 1, background: withAlpha(pageColors.purpleAccent, 0.35),
@@ -156,24 +227,31 @@ function KeyframePanel({ playback }) {
     setSelected,
     addToSelection,
     setPendingMorphEdit,
+    slideBreaks,
+    addSlideBreakAt,
+    clearSlideBreaks,
+    removeSlideBreakAtTime,
+    moveSlideBreak,
   } = useStore();
-  const { isPlaying, currentTime, totalDuration, contentDuration, play, pause, stop, seek, frameCallbackRef } = playback;
+  const { isPlaying, currentTime, currentTimeRef, totalDuration, contentDuration, play, pause, stop, seek, commitTime, frameCallbackRef } = playback;
 
   useEffect(() => {
     // Register high-frequency update callback to bypass React throttle
     frameCallbackRef.current = (t) => {
       if (!playheadRef.current) return;
-      const cDur = Math.max(contentDuration ?? totalDuration, 4);
+      const maxBreak = (slideBreaks && slideBreaks.length) ? Math.max(...slideBreaks) : 0;
+      const cDur = Math.max(contentDuration ?? totalDuration, maxBreak, 4);
       const tW = cDur * PX_PER_SEC + 160;
       const px = Math.min(t * PX_PER_SEC, tW - 2);
       playheadRef.current.style.left = `${px}px`;
       const label = playheadRef.current.querySelector('[data-time-label]');
       if (label) label.textContent = `${t.toFixed(2)}s`;
+      setTimelineCursor(t);
     };
     return () => {
       if (frameCallbackRef.current) frameCallbackRef.current = null;
     };
-  }, [contentDuration, totalDuration, frameCallbackRef]);
+  }, [contentDuration, totalDuration, slideBreaks, frameCallbackRef]);
 
   const [collapsed,     setCollapsed]     = useState(false);
   const [panelHeight,   setPanelHeight]   = useState(PANEL_DEFAULT_H);
@@ -191,12 +269,17 @@ function KeyframePanel({ playback }) {
 
   const timelineNodes = useMemo(() => nodes.filter(node => !isMirrorNode(node)), [nodes]);
   const autoTimes = useMemo(() => computeAutoTimes(timelineNodes, links), [links, timelineNodes]);
+  const animationTimeline = useMemo(
+    () => new AnimationEngine(timelineNodes, links).getTimeline(),
+    [timelineNodes, links]
+  );
   const variableWebs = useMemo(() => {
-    // Build a one-shot engine timeline so the token chain origin reflects each
-    // link's actual draw end — matches the playback timing exactly.
-    const tl = new AnimationEngine(timelineNodes, links).getTimeline();
-    return computeVariableWebs(timelineNodes, links, { timeline: tl });
-  }, [timelineNodes, links]);
+    return computeVariableWebs(timelineNodes, links, { timeline: animationTimeline });
+  }, [timelineNodes, links, animationTimeline]);
+  const manualTokenTimingByLinkId = useMemo(
+    () => computeManualTokenTimingByLinkId(links, animationTimeline),
+    [links, animationTimeline]
+  );
   const webByVariableId = useMemo(() => {
     const m = {};
     for (const w of variableWebs) m[w.sourceNodeId] = w;
@@ -493,8 +576,142 @@ function KeyframePanel({ playback }) {
     setSelectedItem({ kind: 'node', id: nodeId });
   }, [_pushHistory, effectiveTiming, nodeMap, setNodeTextMorphs, setSelected]);
 
+  const setNodeFailureKeyframes = useCallback((nodeId, keyframes) => {
+    updateNode(nodeId, {
+      failing: false,
+      offline: false,
+      failureKeyframes: normalizeNodeFailureKeyframes(keyframes),
+    });
+  }, [updateNode]);
+
+  const addNodeFailure = useCallback((nodeId) => {
+    const node = nodeMap[nodeId];
+    if (!node) return;
+    _pushHistory();
+    const keyframe = {
+      id: uuid(),
+      startTime: r2(Math.max(0, currentTimeRef?.current ?? currentTime)),
+      duration: DEFAULT_NODE_FAILURE_DURATION,
+    };
+    setNodeFailureKeyframes(nodeId, [
+      ...normalizeNodeFailureKeyframes(node.failureKeyframes),
+      keyframe,
+    ]);
+    setSelected(nodeId);
+    setSelectedItem({ kind: 'node-failure', id: nodeId, failureId: keyframe.id });
+  }, [_pushHistory, currentTime, currentTimeRef, nodeMap, setNodeFailureKeyframes, setSelected]);
+
+  const updateNodeFailure = useCallback((nodeId, failureId, updates, pushHistory = true) => {
+    const node = nodeMap[nodeId];
+    if (!node) return;
+    if (pushHistory) _pushHistory();
+    setNodeFailureKeyframes(
+      nodeId,
+      normalizeNodeFailureKeyframes(node.failureKeyframes).map(keyframe => (
+        keyframe.id === failureId ? { ...keyframe, ...updates } : keyframe
+      ))
+    );
+  }, [_pushHistory, nodeMap, setNodeFailureKeyframes]);
+
+  const removeNodeFailure = useCallback((nodeId, failureId) => {
+    const node = nodeMap[nodeId];
+    if (!node) return;
+    _pushHistory();
+    setNodeFailureKeyframes(
+      nodeId,
+      normalizeNodeFailureKeyframes(node.failureKeyframes).filter(keyframe => keyframe.id !== failureId)
+    );
+    setSelected(nodeId);
+    setSelectedItem({ kind: 'node', id: nodeId });
+  }, [_pushHistory, nodeMap, setNodeFailureKeyframes, setSelected]);
+
+  const updateScrollStep = useCallback((nodeId, stepId, updates, pushHistory = true) => {
+    const node = nodeMap[nodeId];
+    if (!node) return;
+    if (pushHistory) _pushHistory();
+    updateNode(nodeId, {
+      scrollSteps: normalizeScrollSteps(node.scrollSteps).map(step => (
+        step.id === stepId ? { ...step, ...updates } : step
+      )),
+    });
+  }, [_pushHistory, nodeMap, updateNode]);
+
+  const removeScrollStep = useCallback((nodeId, stepId) => {
+    const node = nodeMap[nodeId];
+    if (!node) return;
+    _pushHistory();
+    updateNode(nodeId, {
+      scrollSteps: normalizeScrollSteps(node.scrollSteps).filter(step => step.id !== stepId),
+    });
+    setSelected(nodeId);
+    setSelectedItem({ kind: 'node', id: nodeId });
+  }, [_pushHistory, nodeMap, updateNode, setSelected]);
+
+  const setManualTokenTextKeyframes = useCallback((linkId, keyframes) => {
+    updateLink(linkId, {
+      manualTokenTextKeyframes: normalizeManualTokenTextKeyframes(keyframes),
+    });
+  }, [updateLink]);
+
+  const updateManualTokenTextKeyframe = useCallback((linkId, keyframeId, updates, pushHistory = true) => {
+    const link = linkMap[linkId];
+    if (!link) return;
+    if (pushHistory) _pushHistory();
+    const keyframes = normalizeManualTokenTextKeyframes(link.manualTokenTextKeyframes).map(keyframe => (
+      keyframe.id === keyframeId ? { ...keyframe, ...updates } : keyframe
+    ));
+    setManualTokenTextKeyframes(linkId, keyframes);
+  }, [_pushHistory, linkMap, setManualTokenTextKeyframes]);
+
+  const addManualTokenTextKeyframe = useCallback((linkId) => {
+    const link = linkMap[linkId];
+    if (!link?.manualTokenEnabled) return;
+    _pushHistory();
+    const timing = manualTokenTimingByLinkId[linkId];
+    const playheadTime = currentTimeRef?.current ?? currentTime;
+    const time = timing
+      ? r2(Math.max(timing.start, Math.min(timing.start + timing.duration, playheadTime)))
+      : r2(Math.max(0, playheadTime));
+    const keyframe = {
+      id: uuid(),
+      time,
+      text: getManualTokenTextAtTime(link, time),
+    };
+    setManualTokenTextKeyframes(linkId, [
+      ...normalizeManualTokenTextKeyframes(link.manualTokenTextKeyframes),
+      keyframe,
+    ]);
+    setSelected(linkId);
+    setSelectedItem({ kind: 'manual-token-text', id: linkId, keyframeId: keyframe.id });
+  }, [_pushHistory, currentTime, currentTimeRef, linkMap, manualTokenTimingByLinkId, setManualTokenTextKeyframes, setSelected]);
+
+  const removeManualTokenTextKeyframe = useCallback((linkId, keyframeId) => {
+    const link = linkMap[linkId];
+    if (!link) return;
+    _pushHistory();
+    setManualTokenTextKeyframes(
+      linkId,
+      normalizeManualTokenTextKeyframes(link.manualTokenTextKeyframes)
+        .filter(keyframe => keyframe.id !== keyframeId)
+    );
+    setSelected(linkId);
+    setSelectedItem({ kind: 'link', id: linkId });
+  }, [_pushHistory, linkMap, setManualTokenTextKeyframes, setSelected]);
+
   const selKind = selectedItem?.kind;
-  const selBaseKind = (selKind === 'text-morph' || selKind === 'variable-token') ? 'node' : selKind;
+  const selBaseKind = (
+    selKind === 'text-morph'
+    || selKind === 'graph-point'
+    || selKind === 'graph-domain'
+    || selKind === 'graph-calc'
+    || selKind === 'node-failure'
+    || selKind === 'scroll-step'
+    || selKind === 'variable-token'
+  )
+    ? 'node'
+    : selKind === 'manual-token-text'
+      ? 'link'
+      : selKind;
   const selData = !selectedItem ? null : selBaseKind === 'node'
     ? nodes.find(n => n.id === selectedItem.id) ?? null
     : links.find(e => e.id === selectedItem.id) ?? null;
@@ -502,14 +719,32 @@ function KeyframePanel({ playback }) {
   const selMorph = selKind === 'text-morph' && selData && selTiming
     ? getTextMorphById(selData, selectedItem.morphId, selTiming)
     : null;
+  const selManualTokenTextKeyframe = selKind === 'manual-token-text' && selData
+    ? normalizeManualTokenTextKeyframes(selData.manualTokenTextKeyframes)
+        .find(keyframe => keyframe.id === selectedItem.keyframeId) ?? null
+    : null;
   const selGraphPoint = selKind === 'graph-point' && selData
     ? (selData.graphPoints ?? []).find(p => p.id === selectedItem.pointId) ?? null
+    : null;
+  const selNodeFailure = selKind === 'node-failure' && selData
+    ? normalizeNodeFailureKeyframes(selData.failureKeyframes)
+        .find(keyframe => keyframe.id === selectedItem.failureId) ?? null
+    : null;
+  const selScrollStep = selKind === 'scroll-step' && selData
+    ? normalizeScrollSteps(selData.scrollSteps)
+        .find(step => step.id === selectedItem.stepId) ?? null
     : null;
   const selWeb = selKind === 'variable-token' && selData ? webByVariableId[selData.id] : null;
   const selLabel  = selKind === 'text-morph'
     ? `${selData?.label ?? '?'} morph`
+    : selKind === 'manual-token-text'
+      ? `${selData ? linkLabel(selData, nodes) : '?'} text key`
     : selKind === 'variable-token'
       ? `${selData?.variableLabel || selData?.label || '?'} token`
+    : selKind === 'node-failure'
+      ? `${selData?.label ?? '?'} failure`
+    : selKind === 'scroll-step'
+      ? `${selData?.label ?? '?'} step`
     : selBaseKind === 'node'
       ? (selData?.label ?? '?')
     : selData ? linkLabel(selData, nodes) : null;
@@ -652,8 +887,17 @@ function KeyframePanel({ playback }) {
 
   useEffect(() => {
     if (!selectedItem) return;
-    if (selectedItem.kind === 'link') {
-      if (!links.find(link => link.id === selectedItem.id)) setSelectedItem(null);
+    if (selectedItem.kind === 'link' || selectedItem.kind === 'manual-token-text') {
+      const link = links.find(item => item.id === selectedItem.id);
+      if (!link) {
+        setSelectedItem(null);
+      } else if (
+        selectedItem.kind === 'manual-token-text'
+        && !normalizeManualTokenTextKeyframes(link.manualTokenTextKeyframes)
+          .some(keyframe => keyframe.id === selectedItem.keyframeId)
+      ) {
+        setSelectedItem({ kind: 'link', id: selectedItem.id });
+      }
       return;
     }
     const node = nodes.find(item => item.id === selectedItem.id);
@@ -667,7 +911,27 @@ function KeyframePanel({ playback }) {
         setSelectedItem({ kind: 'node', id: selectedItem.id });
       }
     }
+    if (
+      selectedItem.kind === 'node-failure'
+      && !normalizeNodeFailureKeyframes(node.failureKeyframes)
+        .some(keyframe => keyframe.id === selectedItem.failureId)
+    ) {
+      setSelectedItem({ kind: 'node', id: selectedItem.id });
+    }
+    if (
+      selectedItem.kind === 'scroll-step'
+      && !normalizeScrollSteps(node.scrollSteps).some(step => step.id === selectedItem.stepId)
+    ) {
+      setSelectedItem({ kind: 'node', id: selectedItem.id });
+    }
     if (selectedItem.kind === 'variable-token' && node.type !== 'variable') {
+      setSelectedItem({ kind: 'node', id: selectedItem.id });
+    }
+    if (
+      (selectedItem.kind === 'graph-domain' || selectedItem.kind === 'graph-calc')
+      && !(node.graphDomains ?? []).some(dom => dom.id === selectedItem.domainId
+        && (selectedItem.kind === 'graph-domain' || dom.calc))
+    ) {
       setSelectedItem({ kind: 'node', id: selectedItem.id });
     }
   }, [effectiveTiming, links, nodes, selectedItem]);
@@ -679,6 +943,9 @@ function KeyframePanel({ playback }) {
 
   useEffect(() => {
     if (!selectedId) return;
+    // Timeline drags update the node/link stores on every pointer move. Do not
+    // turn those updates into selection changes or scroll corrections.
+    if (blockDragRef.current) return;
     const isNode = !!nodes.find(n => n.id === selectedId);
     const isLink = !isNode && !!links.find(l => l.id === selectedId);
     if (!isNode && !isLink) return;
@@ -686,18 +953,43 @@ function KeyframePanel({ playback }) {
       setSelectedItem(null);
       return;
     }
-    if (selectedItem?.id === selectedId) {
-      if ((selectedItem.kind === 'text-morph' || selectedItem.kind === 'node') && isNode) return;
-      if (selectedItem.kind === 'link' && isLink) return;
-    }
+    const selectedParentKind = selectedItem?.kind === 'manual-token-text'
+      ? 'link'
+      : selectedItem?.kind === 'text-morph'
+        || selectedItem?.kind === 'graph-point'
+        || selectedItem?.kind === 'node-failure'
+        || selectedItem?.kind === 'scroll-step'
+        || selectedItem?.kind === 'variable-token'
+        ? 'node'
+        : selectedItem?.kind;
+    if (
+      selectedItem?.id === selectedId
+      && ((selectedParentKind === 'node' && isNode) || (selectedParentKind === 'link' && isLink))
+    ) return;
     const kind = isNode ? 'node' : 'link';
     setSelectedItem({ kind, id: selectedId });
 
     requestAnimationFrame(() => {
+      if (blockDragRef.current) return;
       const el = leftBodyRef.current;
       if (!el) return;
       const row = el.querySelector(`[data-row-id="${kind}-${selectedId}"]`);
-      if (row) row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      if (!row) return;
+
+      // Keep scrolling local to the timeline. Element.scrollIntoView can also
+      // move the panel or page, which made timeline edits jump upward.
+      const rowTop = row.offsetTop;
+      const rowBottom = rowTop + row.offsetHeight;
+      const viewportTop = el.scrollTop;
+      const viewportBottom = viewportTop + el.clientHeight;
+      let nextScrollTop = viewportTop;
+      if (rowTop < viewportTop) nextScrollTop = rowTop;
+      else if (rowBottom > viewportBottom) nextScrollTop = rowBottom - el.clientHeight;
+
+      if (nextScrollTop !== viewportTop) {
+        el.scrollTop = nextScrollTop;
+        if (rightBodyRef.current) rightBodyRef.current.scrollTop = nextScrollTop;
+      }
     });
   }, [links, nodes, selectedId, selectedItem]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -712,7 +1004,8 @@ function KeyframePanel({ playback }) {
     // The throttled `seek` call will eventually sync React state, but the visual
     // feedback needs to be instant so the scrubber doesn't feel laggy.
     if (playheadRef.current) {
-      const cDur = Math.max(contentDuration ?? totalDuration, 4);
+      const maxBreak = (slideBreaks && slideBreaks.length) ? Math.max(...slideBreaks) : 0;
+      const cDur = Math.max(contentDuration ?? totalDuration, maxBreak, 4);
       const tW = cDur * PX_PER_SEC + 40;
       const px = Math.min(t * PX_PER_SEC, tW - 2);
       playheadRef.current.style.left = px + 'px';
@@ -721,7 +1014,8 @@ function KeyframePanel({ playback }) {
     }
 
     seek(t);
-  }, [seek, contentDuration, totalDuration]);
+    setTimelineCursor(t);
+  }, [seek, contentDuration, totalDuration, slideBreaks]);
 
   useEffect(() => {
     // ── Edge auto-scroll ──────────────────────────────────────────────────────
@@ -774,6 +1068,16 @@ function KeyframePanel({ playback }) {
         setNodeTextMorphs(d.itemId, morphs);
         return;
       }
+      if (d.kind === 'manual-token-text' && d.keyframeId) {
+        const link = linkMap[d.itemId];
+        if (!link) return;
+        const nextTime = r2(Math.max(0, d.initKeyframeTime + dtSec));
+        const keyframes = normalizeManualTokenTextKeyframes(link.manualTokenTextKeyframes).map(keyframe => (
+          keyframe.id === d.keyframeId ? { ...keyframe, time: nextTime } : keyframe
+        ));
+        setManualTokenTextKeyframes(d.itemId, keyframes);
+        return;
+      }
       if (d.multiGroup?.length) {
         const groupMinStart = Math.min(...d.multiGroup.map(groupItem => groupItem.initStart));
         const groupMaxEnd = Math.max(...d.multiGroup.map(groupItem => groupItem.initStart + groupItem.initDur));
@@ -811,6 +1115,69 @@ function KeyframePanel({ playback }) {
           : d.initDur;
         const next = (node.graphPoints ?? []).map(p => p.id === d.pointId ? { ...p, startTime: nextStart, duration: nextDur } : p);
         updateNode(d.itemId, { graphPoints: next });
+        return;
+      }
+      if (d.kind === 'graph-domain') {
+        const node = nodeMap[d.itemId];
+        if (!node) return;
+        const nextStart = d.dragType === 'gdomain-move'
+          ? r2(Math.max(0, d.initStart + dtSec))
+          : d.initStart;
+        const nextDur = d.dragType === 'gdomain-resize'
+          ? r2(Math.max(MIN_DUR, d.initDur + dtSec))
+          : d.initDur;
+        const next = (node.graphDomains ?? []).map(dom => dom.id === d.domainId
+          ? { ...dom, startTime: nextStart, duration: nextDur } : dom);
+        updateNode(d.itemId, { graphDomains: next });
+        return;
+      }
+      if (d.kind === 'graph-calc') {
+        const node = nodeMap[d.itemId];
+        if (!node) return;
+        const nextTime = d.dragType === 'gcalc-move'
+          ? r2(Math.max(0, d.initStart + dtSec))
+          : d.initStart;
+        const nextDur = d.dragType === 'gcalc-resize'
+          ? r2(Math.max(MIN_DUR, d.initDur + dtSec))
+          : d.initDur;
+        const next = (node.graphDomains ?? []).map(dom => dom.id === d.domainId && dom.calc
+          ? { ...dom, calc: { ...dom.calc, time: nextTime, duration: nextDur } } : dom);
+        updateNode(d.itemId, { graphDomains: next });
+        return;
+      }
+      if (d.kind === 'node-failure') {
+        const node = nodeMap[d.itemId];
+        if (!node) return;
+        const nextStart = d.dragType === 'node-failure-move'
+          ? r2(Math.max(0, d.initStart + dtSec))
+          : d.initStart;
+        const nextDur = d.dragType === 'node-failure-resize'
+          ? r2(Math.max(MIN_DUR, d.initDur + dtSec))
+          : d.initDur;
+        setNodeFailureKeyframes(
+          d.itemId,
+          normalizeNodeFailureKeyframes(node.failureKeyframes).map(keyframe => (
+            keyframe.id === d.failureId
+              ? { ...keyframe, startTime: nextStart, duration: nextDur }
+              : keyframe
+          ))
+        );
+        return;
+      }
+      if (d.kind === 'scroll-step') {
+        const node = nodeMap[d.itemId];
+        if (!node) return;
+        const nextTime = d.dragType === 'scroll-step-move'
+          ? r2(Math.max(0, d.initStart + dtSec))
+          : d.initStart;
+        const nextDur = d.dragType === 'scroll-step-resize'
+          ? r2(Math.max(MIN_DUR, d.initDur + dtSec))
+          : d.initDur;
+        updateNode(d.itemId, {
+          scrollSteps: normalizeScrollSteps(node.scrollSteps).map(step => (
+            step.id === d.stepId ? { ...step, time: nextTime, duration: nextDur } : step
+          )),
+        });
         return;
       }
       if (d.kind === 'node') {
@@ -884,13 +1251,17 @@ function KeyframePanel({ playback }) {
       document.removeEventListener('mouseup',   onUp);
       if (autoScrollRAF) cancelAnimationFrame(autoScrollRAF);
     };
-  }, [buildBoundDurationUpdates, clampMoveStartAgainstPreviewRanges, clampResizeDurationAgainstPreviewRanges, effectiveTiming, nodeMap, setNodeTextMorphs, updateNode, updateLink]);
+  }, [buildBoundDurationUpdates, clampMoveStartAgainstPreviewRanges, clampResizeDurationAgainstPreviewRanges, effectiveTiming, linkMap, nodeMap, setManualTokenTextKeyframes, setNodeFailureKeyframes, setNodeTextMorphs, updateNode, updateLink]);
 
   useEffect(() => {
     const onMove = (e) => { if (headDragRef.current) seekFromClientX(e.clientX); };
     const onUp   = ()  => {
+      if (!headDragRef.current) return;
       headDragRef.current = false;
       document.body.style.userSelect = '';
+      // Commit the exact final scrub time to React state so a later re-render
+      // (e.g. moving a node) doesn't snap the playhead back to a throttled value.
+      commitTime();
     };
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup',   onUp);
@@ -898,7 +1269,7 @@ function KeyframePanel({ playback }) {
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup',   onUp);
     };
-  }, [seekFromClientX]);
+  }, [seekFromClientX, commitTime]);
 
   useEffect(() => {
     const clampHeight = () => {
@@ -928,14 +1299,26 @@ function KeyframePanel({ playback }) {
 
   const handleTimelineSelect = useCallback((e, kind, id, options = {}) => {
     e.stopPropagation();
-    const nextItem = options.morphId
+    const nextItem = options.manualTokenTextKeyframeId
+      ? { kind: 'manual-token-text', id, keyframeId: options.manualTokenTextKeyframeId }
+      : options.morphId
       ? { kind: 'text-morph', id, morphId: options.morphId }
       : options.pointId
         ? { kind: 'graph-point', id, pointId: options.pointId }
+        : options.domainId
+          ? { kind: 'graph-domain', id, domainId: options.domainId }
+        : options.domainCalcId
+          ? { kind: 'graph-calc', id, domainId: options.domainCalcId }
+        : options.failureId
+          ? { kind: 'node-failure', id, failureId: options.failureId }
+        : options.stepId
+          ? { kind: 'scroll-step', id, stepId: options.stepId }
         : { kind, id };
     setSelectedItem(nextItem);
     if (e.shiftKey) {
       const anchorKind = selectedItem?.kind === 'text-morph'
+        || selectedItem?.kind === 'graph-point'
+        || selectedItem?.kind === 'node-failure'
         ? 'node'
         : selectedItem?.kind ?? kind;
       const anchorId = selectedItem?.id ?? selectedId ?? id;
@@ -972,6 +1355,57 @@ function KeyframePanel({ playback }) {
     const morphTiming = kind === 'node' && options.morphId
       ? getTextMorphById(item, options.morphId, { start, duration })
       : null;
+    // Special case: dragging a node that is triggered by a link should move that controlling link (and its bound/synced siblings)
+    if (kind === 'node' && dragType === 'move' && item.triggerAfterLinkId) {
+      const controllingLinkId = item.triggerAfterLinkId;
+      // Freeze other items so re-renders don't snap while dragging a link-derived node
+      freezeIndependentTimelineItems('link', controllingLinkId);
+      const controllingLink = links.find(l => l.id === controllingLinkId);
+      const { start: linkStart, duration: linkDur } = effectiveTiming(controllingLink ?? { id: controllingLinkId }, 'link');
+      // Ensure explicit timing exists on the controlling link/group before drag so updates are stable
+      if (controllingLink) {
+        const preset = {};
+        if (controllingLink.animStartTime == null) preset.animStartTime = linkStart;
+        if (controllingLink.animDuration == null)  preset.animDuration  = linkDur;
+        if (Object.keys(preset).length) updateLinkStartGroup(controllingLink.id, preset.animStartTime ?? controllingLink.animStartTime);
+        if (Object.keys(preset).length && Object.prototype.hasOwnProperty.call(preset, 'animDuration')) updateLinkDurationGroup(controllingLink.id, preset.animDuration ?? controllingLink.animDuration);
+      }
+      // Build link group (synced or bound siblings) like link drags do
+      const syncKey = syncedJunctionKeyByLinkId[controllingLinkId];
+      const boundKey = boundKeyByLinkId[controllingLinkId];
+      const groupLinkIds = boundKey
+        ? (boundLinkIdsByKey[boundKey] ?? [])
+        : (syncKey ? (syncedLinkIdsByKey[syncKey] ?? []) : []);
+      const linkGroup = groupLinkIds.length
+        ? groupLinkIds.map(linkId => {
+            const sibling = links.find(link => link.id === linkId);
+            const siblingTiming = sibling ? effectiveTiming(sibling, 'link') : { start: 0, duration: 0.65 };
+            if (sibling) {
+              const siblingUpdates = {};
+              if (sibling.animStartTime == null) siblingUpdates.animStartTime = siblingTiming.start;
+              if (sibling.animDuration == null) siblingUpdates.animDuration = siblingTiming.duration;
+              if (Object.keys(siblingUpdates).length) updateLink(sibling.id, siblingUpdates);
+            }
+            return { id: linkId, initStart: siblingTiming.start, initDur: siblingTiming.duration };
+          })
+        : null;
+      blockDragRef.current = {
+        dragType,
+        kind: 'link',
+        itemId: controllingLinkId,
+        morphId: null,
+        startX: e.clientX,
+        initStart: linkStart,
+        initDur: linkDur,
+        initMorphStart: null,
+        initMorphDur: null,
+        linkGroup,
+        multiGroup: null,
+        previewCrossing: null,
+      };
+      return;
+    }
+
     if (kind === 'node') {
       const nextUpdates = {};
       if ((dragType === 'move' || dragType === 'morph-move' || dragType === 'morph-resize') && item.animStartTime == null) nextUpdates.animStartTime = start;
@@ -1057,6 +1491,23 @@ function KeyframePanel({ playback }) {
     };
   }, [_pushHistory, boundKeyByLinkId, boundLinkIdsByKey, effectiveTiming, freezeIndependentTimelineItems, links, nodes, selectedId, selectedIds, syncedJunctionKeyByLinkId, syncedLinkIdsByKey, updateLinkStartGroup, updateLinkDurationGroup, updateNode, updateLink]);
 
+  const startManualTokenTextKeyframeDrag = useCallback((e, link, keyframe) => {
+    e.preventDefault();
+    e.stopPropagation();
+    document.body.style.userSelect = 'none';
+    _pushHistory();
+    setSelected(link.id);
+    setSelectedItem({ kind: 'manual-token-text', id: link.id, keyframeId: keyframe.id });
+    blockDragRef.current = {
+      dragType: 'manual-token-text-move',
+      kind: 'manual-token-text',
+      itemId: link.id,
+      keyframeId: keyframe.id,
+      startX: e.clientX,
+      initKeyframeTime: keyframe.time,
+    };
+  }, [_pushHistory, setSelected]);
+
   const handleTimelineMouseDown = useCallback((e) => {
     e.preventDefault();
     document.body.style.userSelect = 'none';
@@ -1097,7 +1548,10 @@ function KeyframePanel({ playback }) {
   }, [collapsed, panelHeight]);
 
   const totalDur    = Math.max(totalDuration, 4);
-  const contentDur  = Math.max(contentDuration ?? totalDuration, 4);
+  const contentDur  = (() => {
+    const maxBreak = (slideBreaks && slideBreaks.length) ? Math.max(...slideBreaks) : 0;
+    return Math.max(contentDuration ?? totalDuration, maxBreak, 4);
+  })();
   // Extra 160 px of "breathing room" past the last block so dragging near the edge feels open.
   const timelineW   = contentDur * PX_PER_SEC + 160;
 
@@ -1112,10 +1566,23 @@ function KeyframePanel({ playback }) {
         ? [{ type: 'token', item: n, web }]
         : [];
       const pointRows = (n.type === 'graph' ? (n.graphPoints ?? []).map(pt => ({ type: 'gpoint', item: n, point: pt })) : []);
+      const domainRows = (n.type === 'graph' ? (n.graphDomains ?? []).flatMap(dom => {
+        const rows = [{ type: 'gdomain', item: n, domain: dom }];
+        if (dom.calc) rows.push({ type: 'gcalc', item: n, domain: dom });
+        return rows;
+      }) : []);
+      const failureRows = normalizeNodeFailureKeyframes(n.failureKeyframes)
+        .map(failure => ({ type: 'node-failure', item: n, failure }));
+      const scrollStepRows = (n.type === 'area' && n.scrollEnabled && n.scrollMode === 'stepped')
+        ? normalizeScrollSteps(n.scrollSteps).map(step => ({ type: 'scroll-step', item: n, step }))
+        : [];
       return [
         { type: 'node', item: n },
+        ...failureRows,
+        ...scrollStepRows,
         ...morphs.map(morph => ({ type: 'morph', item: n, morph })),
         ...pointRows,
+        ...domainRows,
         ...tokenRow,
       ];
     }),
@@ -1182,7 +1649,7 @@ function KeyframePanel({ playback }) {
             </span>
             <VSep />
 
-            {selBaseKind === 'node' && selKind !== 'text-morph' && selKind !== 'variable-token' && (() => {
+            {selKind === 'node' && (() => {
               const isTrigger = !!(selData?.triggerAfterLinkId);
               const isTextNode = selData?.type === 'text';
               return (
@@ -1229,6 +1696,19 @@ function KeyframePanel({ playback }) {
                     </button>
                     <div style={{ width: 6 }} />
                   </>
+                  <>
+                    <FieldLabel>Failures</FieldLabel>
+                    <span style={{ color: FAILURE_HUE.bright, fontSize: 11, minWidth: 22 }}>
+                      {normalizeNodeFailureKeyframes(selData.failureKeyframes).length}
+                    </span>
+                    <button
+                      onClick={() => addNodeFailure(selData.id)}
+                      style={{ background: 'none', border: '1px solid var(--danger-border-soft)', borderRadius: 4, color: FAILURE_HUE.bright, fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
+                    >
+                      add failure
+                    </button>
+                    <div style={{ width: 6 }} />
+                  </>
                 </>
               );
             })()}
@@ -1262,8 +1742,26 @@ function KeyframePanel({ playback }) {
                 <FieldLabel>Fill</FieldLabel>
                 <input
                   type="color"
-                  value={selMorph.fill ?? selData.fill ?? '#ffffff'}
+                  value={toColorInputValue(selMorph.fill ?? selData.fill, '#ffffff')}
                   onChange={e => updateTextMorph(selData.id, selMorph.id, { fill: e.target.value })}
+                  onMouseDown={e => e.stopPropagation()}
+                  style={{ width: 28, height: 20, padding: 0, border: '1px solid var(--border-strong)', borderRadius: 4, background: 'transparent', cursor: 'pointer' }}
+                />
+                <div style={{ width: 6 }} />
+                <FieldLabel>Border</FieldLabel>
+                <input
+                  type="color"
+                  value={toColorInputValue(selMorph.stroke ?? selData.stroke, '#ffffff')}
+                  onChange={e => updateTextMorph(selData.id, selMorph.id, { stroke: e.target.value })}
+                  onMouseDown={e => e.stopPropagation()}
+                  style={{ width: 28, height: 20, padding: 0, border: '1px solid var(--border-strong)', borderRadius: 4, background: 'transparent', cursor: 'pointer' }}
+                />
+                <div style={{ width: 6 }} />
+                <FieldLabel>Text clr</FieldLabel>
+                <input
+                  type="color"
+                  value={toColorInputValue(selMorph.textColor ?? selData.textColor, '#ffffff')}
+                  onChange={e => updateTextMorph(selData.id, selMorph.id, { textColor: e.target.value })}
                   onMouseDown={e => e.stopPropagation()}
                   style={{ width: 28, height: 20, padding: 0, border: '1px solid var(--border-strong)', borderRadius: 4, background: 'transparent', cursor: 'pointer' }}
                 />
@@ -1274,6 +1772,14 @@ function KeyframePanel({ playback }) {
                   step={1}
                   min={0}
                   onChange={v => updateTextMorph(selData.id, selMorph.id, { cornerRadius: Math.max(0, Math.round(v)) })}
+                />
+                <div style={{ width: 6 }} />
+                <FieldLabel>Alpha</FieldLabel>
+                <NumberField
+                  value={selMorph.alpha ?? 1}
+                  step={0.1}
+                  min={0}
+                  onChange={v => updateTextMorph(selData.id, selMorph.id, { alpha: Math.max(0, Math.min(1, v)) })}
                 />
                 <button
                   onClick={() => removeTextMorph(selData.id, selMorph.id)}
@@ -1294,20 +1800,84 @@ function KeyframePanel({ playback }) {
                 <FieldLabel>Start</FieldLabel>
                 <NumberField value={Number.isFinite(selGraphPoint.startTime) ? selGraphPoint.startTime : 0} step={0.05} min={0} onChange={v => {
                   const gp = (selData.graphPoints ?? []).map(p => p.id === selGraphPoint.id ? { ...p, startTime: r2(Math.max(0, v)) } : p);
-                  doUpdate({ graphPoints: gp });
+                  _pushHistory();
+                  updateNode(selData.id, { graphPoints: gp });
                 }} />
                 <FieldLabel>s</FieldLabel>
                 <div style={{ width: 6 }} />
                 <FieldLabel>Dur</FieldLabel>
                 <NumberField value={Number.isFinite(selGraphPoint.duration) ? selGraphPoint.duration : 0.35} step={0.05} min={0.05} onChange={v => {
                   const gp = (selData.graphPoints ?? []).map(p => p.id === selGraphPoint.id ? { ...p, duration: r2(Math.max(0.05, v)) } : p);
-                  doUpdate({ graphPoints: gp });
+                  _pushHistory();
+                  updateNode(selData.id, { graphPoints: gp });
                 }} />
                 <FieldLabel>s</FieldLabel>
               </>
             )}
 
-            {selBaseKind === 'link' && (
+            {selKind === 'node-failure' && selNodeFailure && (
+              <>
+                <FieldLabel>Failure</FieldLabel>
+                <span style={{ color: FAILURE_HUE.bright, fontSize: 11, fontWeight: 700 }}>timed</span>
+                <VSep />
+                <FieldLabel>Start</FieldLabel>
+                <NumberField
+                  value={selNodeFailure.startTime}
+                  step={0.05}
+                  min={0}
+                  onChange={value => updateNodeFailure(selData.id, selNodeFailure.id, { startTime: r2(Math.max(0, value)) })}
+                />
+                <FieldLabel>s</FieldLabel>
+                <div style={{ width: 6 }} />
+                <FieldLabel>Dur</FieldLabel>
+                <NumberField
+                  value={selNodeFailure.duration}
+                  step={0.05}
+                  min={MIN_DUR}
+                  onChange={value => updateNodeFailure(selData.id, selNodeFailure.id, { duration: r2(Math.max(MIN_DUR, value)) })}
+                />
+                <FieldLabel>s</FieldLabel>
+                <button
+                  onClick={() => removeNodeFailure(selData.id, selNodeFailure.id)}
+                  style={{ background: 'none', border: '1px solid var(--danger-border-soft)', borderRadius: 4, color: FAILURE_HUE.bright, fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
+                >
+                  remove
+                </button>
+              </>
+            )}
+
+            {selKind === 'scroll-step' && selScrollStep && (
+              <>
+                <FieldLabel>Scroll step</FieldLabel>
+                <span style={{ color: SCROLL_HUE.bright, fontSize: 11, fontWeight: 700 }}>one tile</span>
+                <VSep />
+                <FieldLabel>At</FieldLabel>
+                <NumberField
+                  value={selScrollStep.time}
+                  step={0.05}
+                  min={0}
+                  onChange={value => updateScrollStep(selData.id, selScrollStep.id, { time: r2(Math.max(0, value)) })}
+                />
+                <FieldLabel>s</FieldLabel>
+                <div style={{ width: 6 }} />
+                <FieldLabel>Shift</FieldLabel>
+                <NumberField
+                  value={selScrollStep.duration}
+                  step={0.05}
+                  min={MIN_DUR}
+                  onChange={value => updateScrollStep(selData.id, selScrollStep.id, { duration: r2(Math.max(MIN_DUR, value)) })}
+                />
+                <FieldLabel>s</FieldLabel>
+                <button
+                  onClick={() => removeScrollStep(selData.id, selScrollStep.id)}
+                  style={{ background: 'none', border: '1px solid var(--purple-border-strong)', borderRadius: 4, color: SCROLL_HUE.bright, fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
+                >
+                  remove
+                </button>
+              </>
+            )}
+
+            {selBaseKind === 'link' && selKind !== 'manual-token-text' && (
               <>
                 <FieldLabel>Start</FieldLabel>
                 <NumberField value={selTiming.start} step={0.05} min={0} onChange={v => doUpdate({ animStartTime: r2(Math.max(0, v)), animDuration: selTiming.duration })} />
@@ -1325,7 +1895,56 @@ function KeyframePanel({ playback }) {
               </>
             )}
 
-            {selKind !== 'text-morph' && selKind !== 'variable-token' && (
+            {selKind === 'link' && selData?.manualTokenEnabled && (
+              <>
+                <FieldLabel>Text keys</FieldLabel>
+                <span style={{ color: 'var(--text-dim)', fontSize: 11, minWidth: 22 }}>
+                  {normalizeManualTokenTextKeyframes(selData.manualTokenTextKeyframes).length}
+                </span>
+                <button
+                  onClick={() => addManualTokenTextKeyframe(selData.id)}
+                  style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: TOKEN_HUE.bright, fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
+                >
+                  add text key
+                </button>
+                <VSep />
+              </>
+            )}
+
+            {selKind === 'manual-token-text' && selManualTokenTextKeyframe && (
+              <>
+                <FieldLabel>Text</FieldLabel>
+                <InlineTextField
+                  value={selManualTokenTextKeyframe.text}
+                  onChange={value => updateManualTokenTextKeyframe(
+                    selData.id,
+                    selManualTokenTextKeyframe.id,
+                    { text: value }
+                  )}
+                  width={150}
+                />
+                <FieldLabel>Time</FieldLabel>
+                <NumberField
+                  value={selManualTokenTextKeyframe.time}
+                  step={0.05}
+                  min={0}
+                  onChange={value => updateManualTokenTextKeyframe(
+                    selData.id,
+                    selManualTokenTextKeyframe.id,
+                    { time: r2(Math.max(0, value)) }
+                  )}
+                />
+                <FieldLabel>s</FieldLabel>
+                <button
+                  onClick={() => removeManualTokenTextKeyframe(selData.id, selManualTokenTextKeyframe.id)}
+                  style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--danger-bright)', fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
+                >
+                  remove
+                </button>
+              </>
+            )}
+
+            {(selKind === 'node' || selKind === 'link') && (
               <>
                 <FieldLabel>Duration</FieldLabel>
                 <NumberField value={selTiming.duration} step={0.05} min={MIN_DUR} onChange={v => doUpdate({ animDuration: r2(Math.max(MIN_DUR, v)) })} />
@@ -1503,6 +2122,32 @@ function KeyframePanel({ playback }) {
           </>
         )}
 
+        <VSep />
+        {/* Slide controls */}
+        {!collapsed && (
+          <>
+            <FieldLabel>GIF dividers</FieldLabel>
+            <span style={{ color: 'var(--text-dim)', fontSize: 11, minWidth: 24 }} title="Number of manual GIF dividers">
+              {slideBreaks.length}
+            </span>
+            <button
+              onClick={() => addSlideBreakAt(r2(currentTime))}
+              title="Add GIF divider at playhead time. The last divider ends the final GIF."
+              style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text-main)', fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
+            >
+              add divider @ {r2(currentTime)}s
+            </button>
+            <button
+              onClick={clearSlideBreaks}
+              disabled={!slideBreaks.length}
+              title="Clear all slide breaks"
+              style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text-dim)', fontSize: 10, padding: '2px 8px', cursor: slideBreaks.length ? 'pointer' : 'not-allowed', whiteSpace: 'nowrap', opacity: slideBreaks.length ? 1 : 0.6 }}
+            >
+              clear
+            </button>
+          </>
+        )}
+
         {!collapsed && isEmpty && (
           <span style={{ color: 'var(--text-faint)', fontSize: 12 }}>Add nodes to see timeline</span>
         )}
@@ -1525,6 +2170,62 @@ function KeyframePanel({ playback }) {
               {rows.map((row, i) => {
                 if (row.type === 'section') {
                   return <SectionRow key={`sec-${i}`} label={row.label} color={row.color} />;
+                }
+                if (row.type === 'node-failure') {
+                  const { item: node, failure } = row;
+                  const failures = normalizeNodeFailureKeyframes(node.failureKeyframes);
+                  const failureIndex = failures.findIndex(keyframe => keyframe.id === failure.id);
+                  const isFailureSel = selectedItem?.kind === 'node-failure'
+                    && selectedItem?.id === node.id
+                    && selectedItem?.failureId === failure.id;
+                  return (
+                    <div
+                      key={`failure-left-${node.id}-${failure.id}`}
+                      onClick={(e) => handleTimelineSelect(e, 'node', node.id, { failureId: failure.id })}
+                      style={{
+                        height: ROW_H, display: 'flex', alignItems: 'center',
+                        padding: '0 10px 0 22px', gap: 7, cursor: 'pointer',
+                        borderBottom: `1px solid ${pageColors.timelineRowDivider}`,
+                        borderLeft: `2px solid ${isFailureSel ? FAILURE_HUE.bright : pageColors.transparent}`,
+                        background: isFailureSel ? withAlpha(FAILURE_HUE.solid, 0.08) : pageColors.transparent,
+                        flexShrink: 0,
+                      }}
+                    >
+                      <span style={{ color: FAILURE_HUE.bright, fontSize: 12, fontWeight: 800, lineHeight: 1 }}>×</span>
+                      <span style={{ color: isFailureSel ? FAILURE_HUE.bright : pageColors.timelineTextMuted, fontSize: 11, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        failure {failureIndex + 1}
+                      </span>
+                      <span style={{ color: FAILURE_HUE.bright, opacity: 0.65, fontSize: 9, letterSpacing: '0.05em', flexShrink: 0 }}>FAIL</span>
+                    </div>
+                  );
+                }
+                if (row.type === 'scroll-step') {
+                  const { item: node, step } = row;
+                  const steps = normalizeScrollSteps(node.scrollSteps);
+                  const stepIndex = steps.findIndex(s => s.id === step.id);
+                  const isStepSel = selectedItem?.kind === 'scroll-step'
+                    && selectedItem?.id === node.id
+                    && selectedItem?.stepId === step.id;
+                  return (
+                    <div
+                      key={`scroll-step-left-${node.id}-${step.id}`}
+                      onClick={(e) => handleTimelineSelect(e, 'node', node.id, { stepId: step.id })}
+                      style={{
+                        height: ROW_H, display: 'flex', alignItems: 'center',
+                        padding: '0 10px 0 22px', gap: 7, cursor: 'pointer',
+                        borderBottom: `1px solid ${pageColors.timelineRowDivider}`,
+                        borderLeft: `2px solid ${isStepSel ? SCROLL_HUE.bright : pageColors.transparent}`,
+                        background: isStepSel ? withAlpha(SCROLL_HUE.solid, 0.08) : pageColors.transparent,
+                        flexShrink: 0,
+                      }}
+                    >
+                      <span style={{ color: SCROLL_HUE.bright, fontSize: 12, fontWeight: 800, lineHeight: 1 }}>⇥</span>
+                      <span style={{ color: isStepSel ? SCROLL_HUE.bright : pageColors.timelineTextMuted, fontSize: 11, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        step {stepIndex + 1}
+                      </span>
+                      <span style={{ color: SCROLL_HUE.bright, opacity: 0.65, fontSize: 9, letterSpacing: '0.05em', flexShrink: 0 }}>STEP</span>
+                    </div>
+                  );
                 }
                 if (row.type === 'morph') {
                   const { item: morphNode, morph } = row;
@@ -1598,6 +2299,35 @@ function KeyframePanel({ playback }) {
                     </div>
                   );
                 }
+                if (row.type === 'gdomain' || row.type === 'gcalc') {
+                  const { item: gdNode, domain } = row;
+                  const isCalc = row.type === 'gcalc';
+                  const selKindWant = isCalc ? 'graph-calc' : 'graph-domain';
+                  const isSel = selectedItem?.kind === selKindWant
+                    && selectedItem?.id === gdNode.id && selectedItem?.domainId === domain.id;
+                  return (
+                    <div
+                      key={`${row.type}-left-${gdNode.id}-${domain.id}`}
+                      onClick={(e) => handleTimelineSelect(e, 'node', gdNode.id, isCalc ? { domainCalcId: domain.id } : { domainId: domain.id })}
+                      style={{
+                        height: ROW_H, display: 'flex', alignItems: 'center',
+                        padding: '0 10px 0 22px', gap: 7, cursor: 'pointer',
+                        borderBottom: `1px solid ${pageColors.timelineRowDivider}`,
+                        borderLeft: `2px solid ${isSel ? NODE_HUE.solid : pageColors.transparent}`,
+                        background: isSel ? withAlpha(NODE_HUE.solid, 0.06) : pageColors.transparent,
+                        flexShrink: 0,
+                      }}
+                    >
+                      <div style={{ width: 5, height: 5, borderRadius: isCalc ? 1 : '50%', flexShrink: 0, background: domain.color ?? NODE_HUE.solid, opacity: 0.85 }} />
+                      <span style={{ color: isSel ? NODE_HUE.bright : pageColors.timelineTextMuted, fontSize: 11, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {isCalc
+                          ? `calculate · ${Math.round(domain.calc?.count ?? 0)} dots`
+                          : `domain: ${domain.label || '(unnamed)'}`}
+                      </span>
+                      <span style={{ color: pageColors.rulerMinorTick, fontSize: 9, letterSpacing: '0.05em', flexShrink: 0 }}>{isCalc ? 'CALC' : 'DOMAIN'}</span>
+                    </div>
+                  );
+                }
                 if (row.type === 'token') {
                   const { item: varNode, web } = row;
                   const isTokenSel = selectedItem?.kind === 'variable-token' && selectedItem?.id === varNode.id;
@@ -1627,7 +2357,10 @@ function KeyframePanel({ playback }) {
                 const hue   = kind === 'node' ? NODE_HUE : LINK_HUE;
                 const isSel = selectedItem?.id === item.id && (
                   selectedItem?.kind === kind ||
-                  (kind === 'node' && selectedItem?.kind === 'text-morph')
+                  (kind === 'node' && selectedItem?.kind === 'text-morph') ||
+                  (kind === 'node' && selectedItem?.kind === 'node-failure') ||
+                  (kind === 'node' && selectedItem?.kind === 'scroll-step') ||
+                  (kind === 'link' && selectedItem?.kind === 'manual-token-text')
                 );
                 const isInSelection = selectedIds.includes(item.id);
                 const label = kind === 'node' ? trunc(item.label) : linkLabel(item, nodes);
@@ -1685,7 +2418,13 @@ function KeyframePanel({ playback }) {
             style={{ flex: 1, overflowX: 'auto', overflowY: 'hidden', position: 'relative', cursor: 'crosshair', minWidth: 0 }}
           >
             <div style={{ minWidth: timelineW, width: '100%', display: 'flex', flexDirection: 'column', height: '100%', position: 'relative' }}>
-              <Ruler total={totalDur} contentDur={contentDur} />
+              <Ruler
+                total={contentDur}
+                contentDur={contentDur}
+                slideBreaks={slideBreaks}
+                onRemoveBreak={t => removeSlideBreakAtTime(t)}
+                onMoveBreak={(from, to) => moveSlideBreak(from, to)}
+              />
 
               {/* Buffer-zone overlay — the 160 px of breathing room past content end */}
               <div style={{
@@ -1709,6 +2448,148 @@ function KeyframePanel({ playback }) {
                   if (row.type === 'section') {
                     return (
                       <div key={`sec-${i}`} style={{ height: SEC_H, background: pageColors.timelineSectionBackground, borderBottom: `1px solid ${withAlpha(row.color, 0.13)}`, flexShrink: 0 }} />
+                    );
+                  }
+
+                  if (row.type === 'node-failure') {
+                    const { item: node, failure } = row;
+                    const isFailureSel = selectedItem?.kind === 'node-failure'
+                      && selectedItem?.id === node.id
+                      && selectedItem?.failureId === failure.id;
+                    const left = failure.startTime * PX_PER_SEC;
+                    const width = Math.max(failure.duration * PX_PER_SEC, HANDLE_W + 6);
+                    const beginDrag = (e, dragType) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      document.body.style.userSelect = 'none';
+                      _pushHistory();
+                      setSelected(node.id);
+                      setSelectedItem({ kind: 'node-failure', id: node.id, failureId: failure.id });
+                      blockDragRef.current = {
+                        dragType,
+                        kind: 'node-failure',
+                        itemId: node.id,
+                        failureId: failure.id,
+                        startX: e.clientX,
+                        initStart: failure.startTime,
+                        initDur: failure.duration,
+                      };
+                    };
+                    return (
+                      <div
+                        key={`failure-${node.id}-${failure.id}`}
+                        onClick={(e) => handleTimelineSelect(e, 'node', node.id, { failureId: failure.id })}
+                        style={{
+                          height: ROW_H,
+                          borderBottom: `1px solid ${pageColors.timelineRowDivider}`,
+                          position: 'relative',
+                          flexShrink: 0,
+                          background: isFailureSel ? withAlpha(FAILURE_HUE.solid, 0.055) : pageColors.transparent,
+                          cursor: 'crosshair',
+                        }}
+                      >
+                        <div
+                          title={`Node failure · Start ${failure.startTime.toFixed(2)}s · Duration ${failure.duration.toFixed(2)}s`}
+                          onMouseDown={e => beginDrag(e, 'node-failure-move')}
+                          style={{
+                            position: 'absolute', top: 6, left, width, height: ROW_H - 12,
+                            borderRadius: 5, cursor: 'grab', display: 'flex', alignItems: 'center', overflow: 'hidden',
+                            background: isFailureSel ? withAlpha(FAILURE_HUE.solid, 0.5) : withAlpha(FAILURE_HUE.solid, 0.26),
+                            border: `1px solid ${isFailureSel ? FAILURE_HUE.bright : withAlpha(FAILURE_HUE.bright, 0.58)}`,
+                            boxShadow: isFailureSel ? `0 0 0 2px ${withAlpha(FAILURE_HUE.solid, 0.16)}` : 'none',
+                          }}
+                        >
+                          <span style={{ color: FAILURE_HUE.bright, fontSize: 12, fontWeight: 800, paddingLeft: 6, pointerEvents: 'none' }}>×</span>
+                          {width > 48 && (
+                            <span style={{ color: FAILURE_HUE.bright, fontSize: 10, paddingLeft: 5, whiteSpace: 'nowrap', pointerEvents: 'none' }}>
+                              {failure.duration.toFixed(2)}s
+                            </span>
+                          )}
+                          <div
+                            onMouseDown={e => beginDrag(e, 'node-failure-resize')}
+                            style={{
+                              position: 'absolute', right: 0, top: 0, bottom: 0,
+                              width: HANDLE_W, cursor: 'ew-resize',
+                              background: isFailureSel ? withAlpha(FAILURE_HUE.bright, 0.18) : pageColors.transparent,
+                              display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            }}
+                          >
+                            {isFailureSel && <div style={{ width: 2, height: 10, borderRadius: 1, background: FAILURE_HUE.bright }} />}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  }
+
+                  if (row.type === 'scroll-step') {
+                    const { item: node, step } = row;
+                    const steps = normalizeScrollSteps(node.scrollSteps);
+                    const stepIndex = steps.findIndex(s => s.id === step.id);
+                    const isStepSel = selectedItem?.kind === 'scroll-step'
+                      && selectedItem?.id === node.id
+                      && selectedItem?.stepId === step.id;
+                    const left = step.time * PX_PER_SEC;
+                    const width = Math.max(step.duration * PX_PER_SEC, HANDLE_W + 6);
+                    const beginDrag = (e, dragType) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      document.body.style.userSelect = 'none';
+                      _pushHistory();
+                      setSelected(node.id);
+                      setSelectedItem({ kind: 'scroll-step', id: node.id, stepId: step.id });
+                      blockDragRef.current = {
+                        dragType,
+                        kind: 'scroll-step',
+                        itemId: node.id,
+                        stepId: step.id,
+                        startX: e.clientX,
+                        initStart: step.time,
+                        initDur: step.duration,
+                      };
+                    };
+                    return (
+                      <div
+                        key={`scroll-step-${node.id}-${step.id}`}
+                        onClick={(e) => handleTimelineSelect(e, 'node', node.id, { stepId: step.id })}
+                        style={{
+                          height: ROW_H,
+                          borderBottom: `1px solid ${pageColors.timelineRowDivider}`,
+                          position: 'relative',
+                          flexShrink: 0,
+                          background: isStepSel ? withAlpha(SCROLL_HUE.solid, 0.055) : pageColors.transparent,
+                          cursor: 'crosshair',
+                        }}
+                      >
+                        <div
+                          title={`Scroll step ${stepIndex + 1} · At ${step.time.toFixed(2)}s · Shift ${step.duration.toFixed(2)}s`}
+                          onMouseDown={e => beginDrag(e, 'scroll-step-move')}
+                          style={{
+                            position: 'absolute', top: 6, left, width, height: ROW_H - 12,
+                            borderRadius: 5, cursor: 'grab', display: 'flex', alignItems: 'center', overflow: 'hidden',
+                            background: isStepSel ? withAlpha(SCROLL_HUE.solid, 0.5) : withAlpha(SCROLL_HUE.solid, 0.26),
+                            border: `1px solid ${isStepSel ? SCROLL_HUE.bright : withAlpha(SCROLL_HUE.bright, 0.58)}`,
+                            boxShadow: isStepSel ? `0 0 0 2px ${withAlpha(SCROLL_HUE.solid, 0.16)}` : 'none',
+                          }}
+                        >
+                          <span style={{ color: SCROLL_HUE.bright, fontSize: 12, fontWeight: 800, paddingLeft: 6, pointerEvents: 'none' }}>⇥</span>
+                          {width > 48 && (
+                            <span style={{ color: SCROLL_HUE.bright, fontSize: 10, paddingLeft: 5, whiteSpace: 'nowrap', pointerEvents: 'none' }}>
+                              {step.duration.toFixed(2)}s
+                            </span>
+                          )}
+                          <div
+                            onMouseDown={e => beginDrag(e, 'scroll-step-resize')}
+                            style={{
+                              position: 'absolute', right: 0, top: 0, bottom: 0,
+                              width: HANDLE_W, cursor: 'ew-resize',
+                              background: isStepSel ? withAlpha(SCROLL_HUE.bright, 0.18) : pageColors.transparent,
+                              display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            }}
+                          >
+                            {isStepSel && <div style={{ width: 2, height: 10, borderRadius: 1, background: SCROLL_HUE.bright }} />}
+                          </div>
+                        </div>
+                      </div>
                     );
                   }
 
@@ -1940,6 +2821,77 @@ function KeyframePanel({ playback }) {
                     );
                   }
 
+                  if (row.type === 'gdomain' || row.type === 'gcalc') {
+                    const { item: node, domain } = row;
+                    const isCalc = row.type === 'gcalc';
+                    const hue = domain.color ?? NODE_HUE.solid;
+                    const selKindWant = isCalc ? 'graph-calc' : 'graph-domain';
+                    const isSel = selectedItem?.kind === selKindWant && selectedItem?.id === node.id && selectedItem?.domainId === domain.id;
+                    const initStart = isCalc
+                      ? (Number.isFinite(domain.calc?.time) ? domain.calc.time : 0)
+                      : (Number.isFinite(domain.startTime) ? domain.startTime : 0);
+                    const initDur = isCalc
+                      ? (Number.isFinite(domain.calc?.duration) ? domain.calc.duration : 1)
+                      : (Number.isFinite(domain.duration) ? domain.duration : 0.4);
+                    const left = initStart * PX_PER_SEC;
+                    const width = Math.max(initDur * PX_PER_SEC, HANDLE_W + 6);
+                    const dragKind = isCalc ? 'graph-calc' : 'graph-domain';
+                    const moveType = isCalc ? 'gcalc-move' : 'gdomain-move';
+                    const resizeType = isCalc ? 'gcalc-resize' : 'gdomain-resize';
+                    return (
+                      <div
+                        key={`${row.type}-${node.id}-${domain.id}`}
+                        onClick={(e) => { e.stopPropagation(); setSelectedItem({ kind: selKindWant, id: node.id, domainId: domain.id }); }}
+                        style={{ height: ROW_H, borderBottom: `1px solid ${pageColors.timelineRowDivider}`, position: 'relative', flexShrink: 0, background: isSel ? withAlpha(hue, 0.04) : pageColors.transparent, cursor: 'crosshair' }}
+                      >
+                        <div
+                          onMouseDown={e => {
+                            if (e.shiftKey || e.ctrlKey || e.metaKey) { setSelectedItem({ kind: selKindWant, id: node.id, domainId: domain.id }); return; }
+                            e.preventDefault(); e.stopPropagation();
+                            document.body.style.userSelect = 'none';
+                            _pushHistory();
+                            freezeIndependentTimelineItems('node', node.id);
+                            blockDragRef.current = {
+                              dragType: moveType,
+                              kind: dragKind,
+                              itemId: node.id,
+                              domainId: domain.id,
+                              startX: e.clientX,
+                              initStart,
+                              initDur,
+                            };
+                          }}
+                          style={{ position: 'absolute', top: 6, left, width, height: ROW_H - 12, borderRadius: 5, cursor: 'grab', display: 'flex', alignItems: 'center', overflow: 'hidden', background: isSel ? withAlpha(hue, 0.34) : withAlpha(hue, 0.2), border: `${isCalc ? '1px dashed' : '1px solid'} ${isSel ? hue : withAlpha(hue, 0.55)}` }}
+                        >
+                          {width > 44 && (
+                            <span style={{ color: isSel ? hue : withAlpha(hue, 0.85), fontSize: 10, paddingLeft: 6, whiteSpace: 'nowrap', pointerEvents: 'none' }}>
+                              {initDur.toFixed(2)}s
+                            </span>
+                          )}
+                          <div
+                            onMouseDown={e => {
+                              e.stopPropagation();
+                              document.body.style.userSelect = 'none';
+                              _pushHistory();
+                              blockDragRef.current = {
+                                dragType: resizeType,
+                                kind: dragKind,
+                                itemId: node.id,
+                                domainId: domain.id,
+                                startX: e.clientX,
+                                initStart,
+                                initDur,
+                              };
+                            }}
+                            style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: 'ew-resize', background: isSel ? withAlpha(hue, 0.3) : pageColors.transparent, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '0 5px 5px 0' }}
+                          >
+                            {isSel && <div style={{ width: 2, height: 10, borderRadius: 1, background: hue }} />}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  }
+
                   if (row.type === 'gpoint') {
                     const { item: node, point: pt } = row;
                     const isSel = selectedItem?.kind === 'graph-point' && selectedItem?.id === node.id && selectedItem?.pointId === pt.id;
@@ -2004,7 +2956,10 @@ function KeyframePanel({ playback }) {
                   const hue        = kind === 'node' ? NODE_HUE : LINK_HUE;
                   const isSel      = selectedItem?.id === item.id && (
                     selectedItem?.kind === kind ||
-                    (kind === 'node' && selectedItem?.kind === 'text-morph')
+                    (kind === 'node' && selectedItem?.kind === 'text-morph') ||
+                    (kind === 'node' && selectedItem?.kind === 'node-failure') ||
+                    (kind === 'node' && selectedItem?.kind === 'scroll-step') ||
+                    (kind === 'link' && selectedItem?.kind === 'manual-token-text')
                   );
                   const isTriggered = kind === 'node' && !!item.triggerAfterLinkId;
                   const boundKey   = kind === 'link' ? boundKeyByLinkId[item.id] : null;
@@ -2029,6 +2984,33 @@ function KeyframePanel({ playback }) {
                           pointerEvents: 'none',
                         }} />
                       )}
+                      {kind === 'link' && item.manualTokenEnabled && normalizeManualTokenTextKeyframes(item.manualTokenTextKeyframes).map(keyframe => {
+                        const isKeySelected = selectedItem?.kind === 'manual-token-text'
+                          && selectedItem?.id === item.id
+                          && selectedItem?.keyframeId === keyframe.id;
+                        return (
+                          <div
+                            key={`manual-token-text-${item.id}-${keyframe.id}`}
+                            title={`Token text at ${keyframe.time.toFixed(2)}s: ${keyframe.text || '(blank)'}`}
+                            onClick={e => handleTimelineSelect(e, 'link', item.id, { manualTokenTextKeyframeId: keyframe.id })}
+                            onMouseDown={e => startManualTokenTextKeyframeDrag(e, item, keyframe)}
+                            style={{
+                              position: 'absolute',
+                              left: keyframe.time * PX_PER_SEC - 6,
+                              top: 2,
+                              width: 12,
+                              height: 12,
+                              zIndex: 8,
+                              cursor: 'ew-resize',
+                              transform: 'rotate(45deg)',
+                              borderRadius: 2,
+                              background: isKeySelected ? TOKEN_HUE.bright : withAlpha(TOKEN_HUE.solid, 0.75),
+                              border: `1px solid ${isKeySelected ? pageColors.white : withAlpha(pageColors.white, 0.55)}`,
+                              boxShadow: isKeySelected ? `0 0 0 2px ${withAlpha(TOKEN_HUE.solid, 0.25)}` : 'none',
+                            }}
+                          />
+                        );
+                      })}
                       <div
                         title={`${kind === 'node' ? 'Node' : 'Link'} · Start ${start.toFixed(2)}s · Duration ${duration.toFixed(2)}s${displayDuration !== duration ? ` · Timeline ${displayDuration.toFixed(2)}s` : ''}${isTriggered ? ' · Triggered by link' : ''}${isBound ? ` · Synced with ${boundCount} links` : ''}`}
                         onMouseDown={e => {

@@ -1,9 +1,19 @@
 import React, { useRef, useState } from 'react';
 import { Circle, Group, Rect, Text } from 'react-konva';
-import { pageColors } from '../../../colorThemes';
+import { pageColors } from '../../colorThemes';
 import useStore from '../../store/useStore';
+import NodeStatusMark, { getNodeStatusDash, getNodeStatusStroke, getNodeStatusTextColor } from './NodeStatusMark';
 
 const PORT_R = 7;
+
+// Measure rendered text width so the value border can hug the text tightly.
+let _measureCtx = null;
+function measureTextWidth(text, fontSize, fontFamily, fontWeight = '500') {
+  if (typeof document === 'undefined') return (text?.length ?? 0) * fontSize * 0.6;
+  if (!_measureCtx) _measureCtx = document.createElement('canvas').getContext('2d');
+  _measureCtx.font = `${fontWeight} ${fontSize}px ${fontFamily}`;
+  return _measureCtx.measureText(text ?? '').width;
+}
 
 const PORT_POSITIONS = (w, h) => [
   { x: w / 2, y: 0,     side: 'top'    },
@@ -24,6 +34,7 @@ function MonitorShape({
   isLinking,
   onGroupDragStart,
   onGroupDragMove,
+  renderEditorChrome = true,
 }) {
   const updateNode = useStore(state => state.updateNode);
 
@@ -34,12 +45,12 @@ function MonitorShape({
     ? pageColors.blueSelection
     : isInSelection
       ? pageColors.purpleAccent
-      : node.stroke;
+      : getNodeStatusStroke(node, node.stroke);
   const strokeWidth = (isSelected || isInSelection) ? node.strokeWidth + 1 : node.strokeWidth;
   const cx = node.x + node.width / 2;
   const cy = node.y + node.height / 2;
 
-  const showPorts = isSelected || hovered || isLinking;
+  const showPorts = renderEditorChrome && (isSelected || hovered || isLinking);
   // Monitors don't participate in flow; we only show a dashed center port as a visual affordance
   const ports = [{ x: node.width / 2, y: node.height / 2, side: 'center' }];
 
@@ -90,18 +101,9 @@ function MonitorShape({
       onMouseLeave={() => setHovered(false)}
       onMouseUp={(e) => { if (isLinking) { e.cancelBubble = true; onEndLink(node.id, null); } }}
     >
-      <Rect width={node.width} height={node.height} fill={pageColors.blackHitArea} />
-
-      {/* shadow */}
-      <Rect
-        x={4}
-        y={4}
-        width={node.width}
-        height={node.height}
-        cornerRadius={node.cornerRadius}
-        fill={pageColors.blackShadowNode}
-        listening={false}
-      />
+      {renderEditorChrome && (
+        <Rect width={node.width} height={node.height} fill={pageColors.blackHitArea} />
+      )}
 
       {/* body */}
       <Rect
@@ -113,8 +115,10 @@ function MonitorShape({
         stroke={stroke}
         strokeWidth={strokeWidth}
         baseFill={node.fill}
-        baseStroke={node.stroke}
+        baseStroke={getNodeStatusStroke(node, node.stroke)}
         baseStrokeWidth={node.strokeWidth}
+        dash={getNodeStatusDash(node)}
+        dashEnabled={!!node.offline}
       />
 
 
@@ -138,7 +142,7 @@ function MonitorShape({
             align="center"
             verticalAlign="middle"
             fontSize={12}
-            fill={pageColors.white}
+            fill={getNodeStatusTextColor(node, pageColors.white)}
             fontFamily="Inter, system-ui, sans-serif"
             fontStyle="700"
           />
@@ -157,7 +161,7 @@ function MonitorShape({
         align="center"
         verticalAlign="middle"
         fontSize={node.fontSize ?? 14}
-        fill={node.textColor}
+        fill={getNodeStatusTextColor(node, node.textColor)}
         fontFamily="Inter, system-ui, sans-serif"
         fontStyle="500"
         listening={false}
@@ -175,11 +179,43 @@ function MonitorShape({
         align="center"
         verticalAlign="middle"
         fontSize={node.fontSize ?? 14}
-        fill={node.textColor}
+        fill={getNodeStatusTextColor(node, node.textColor)}
         fontFamily="Inter, system-ui, sans-serif"
         fontStyle="500"
         listening={false}
       />
+
+      {/* Border hugging the value text, so the node reads like a special
+          monitor rather than a normal node. Sized to the text it displays. */}
+      {node.showMonitorTag !== false && (() => {
+        const fontSize = node.fontSize ?? 14;
+        const fontFamily = 'Inter, system-ui, sans-serif';
+        const padX = 10;
+        const padY = 4;
+        const measured = measureTextWidth(node.initialValue ?? '', fontSize, fontFamily, '500');
+        const bw = Math.min(node.width - 8, Math.max(40, measured + padX * 2));
+        const bh = Math.max(fontSize + padY * 2, 18);
+        const cyValue = valueY + valueH / 2;
+        const bx = (node.width - bw) / 2;
+        const by = cyValue - bh / 2;
+        const accent = getNodeStatusStroke(node, node.stroke || pageColors.purpleAccent);
+        return (
+          <Rect
+            x={bx}
+            y={by}
+            width={bw}
+            height={bh}
+            cornerRadius={Math.min(bh / 2, 6)}
+            stroke={accent}
+            strokeWidth={2.5}
+            fill={pageColors.transparent}
+            opacity={0.95}
+            listening={false}
+          />
+        );
+      })()}
+
+      <NodeStatusMark node={node} />
 
       {showPorts && ports.map((p, i) => {
         const isCenter = p.side === 'center';

@@ -1,12 +1,16 @@
 import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { Ellipse, Group, Layer, Line, Path, Rect, Stage, Text } from 'react-konva';
-import { pageColors, withAlpha } from '../../colorThemes';
+import { pageColors, withAlpha } from '../colorThemes';
 import { getNodeLabelFrame } from '../nodeLabelFrame';
 import { AnimationEngine } from '../animation/AnimationEngine';
 import { applyAnimState, computeLinkRenders } from '../animation/applyAnimState';
+import { computeManualTokenTimingByLinkId, getManualTokenBaseText, normalizeManualTokenTextKeyframes } from '../animation/manualTokenTiming';
 import { buildLinkRenderData } from '../links/linkGeometry';
-import { buildWebByLinkId, computeVariableWebs } from '../variables/flow';
+import { buildWebByLinkId } from '../variables/flow';
 import useStore from '../store/useStore';
+import { getNodeDisplayText, getNodeTextFontFamily } from '../text/equationText';
+import NodeStatusMark, { getNodeStatusDash, getNodeStatusStroke, getNodeStatusTextColor } from './canvas/NodeStatusMark';
+import LinkFailureMark from './canvas/LinkFailureMark';
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -40,8 +44,10 @@ function renderBodyShape(node, extraProps = {}) {
   const { width: w, height: h, shape, cornerRadius, fill, stroke, strokeWidth } = node;
   const props = {
     fill: fill ?? pageColors.blueNodeFill,
-    stroke: stroke ?? pageColors.blueNodeStroke,
+    stroke: getNodeStatusStroke(node, stroke ?? pageColors.blueNodeStroke),
     strokeWidth: strokeWidth ?? 2,
+    dash: getNodeStatusDash(node),
+    dashEnabled: !!node.offline,
     listening: false,
     ...extraProps,
   };
@@ -56,7 +62,7 @@ function renderBodyShape(node, extraProps = {}) {
   if (shape === 'circle') {
     return <Ellipse x={w / 2} y={h / 2} radiusX={w / 2} radiusY={h / 2} {...props} />;
   }
-  if (shape === 'pillar' || shape === 'cylinder') {
+  if (shape === 'pillar' || shape === 'cylinder' || shape === 'database') {
     const curve = Math.min(w, h) * 0.12;
     const pathData = [
       `M ${curve},0`,
@@ -79,7 +85,7 @@ function renderBodyShape(node, extraProps = {}) {
 // Thin top-edge highlight stripe — matches NodeShape/SubdiagramShape's renderNodeHighlight.
 function renderHighlight(node, extraProps = {}) {
   const { width: w, height: h, shape, cornerRadius } = node;
-  if (shape === 'diamond' || shape === 'hexagon' || shape === 'circle' || shape === 'pillar' || shape === 'cylinder' || shape === 'slanted') return null;
+  if (shape === 'diamond' || shape === 'hexagon' || shape === 'circle' || shape === 'pillar' || shape === 'cylinder' || shape === 'database' || shape === 'slanted') return null;
   const inset = shape === 'pill' ? h / 2 : (cornerRadius ?? 8);
   return (
     <Rect
@@ -216,29 +222,41 @@ function ReadonlyNodeShape({ node, allNodes }) {
         );
       })()}
 
+      {/* Failure tint overlay: above both base and transform bodies, below label */}
+      {!isText && renderBodyShape(node, {
+        id: `node-fail-tint-${node.id}`,
+        fill: pageColors.dangerSurfaceSoft,
+        stroke: pageColors.transparent,
+        strokeWidth: 0,
+        opacity: node.failing ? 1 : 0,
+        listening: false,
+      })}
+
       {/* Highlight stripe on the original body */}
       {!isText && renderHighlight(node, { id: `node-highlight-${node.id}` })}
 
       <Text
         id={`node-label-${node.id}`}
         baseText={node.label ?? ''}
+        equationMode={!!node.equationMode}
         x={labelFrame.x}
         y={labelFrame.y}
         width={labelFrame.width}
         height={labelFrame.height}
-        text={node.label ?? ''}
+        text={getNodeDisplayText(node)}
         align="center"
         verticalAlign="middle"
         fontSize={node.fontSize ?? 13}
-        fill={node.textColor ?? pageColors.white}
-        baseFill={node.textColor ?? pageColors.white}
-        fontFamily="Inter, system-ui, sans-serif"
-        fontStyle="500"
+        fill={getNodeStatusTextColor(node, node.textColor ?? pageColors.white)}
+        baseFill={getNodeStatusTextColor(node, node.textColor ?? pageColors.white)}
+        fontFamily={getNodeTextFontFamily(node)}
+        fontStyle={node.bold ? '700' : '500'}
         listening={false}
       />
 
       <Text
         id={`node-label-morph-${node.id}`}
+        equationMode={!!node.equationMode}
         x={labelFrame.x}
         y={labelFrame.y}
         width={labelFrame.width}
@@ -247,12 +265,15 @@ function ReadonlyNodeShape({ node, allNodes }) {
         align="center"
         verticalAlign="middle"
         fontSize={node.fontSize ?? 13}
-        fill={node.textColor ?? pageColors.white}
-        baseFill={node.textColor ?? pageColors.white}
-        fontFamily="Inter, system-ui, sans-serif"
+        fill={getNodeStatusTextColor(node, node.textColor ?? pageColors.white)}
+        baseFill={getNodeStatusTextColor(node, node.textColor ?? pageColors.white)}
+        fontFamily={getNodeTextFontFamily(node)}
+        fontStyle={node.bold ? '700' : '500'}
         opacity={0}
         listening={false}
       />
+
+      <NodeStatusMark node={node} />
 
       {isSubdiagram && !isText && (node.showSubBadge ?? true) && (
         <>
@@ -306,17 +327,42 @@ function ReadonlyLinkShape({ link, fromNode, toNode, allNodes, allLinks }) {
 
   // Simulation options (readonly overlay)
   const simulateOptions = useStore(state => state.simulateOptions);
-  const tokenR = Math.max(2, Math.min(24, simulateOptions?.tokenSize ?? 7));
-  const tokenFill = simulateOptions?.tokenFill ?? '#ffffff';
+  const tokenR = Math.max(2, Math.min(24,
+    link.manualTokenEnabled && Number.isFinite(link.manualTokenSize)
+      ? link.manualTokenSize
+      : (simulateOptions?.tokenSize ?? 7)
+  ));
+  const tokenFill = link.manualTokenEnabled && link.manualTokenColor
+    ? link.manualTokenColor
+    : (simulateOptions?.tokenFill ?? '#ffffff');
   const tokenStroke = simulateOptions?.tokenStroke ?? pageColors.blueLink;
   const baseTokenText = simulateOptions?.tokenText ?? '';
   const varTextOverride = (fromNode?.tokenText ?? '').trim();
   const sourceVar = (fromNode?.variableLabel ?? '').trim();
-  const eff = (link.messageLabel && link.messageLabel.trim()) ? link.messageLabel : (varTextOverride || sourceVar || baseTokenText);
-  const effectiveTokenText = eff.slice(0, 6);
-  const tokenTextColor = simulateOptions?.tokenTextColor ?? tokenStroke;
-  const tokenTextSize = Math.max(8, Math.min(24, simulateOptions?.tokenTextSize ?? 10));
+  const inheritedText = varTextOverride || sourceVar || baseTokenText;
+  const eff = link.manualTokenEnabled
+    ? getManualTokenBaseText(link, inheritedText)
+    : ((link.messageLabel && link.messageLabel.trim()) ? link.messageLabel : inheritedText);
+  const messageOverlapsToken = !link.manualTokenEnabled || link.manualTokenMessageOverlap !== false;
+  const manualTextKeyframes = normalizeManualTokenTextKeyframes(link.manualTokenTextKeyframes);
+  const longestTokenText = [eff, ...manualTextKeyframes.map(keyframe => keyframe.text)]
+    .reduce((longest, text) => text.length > longest.length ? text : longest, '');
+  const effectiveTokenText = eff.slice(0, messageOverlapsToken ? 6 : 24);
+  const longestVisibleTokenText = longestTokenText.slice(0, messageOverlapsToken ? 6 : 24);
+  const tokenTextColor = link.manualTokenEnabled && link.manualTokenTextColor
+    ? link.manualTokenTextColor
+    : (simulateOptions?.tokenTextColor ?? tokenStroke);
+  const tokenTextSize = Math.max(8, Math.min(24,
+    link.manualTokenEnabled && Number.isFinite(link.manualTokenTextSize)
+      ? link.manualTokenTextSize
+      : (simulateOptions?.tokenTextSize ?? 10)
+  ));
   const tokenShape = simulateOptions?.tokenShape ?? 'circle';
+  const tokenLabelWidth = messageOverlapsToken
+    ? tokenR * 2
+    : Math.max(tokenR * 2, Math.min(160, longestVisibleTokenText.length * tokenTextSize * 0.65 + 8));
+  const tokenLabelHeight = messageOverlapsToken ? tokenR * 2 : tokenTextSize * 1.4;
+  const tokenLabelY = messageOverlapsToken ? 0 : -(tokenR + tokenLabelHeight + 4);
 
   return (
     <Group listening={false}>
@@ -327,6 +373,18 @@ function ReadonlyLinkShape({ link, fromNode, toNode, allNodes, allLinks }) {
         strokeWidth={sw}
         lineCap="round"
         lineJoin="round"
+        listening={false}
+      />
+      <LinkFailureMark link={link} render={render} />
+      {/* Fail tint overlay */}
+      <Path
+        id={`link-shaft-fail-overlay-${link.id}`}
+        data={render.pathData}
+        stroke={pageColors.dangerBright}
+        strokeWidth={sw}
+        lineCap="round"
+        lineJoin="round"
+        opacity={0}
         listening={false}
       />
       <Line
@@ -350,22 +408,40 @@ function ReadonlyLinkShape({ link, fromNode, toNode, allNodes, allLinks }) {
         ) : (
           <Ellipse radiusX={tokenR} radiusY={tokenR} fill={tokenFill} stroke={tokenStroke} strokeWidth={2} />
         )}
-        {!!effectiveTokenText && (
+        {(!!effectiveTokenText || manualTextKeyframes.length > 0) && (
           <Text
             id={`link-token-label-${link.id}`}
             text={effectiveTokenText}
             align="center"
             verticalAlign="middle"
-            offsetX={tokenR}
-            offsetY={tokenR}
-            width={tokenR * 2}
-            height={tokenR * 2}
+            x={0}
+            y={tokenLabelY}
+            offsetX={tokenLabelWidth / 2}
+            offsetY={messageOverlapsToken ? tokenR : 0}
+            width={tokenLabelWidth}
+            height={tokenLabelHeight}
             fill={tokenTextColor}
             fontSize={tokenTextSize}
             fontFamily="Inter, system-ui, sans-serif"
             listening={false}
           />
         )}
+      </Group>
+
+      {/* Screen-centered fail X (overlay) */}
+      <Group id={`link-fail-screen-x-${link.id}`} opacity={0} listening={false}>
+        <Line
+          points={[-28, -28, 28, 28]}
+          stroke={pageColors.dangerBright}
+          strokeWidth={4}
+          lineCap="round"
+        />
+        <Line
+          points={[-28, 28, 28, -28]}
+          stroke={pageColors.dangerBright}
+          strokeWidth={4}
+          lineCap="round"
+        />
       </Group>
     </Group>
   );
@@ -475,14 +551,21 @@ const SubdiagramOverlay = forwardRef(function SubdiagramOverlayInner({
     [cleanedSnapshotNodes, snapshotLinks]
   );
   const overlayWebs = useMemo(
-    () => computeVariableWebs(cleanedSnapshotNodes, snapshotLinks, { timeline: engine.getTimeline() }),
-    [cleanedSnapshotNodes, snapshotLinks, engine]
+    () => engine.getVariableWebs(),
+    [engine]
   );
   const overlayWebByLinkId = useMemo(() => buildWebByLinkId(overlayWebs), [overlayWebs]);
   const bindToTokenHopById = useMemo(() => Object.fromEntries((snapshotLinks ?? []).map(l => [l.id, !!l.bindToTokenHop])), [snapshotLinks]);
   const bindMetaById = useMemo(() => Object.fromEntries((snapshotLinks ?? []).map(l => [l.id, { offset: Number.isFinite(l.bindHopOffset) ? l.bindHopOffset : 0, scale: Number.isFinite(l.bindHopScale) && l.bindHopScale > 0 ? l.bindHopScale : 1 }])), [snapshotLinks]);
   const linkStartOverrideById = useMemo(() => Object.fromEntries((snapshotLinks ?? []).map(l => [l.id, (l.bindToTokenHop && Number.isFinite(l.animStartTime)) ? l.animStartTime : null])), [snapshotLinks]);
   const linkDurationOverrideById = useMemo(() => Object.fromEntries((snapshotLinks ?? []).map(l => [l.id, (l.bindToTokenHop && Number.isFinite(l.animDuration)) ? l.animDuration : null])), [snapshotLinks]);
+  const manualTokenTimingById = useMemo(
+    () => computeManualTokenTimingByLinkId(snapshotLinks, engine.getTimeline()),
+    [engine, snapshotLinks]
+  );
+  const failAtEndsById = useMemo(() => Object.fromEntries((snapshotLinks ?? []).map(l => [l.id, !!l.failAtEnds])), [snapshotLinks]);
+  const failOnTokenEndById = useMemo(() => Object.fromEntries((snapshotLinks ?? []).map(l => [l.id, !!l.failOnTokenEnd])), [snapshotLinks]);
+  const failingById = useMemo(() => Object.fromEntries((snapshotLinks ?? []).map(l => [l.id, !!l.failing])), [snapshotLinks]);
   const overlayMonitors = useMemo(
     () => cleanedSnapshotNodes.filter(n => n.type === 'monitor'),
     [cleanedSnapshotNodes]
@@ -565,12 +648,26 @@ const SubdiagramOverlay = forwardRef(function SubdiagramOverlayInner({
       const ct = Math.max(0, Math.min(engineRef.current.getContentDuration(), t));
       const state = engineRef.current.getStateAtTime(ct);
       applyAnimState(layerRef.current, state, linkRendersRef.current, null, {
-        webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: ct, timelineStart: earliestStart, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById,
+        webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: ct, timelineStart: earliestStart, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById, manualTokenTimingById, failAtEndsById, failOnTokenEndById, failingById, isPlaying: true,
       });
       layerRef.current.draw();
       updateNestedPopupImperatively(ct);
     },
-  }), [earliestStart, updateNestedPopupImperatively]);
+  }), [
+    bindMetaById,
+    bindToTokenHopById,
+    earliestStart,
+    linkDurationOverrideById,
+    linkStartOverrideById,
+    manualTokenTimingById,
+    failAtEndsById,
+    failOnTokenEndById,
+    failingById,
+    overlayMonitors,
+    overlayWebByLinkId,
+    overlayWebs,
+    updateNestedPopupImperatively,
+  ]);
 
   // Show end state on first render (after shapes are mounted)
   const showEndState = useCallback(() => {
@@ -578,11 +675,26 @@ const SubdiagramOverlay = forwardRef(function SubdiagramOverlayInner({
     const ct = engine.getContentDuration();
     const state = engine.getStateAtTime(ct);
     applyAnimState(layerRef.current, state, linkRenders, null, {
-      webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: ct, timelineStart: earliestStart,
+      webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: ct, timelineStart: earliestStart, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById, manualTokenTimingById, failAtEndsById, failOnTokenEndById, failingById, isPlaying: false,
     });
     layerRef.current.draw();
     setDisplayTime(ct);
-  }, [earliestStart, engine, linkRenders, overlayMonitors, overlayWebByLinkId, overlayWebs]);
+  }, [
+    bindMetaById,
+    bindToTokenHopById,
+    earliestStart,
+    engine,
+    linkDurationOverrideById,
+    linkRenders,
+    linkStartOverrideById,
+    manualTokenTimingById,
+    failAtEndsById,
+    failOnTokenEndById,
+    failingById,
+    overlayMonitors,
+    overlayWebByLinkId,
+    overlayWebs,
+  ]);
 
   useEffect(() => {
     if (isControlled) return undefined;
@@ -597,10 +709,27 @@ const SubdiagramOverlay = forwardRef(function SubdiagramOverlayInner({
     // Subsequent per-frame updates are driven imperatively via setTime() — no React re-renders.
     const state = engine.getStateAtTime(controlledDisplayTime);
     applyAnimState(layerRef.current, state, linkRenders, null, {
-      webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: controlledDisplayTime, timelineStart: earliestStart, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById,
+      webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: controlledDisplayTime, timelineStart: earliestStart, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById, manualTokenTimingById, failAtEndsById, failOnTokenEndById, failingById, isPlaying: false,
     });
     layerRef.current.draw();
-  }, [controlledDisplayTime, engine, isControlled, linkRenders, overlayMonitors, overlayWebByLinkId, overlayWebs]);
+  }, [
+    bindMetaById,
+    bindToTokenHopById,
+    controlledDisplayTime,
+    earliestStart,
+    engine,
+    isControlled,
+    linkDurationOverrideById,
+    linkRenders,
+    linkStartOverrideById,
+    manualTokenTimingById,
+    failAtEndsById,
+    failOnTokenEndById,
+    failingById,
+    overlayMonitors,
+    overlayWebByLinkId,
+    overlayWebs,
+  ]);
 
   // Cleanup RAF on unmount
   useEffect(() => () => {
@@ -628,7 +757,7 @@ const SubdiagramOverlay = forwardRef(function SubdiagramOverlayInner({
     if (layerRef.current) {
       const state = engine.getStateAtTime(0);
       applyAnimState(layerRef.current, state, linkRenders, null, {
-        webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: 0, timelineStart: earliestStart,
+        webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: 0, timelineStart: earliestStart, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById, manualTokenTimingById, failAtEndsById, failOnTokenEndById, failingById, isPlaying: true,
       });
       layerRef.current.draw();
     }
@@ -649,7 +778,7 @@ const SubdiagramOverlay = forwardRef(function SubdiagramOverlayInner({
         setDisplayTime(contentDuration);
         if (layerRef.current) {
           applyAnimState(layerRef.current, state, linkRenders, null, {
-            webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: contentDuration, timelineStart: earliestStart, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById,
+            webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: contentDuration, timelineStart: earliestStart, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById, manualTokenTimingById, failAtEndsById, failOnTokenEndById, failingById, isPlaying: false,
           });
           layerRef.current.draw();
         }
@@ -659,7 +788,7 @@ const SubdiagramOverlay = forwardRef(function SubdiagramOverlayInner({
       const state = engine.getStateAtTime(elapsed);
       if (layerRef.current) {
         applyAnimState(layerRef.current, state, linkRenders, null, {
-          webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: elapsed, timelineStart: earliestStart, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById,
+          webs: overlayWebs, webByLinkId: overlayWebByLinkId, monitors: overlayMonitors, currentTime: elapsed, timelineStart: earliestStart, bindToTokenHopById, bindMetaById, linkStartOverrideById, linkDurationOverrideById, manualTokenTimingById, failAtEndsById, failOnTokenEndById, failingById, isPlaying: true,
         });
         layerRef.current.draw();
       }
@@ -673,7 +802,23 @@ const SubdiagramOverlay = forwardRef(function SubdiagramOverlayInner({
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
-  }, [engine, linkRenders, updateNestedPopupImperatively]);
+  }, [
+    bindMetaById,
+    bindToTokenHopById,
+    earliestStart,
+    engine,
+    linkDurationOverrideById,
+    linkRenders,
+    linkStartOverrideById,
+    manualTokenTimingById,
+    failAtEndsById,
+    failOnTokenEndById,
+    failingById,
+    overlayMonitors,
+    overlayWebByLinkId,
+    overlayWebs,
+    updateNestedPopupImperatively,
+  ]);
 
   const stopAnimation = useCallback(() => {
     playingRef.current = false;

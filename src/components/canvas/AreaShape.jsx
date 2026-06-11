@@ -1,13 +1,13 @@
 import React, { useRef, useState } from 'react';
 import { Circle, Group, Rect, Text } from 'react-konva';
-import { pageColors } from '../../../colorThemes';
+import { pageColors } from '../../colorThemes';
 import useStore from '../../store/useStore';
 
 const MIN_W = 120;
 const MIN_H = 80;
 const HANDLE_R = 5;
 
-function AreaShape({ area, isSelected, isInSelection, onSelect, onContextMenu, onGroupDragStart, onGroupDragMove }) {
+function AreaShape({ area, isSelected, isInSelection, onSelect, onContextMenu, onGroupDragStart, onGroupDragMove, renderEditorChrome = true }) {
   const { updateNode } = useStore();
   const [hovered, setHovered] = useState(false);
   const resizeRef = useRef(null);
@@ -114,11 +114,13 @@ function AreaShape({ area, isSelected, isInSelection, onSelect, onContextMenu, o
       onMouseLeave={() => setHovered(false)}
     >
       {/* Transparent hit-zone so clicking inside selects the area */}
-      <Rect
-        width={area.width}
-        height={area.height}
-        fill={pageColors.blackHitArea}
-      />
+      {renderEditorChrome && (
+        <Rect
+          width={area.width}
+          height={area.height}
+          fill={pageColors.blackHitArea}
+        />
+      )}
 
       {/* Main area fill + dashed border — ID'd so applyAnimState can animate it */}
       <Rect
@@ -134,7 +136,9 @@ function AreaShape({ area, isSelected, isInSelection, onSelect, onContextMenu, o
         cornerRadius={area.cornerRadius ?? 12}
         dash={[10, 6]}
         dashEnabled
-        opacity={area.areaOpacity ?? 1}
+        opacity={area.areaInvisible ? 0 : (area.areaOpacity ?? 1)}
+        visible={!area.areaInvisible}
+        perfectDrawEnabled={false}
         listening={false}
       />
 
@@ -147,9 +151,10 @@ function AreaShape({ area, isSelected, isInSelection, onSelect, onContextMenu, o
         fontSize={area.fontSize ?? 12}
         fill={isSelected ? pageColors.blueSelection : area.textColor ?? area.stroke}
         fontFamily="Inter, system-ui, sans-serif"
-        fontStyle="600"
+        fontStyle={area.bold ? '700' : '600'}
         letterSpacing={0.5}
         listening={false}
+        visible={!area.areaInvisible}
       />
 
       {/* Corner resize handles — only when selected */}

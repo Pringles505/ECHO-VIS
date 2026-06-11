@@ -1,9 +1,10 @@
 import React, { useRef, useState } from 'react';
 import { Circle, Ellipse, Group, Line, Path, Rect, Text } from 'react-konva';
-import { pageColors } from '../../../colorThemes';
+import { pageColors } from '../../colorThemes';
 import { getNodeLabelFrame } from '../../nodeLabelFrame';
 import useStore from '../../store/useStore';
 import { collectGuideMatches, collectVisibleGuides, isSameGuideMatch, SNAP_DISTANCE, UNSNAP_DISTANCE } from './symmetryGuides';
+import NodeStatusMark, { getNodeStatusDash, getNodeStatusStroke, getNodeStatusTextColor } from './NodeStatusMark';
 
 const PORT_R = 7;
 
@@ -43,7 +44,7 @@ function getSubdiagramTransformStyle(node, resolvedTargetNode) {
 }
 
 function renderSubdiagramHighlight(node, extraProps = {}) {
-  if (node.shape === 'diamond' || node.shape === 'hexagon' || node.shape === 'circle' || node.shape === 'pillar' || node.shape === 'cylinder' || node.shape === 'slanted') return null;
+  if (node.shape === 'diamond' || node.shape === 'hexagon' || node.shape === 'circle' || node.shape === 'pillar' || node.shape === 'cylinder' || node.shape === 'database' || node.shape === 'slanted') return null;
   return (
     <Rect
       x={node.shape === 'pill' ? node.height / 2 : (node.cornerRadius ?? 10)}
@@ -111,7 +112,7 @@ function renderSubdiagramBody(node, stroke, strokeWidth, fill, shadow = false, e
     );
   }
 
-  if (node.shape === 'pillar' || node.shape === 'cylinder') {
+  if (node.shape === 'pillar' || node.shape === 'cylinder' || node.shape === 'database') {
     const w = node.width;
     const h = node.height;
     const curve = Math.min(w, h) * 0.12;
@@ -180,6 +181,7 @@ function SubdiagramShape({
   onGroupDragStart,
   onGroupDragMove,
   onExpand,
+  renderEditorChrome = true,
 }) {
   const {
     updateNode,
@@ -205,7 +207,8 @@ function SubdiagramShape({
   const h = node.height ?? 72;
   const cx = node.x + w / 2;
   const cy = node.y + h / 2;
-  const showPorts = isSelected || hovered || isLinking;
+  const editorHovered = renderEditorChrome && hovered;
+  const showPorts = renderEditorChrome && (isSelected || hovered || isLinking);
   const ports = PORT_POSITIONS(w, h);
   const labelFrame = getNodeLabelFrame(node, { reserveBottomRightBadge: node.showSubBadge ?? true });
   const transformStyle = node.transformMode && node.transformMode !== 'none'
@@ -216,7 +219,9 @@ function SubdiagramShape({
     ? pageColors.blueSelection
     : isInSelection
       ? pageColors.purpleAccent
-      : hovered
+        : (node.failing || node.offline)
+          ? getNodeStatusStroke(node, node.stroke ?? pageColors.blueNodeStroke)
+          : editorHovered
         ? pageColors.blueLink
         : (node.stroke ?? pageColors.blueNodeStroke);
 
@@ -314,9 +319,9 @@ function SubdiagramShape({
       onMouseLeave={() => setHovered(false)}
       onMouseUp={(e) => { if (isLinking) { e.cancelBubble = true; onEndLink?.(node.id, null); } }}
     >
-      <Rect width={w} height={h} fill={pageColors.blackHitArea} />
-
-      {renderSubdiagramBody(node, pageColors.transparent, 0, pageColors.blackShadowNode, true)}
+      {renderEditorChrome && (
+        <Rect width={w} height={h} fill={pageColors.blackHitArea} />
+      )}
       {renderSubdiagramBody(
         node,
         borderColor,
@@ -326,8 +331,9 @@ function SubdiagramShape({
         {
           id: `node-body-${node.id}`,
           baseFill: node.fill ?? pageColors.uiRaised,
-          baseStroke: borderColor,
+          baseStroke: getNodeStatusStroke(node, node.stroke ?? pageColors.blueNodeStroke),
           baseStrokeWidth: isSelected ? 3 : 2,
+          ...(node.offline ? { dash: getNodeStatusDash(node), dashEnabled: true } : {}),
         }
       )}
 
@@ -404,10 +410,10 @@ function SubdiagramShape({
         align="center"
         verticalAlign="middle"
         fontSize={node.fontSize ?? 13}
-        fill={node.textColor ?? pageColors.textMain}
-        baseFill={node.textColor ?? pageColors.textMain}
+        fill={getNodeStatusTextColor(node, node.textColor ?? pageColors.textMain)}
+        baseFill={getNodeStatusTextColor(node, node.textColor ?? pageColors.textMain)}
         fontFamily="Inter, system-ui, sans-serif"
-        fontStyle="500"
+        fontStyle={node.bold ? '700' : '500'}
         listening={false}
       />
 
@@ -421,12 +427,14 @@ function SubdiagramShape({
         align="center"
         verticalAlign="middle"
         fontSize={node.fontSize ?? 13}
-        fill={node.textColor ?? pageColors.textMain}
-        baseFill={node.textColor ?? pageColors.textMain}
+        fill={getNodeStatusTextColor(node, node.textColor ?? pageColors.textMain)}
+        baseFill={getNodeStatusTextColor(node, node.textColor ?? pageColors.textMain)}
         fontFamily="Inter, system-ui, sans-serif"
         opacity={0}
         listening={false}
       />
+
+      <NodeStatusMark node={node} />
 
       {showPorts && ports.map((port, index) => {
         const isCenter = port.side === 'center';

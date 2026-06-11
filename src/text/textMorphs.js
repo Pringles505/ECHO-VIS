@@ -20,6 +20,9 @@ export function normalizeTextMorphList(morphs = []) {
       strokeWidth: Number.isFinite(morph?.strokeWidth) ? morph.strokeWidth : null,
       // Corner radius allows smooth rounded→pill transitions on rectangular shapes
       cornerRadius: Number.isFinite(morph?.cornerRadius) ? morph.cornerRadius : null,
+      // Alpha (node opacity) lets a morph fade the node in/out — e.g. make it disappear.
+      // null = leave opacity untouched (falls back to the node's default of fully visible).
+      alpha: Number.isFinite(morph?.alpha) ? clamp(morph.alpha, 0, 1) : null,
     }))
     .sort((a, b) => a.startTime - b.startTime);
 }
@@ -107,40 +110,59 @@ export function getTextMorphRenderState(node, timing, time) {
 }
 
 // Compute appearance morphs (fill/stroke/textColor/strokeWidth/cornerRadius) over time.
-// Similar to text morphs: properties commit once a morph completes; during an active
-// morph we blend from committed base to this morph's target values.
+//
+// Each morph keyframe defines a *complete form*: the latest morph wins, and any
+// property the morph leaves unset falls back to the node's own default — never to
+// an earlier morph's value. While a morph is active we blend from the previously
+// committed form to this morph's form, so chained morphs transition smoothly (e.g.
+// red → blue, or red → back-to-default) without flashing through the base color.
+// This mirrors resolveMonitorTextColor used for the monitor value text.
 export function getStyleMorphRenderState(node, timing, time) {
   const morphs = getNodeTextMorphs(node, timing);
-  const committed = { fill: null, stroke: null, textColor: null, strokeWidth: null, cornerRadius: null };
+  const emptyStyle = { fill: null, stroke: null, textColor: null, strokeWidth: null, cornerRadius: null, alpha: null };
+  if (!morphs.length) {
+    return { baseStyle: { ...emptyStyle }, targetStyle: null, progress: 0, hasActive: false, activeMorphId: null };
+  }
+
+  // Node defaults — the value an unset morph property resolves to.
+  const def = {
+    fill: node?.fill ?? null,
+    stroke: node?.stroke ?? null,
+    textColor: node?.textColor ?? null,
+    strokeWidth: Number.isFinite(node?.strokeWidth) ? node.strokeWidth : null,
+    cornerRadius: Number.isFinite(node?.cornerRadius) ? node.cornerRadius : null,
+    // A node's default opacity is fully visible; a morph that leaves alpha unset
+    // resolves back to this, so an explicit "disappear" can later be undone.
+    alpha: Number.isFinite(node?.alpha) ? node.alpha : 1,
+  };
+  // A morph's resolved form: its explicit values, with unset properties = node default.
+  const formOf = (morph) => ({
+    fill: morph.fill ?? def.fill,
+    stroke: morph.stroke ?? def.stroke,
+    textColor: morph.textColor ?? def.textColor,
+    strokeWidth: morph.strokeWidth ?? def.strokeWidth,
+    cornerRadius: morph.cornerRadius ?? def.cornerRadius,
+    alpha: morph.alpha ?? def.alpha,
+  });
+
+  let committed = { ...def };   // form before the first morph = the node's default form
 
   for (const morph of morphs) {
+    if (time < morph.startTime) break;     // future morph: list is sorted, stop here
+    const form = formOf(morph);
     const end = morph.startTime + morph.duration;
     if (time >= end) {
-      if (morph.fill != null) committed.fill = morph.fill;
-      if (morph.stroke != null) committed.stroke = morph.stroke;
-      if (morph.textColor != null) committed.textColor = morph.textColor;
-      if (morph.strokeWidth != null) committed.strokeWidth = morph.strokeWidth;
-      if (morph.cornerRadius != null) committed.cornerRadius = morph.cornerRadius;
+      committed = form;                    // morph finished: its form is now in effect
       continue;
     }
-    if (time >= morph.startTime) {
-      const progress = clamp((time - morph.startTime) / morph.duration, 0, 1);
-      return {
-        baseStyle: { ...committed },
-        targetStyle: {
-          fill: morph.fill,
-          stroke: morph.stroke,
-          textColor: morph.textColor,
-          strokeWidth: morph.strokeWidth,
-          cornerRadius: morph.cornerRadius,
-        },
-        progress,
-        hasActive: true,
-        activeMorphId: morph.id,
-      };
-    }
-    // time < morph.startTime → break because list sorted by startTime
-    break;
+    const progress = clamp((time - morph.startTime) / morph.duration, 0, 1);
+    return {
+      baseStyle: { ...committed },
+      targetStyle: form,
+      progress,
+      hasActive: true,
+      activeMorphId: morph.id,
+    };
   }
 
   return {

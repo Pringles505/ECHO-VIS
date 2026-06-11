@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Layer, Line, Rect, Stage } from 'react-konva';
 import { v4 as uuid } from 'uuid';
-import { pageColors } from '../../../colorThemes';
+import { pageColors } from '../../colorThemes';
 import { AnimationEngine } from '../../animation/AnimationEngine';
 import { buildLinkRenderData, getLinkParallelOffset, getNodeAnchorPoint, resolveLinkJunctionPoint } from '../../links/linkGeometry';
 import { buildMirrorBindings, isMirrorNode, MIRROR_PADDING } from '../../mirror/mirrorData';
@@ -9,6 +9,7 @@ import { isAreaNode, isSubdiagramNode } from '../../store/useStore';
 import { normalizeTextMorphList } from '../../text/textMorphs';
 import useStore from '../../store/useStore';
 import AreaShape from './AreaShape';
+import GhostOverlay from './GhostOverlay';
 import LinkShape from './LinkShape';
 import MirrorShape from './MirrorShape';
 import NodeShape from './NodeShape';
@@ -57,6 +58,69 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+// Floating draw.io-style alignment toolbar shown when 2+ nodes are selected.
+function AlignmentToolbar({ count, onAlign, onDistribute }) {
+  const Btn = ({ title, label, onClick, disabled }) => (
+    <button
+      title={title}
+      disabled={disabled}
+      onClick={onClick}
+      style={{
+        width: 28,
+        height: 28,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: pageColors.transparent,
+        border: '1px solid transparent',
+        borderRadius: 6,
+        color: disabled ? pageColors.whiteHintSoft : pageColors.white,
+        fontSize: 15,
+        lineHeight: 1,
+        cursor: disabled ? 'default' : 'pointer',
+        opacity: disabled ? 0.35 : 0.9,
+      }}
+      onMouseEnter={(e) => { if (!disabled) e.currentTarget.style.background = pageColors.purpleHover ?? 'rgba(255,255,255,0.08)'; }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = pageColors.transparent; }}
+    >
+      {label}
+    </button>
+  );
+  const Sep = () => <div style={{ width: 1, height: 18, background: 'var(--border-strong)', margin: '0 2px' }} />;
+
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        top: 12,
+        left: '50%',
+        transform: 'translateX(-50%)',
+        display: 'flex',
+        alignItems: 'center',
+        gap: 1,
+        padding: '4px 6px',
+        background: 'linear-gradient(180deg, var(--panel-bg-2), var(--panel-bg))',
+        border: '1px solid var(--border-strong)',
+        borderRadius: 10,
+        boxShadow: '0 10px 30px var(--menu-shadow)',
+        zIndex: 6,
+        userSelect: 'none',
+      }}
+    >
+      <Btn title="Align left edges" label="⊢" onClick={() => onAlign('left')} />
+      <Btn title="Align horizontal centers" label="↔" onClick={() => onAlign('hcenter')} />
+      <Btn title="Align right edges" label="⊣" onClick={() => onAlign('right')} />
+      <Sep />
+      <Btn title="Align top edges" label="⊤" onClick={() => onAlign('top')} />
+      <Btn title="Align vertical centers" label="↕" onClick={() => onAlign('vcenter')} />
+      <Btn title="Align bottom edges" label="⊥" onClick={() => onAlign('bottom')} />
+      <Sep />
+      <Btn title="Distribute horizontally" label="☰" disabled={count < 3} onClick={() => onDistribute('horizontal')} />
+      <Btn title="Distribute vertically" label="‖" disabled={count < 3} onClick={() => onDistribute('vertical')} />
+    </div>
+  );
+}
+
 function DiagramCanvas({ stageRef, layerRef, playback }) {
   const {
     nodes,
@@ -64,6 +128,7 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
     selectedId,
     selectedJointId,
     selectedIds,
+    isExporting,
     setSelected,
     setSelectedJoint,
     addToSelection,
@@ -84,12 +149,16 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
     updateMirrorNodeOverride,
     setContextMenu,
     deleteSelected,
+    alignNodes,
+    distributeNodes,
     showGridLines,
     symmetryGuides,
     pendingMorphEdit,
     setPendingMorphEdit,
     expandedSubdiagramId,
     setExpandedSubdiagramId,
+    captureFrame,
+    setCaptureFrame,
   } = useStore();
   const playbackTime = playback?.currentTime ?? 0;
   const playbackTimeline = playback?.timeline ?? [];
@@ -505,6 +574,30 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
     });
   }, [stageRef]);
 
+  // Enable zooming even when the overlay is on top by handling DOM wheel events
+  // and applying the same zoom math used for Konva's onWheel.
+  const handleDomWheel = useCallback((ev) => {
+    ev.preventDefault();
+    const stage = stageRef.current;
+    if (!stage) return;
+    const oldScale = stage.scaleX();
+    const rect = containerRef.current.getBoundingClientRect();
+    const ptr = { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
+    const origin = { x: (ptr.x - stagePos.x) / oldScale, y: (ptr.y - stagePos.y) / oldScale };
+    const delta = ev.deltaY < 0 ? 1 : -1;
+    const newScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, oldScale + delta * oldScale * 0.1));
+    setScale(newScale);
+    setStagePos({ x: ptr.x - origin.x * newScale, y: ptr.y - origin.y * newScale });
+  }, [stageRef, containerRef, stagePos]);
+
+  // Container-level wheel handler so zoom works even when overlay is on top.
+  const handleContainerWheel = useCallback((ev) => {
+    // If the wheel originated on the canvas, let Konva's onWheel handle it
+    const t = ev.target;
+    if (t && t.tagName && String(t.tagName).toLowerCase() === 'canvas') return;
+    handleDomWheel(ev);
+  }, [handleDomWheel]);
+
   const clearSelection = useCallback(() => {
     setSelected(null);
     setSelectedJoint(null);
@@ -822,7 +915,11 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
     const pointer = stage.getPointerPosition();
     if (!pointer) return;
     const canvas = toCanvas(pointer);
-    setSelected(nodeId);
+    // Preserve an existing multi-selection if the right-clicked node is part of
+    // it, so actions like "Strip Animation" can operate on the whole group.
+    if (!(selectedIdsRef.current ?? []).includes(nodeId)) {
+      setSelected(nodeId);
+    }
     setContextMenu({
       type: 'node',
       nodeId,
@@ -875,6 +972,11 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
     });
   }, [setContextMenu, setSelected, setSelectedJoint, stageRef, toCanvas]);
 
+  // Combined node selection (marquee fills selectedIds; single click fills
+  // selectedId) — used to show the alignment toolbar.
+  const selectedNodeIds = [...new Set([...(selectedIds ?? []), selectedId].filter(Boolean))]
+    .filter(id => nodes.some(node => node.id === id));
+
   const linkingNode = linkingFrom?.type === 'node'
     ? allNodes.find(node => node.id === linkingFrom.nodeId)
     : null;
@@ -892,9 +994,17 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
       : null;
 
   return (
-    <div ref={containerRef} style={{ flex: 1, position: 'relative', overflow: 'hidden', background: CANVAS_BASE, cursor: linkingFrom ? 'crosshair' : 'default' }}>
+    <div ref={containerRef} onWheel={handleContainerWheel} style={{ flex: 1, position: 'relative', overflow: 'hidden', background: CANVAS_BASE, cursor: linkingFrom ? 'crosshair' : 'default' }}>
       <div style={CANVAS_TEXTURE_STYLE} />
       {showGridLines && <div style={gridStyle} />}
+
+      {!isExporting && selectedNodeIds.length >= 2 && (
+        <AlignmentToolbar
+          count={selectedNodeIds.length}
+          onAlign={(mode) => alignNodes(selectedNodeIds, mode)}
+          onDistribute={(axis) => distributeNodes(selectedNodeIds, axis)}
+        />
+      )}
 
       <Stage
         ref={stageRef}
@@ -926,200 +1036,107 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
             <AreaShape
               key={area.id}
               area={area}
-              isSelected={selectedId === area.id}
-              isInSelection={selectedIds.includes(area.id)}
+              isSelected={!isExporting && selectedId === area.id}
+              isInSelection={!isExporting && selectedIds.includes(area.id)}
               onSelect={(shiftHeld) => handleNodeSelect(area.id, shiftHeld)}
               onContextMenu={handleNodeContextMenu}
               onGroupDragStart={handleGroupDragStart}
               onGroupDragMove={handleGroupDragMove}
+              renderEditorChrome={!isExporting}
             />
           ))}
 
           {links.map((link) => {
-            const fromNode = allNodes.find(node => node.id === link.fromId);
-            const toNode = allNodes.find(node => node.id === link.toId);
-            if (!fromNode || !toNode) return null;
+              const fromNode = allNodes.find(node => node.id === link.fromId);
+              const toNode = allNodes.find(node => node.id === link.toId);
+              if (!fromNode || !toNode) return null;
 
-            return (
-              <LinkShape
-                key={link.id}
-                link={link}
-                allLinks={links}
-                fromNode={fromNode}
-                toNode={toNode}
-                isSelected={selectedId === link.id}
-                selectedJointId={selectedId === link.id ? selectedJointId : null}
-                isInSelection={selectedIds.includes(link.id)}
-                onSelect={(shiftHeld) => handleLinkSelectWithShift(link.id, shiftHeld)}
-                onContextMenu={(e) => handleLinkContextMenu(e, link.id)}
-                onJointSelect={(jointId) => {
-                  setSelected(link.id);
-                  setSelectedJoint(jointId);
-                }}
-                onJointContextMenu={(e, jointId) => handleJointContextMenu(e, link.id, jointId)}
-                onStartBranchFromJoint={(jointId) => handleStartJunctionLink(link.id, jointId)}
-                onEndLinkAtJunction={handleEndLinkAtJunction}
-                isLinking={!!linkingFrom}
-                onJointDragStart={(jointId) => {
-                  setSelected(link.id);
-                  setSelectedJoint(jointId);
-                }}
-                onJointDragMove={(jointId, point) => updateLinkJoint(link.id, jointId, point)}
-                onJointDragEnd={(jointId, point) => updateLinkJoint(link.id, jointId, point)}
-                onStartAnchorChange={({ side, along, centered }) => updateLink(link.id, {
-                  fromAnchorSide: side,
-                  fromAnchorLockedCenter: !!centered,
-                  fromAlongPos: along,
-                  fromAnchorId: null,
-                  fromJunctionLinkId: null,
-                  fromJunctionJointId: null,
-                })}
-                onEndAnchorChange={({ side, along, centered }) => updateLink(link.id, {
-                  toAnchorSide: side,
-                  toAnchorLockedCenter: !!centered,
-                  toAlongPos: along,
-                  toAnchorId: null,
-                })}
-                renderControls={false}
-              />
-            );
-          })}
+              return (
+                <LinkShape
+                  key={link.id}
+                  link={link}
+                  allLinks={links}
+                  fromNode={fromNode}
+                  toNode={toNode}
+                  isSelected={!isExporting && selectedId === link.id}
+                  selectedJointId={selectedId === link.id ? selectedJointId : null}
+                  isInSelection={!isExporting && selectedIds.includes(link.id)}
+                  onSelect={(shiftHeld) => handleLinkSelectWithShift(link.id, shiftHeld)}
+                  onContextMenu={(e) => handleLinkContextMenu(e, link.id)}
+                  onJointSelect={(jointId) => {
+                    setSelected(link.id);
+                    setSelectedJoint(jointId);
+                  }}
+                  onJointContextMenu={(e, jointId) => handleJointContextMenu(e, link.id, jointId)}
+                  onStartBranchFromJoint={(jointId) => handleStartJunctionLink(link.id, jointId)}
+                  onEndLinkAtJunction={handleEndLinkAtJunction}
+                  isLinking={!isExporting && !!linkingFrom}
+                  onJointDragStart={(jointId) => {
+                    setSelected(link.id);
+                    setSelectedJoint(jointId);
+                  }}
+                  onJointDragMove={(jointId, point) => updateLinkJoint(link.id, jointId, point)}
+                  onJointDragEnd={(jointId, point) => updateLinkJoint(link.id, jointId, point)}
+                  onStartAnchorChange={({ side, along, centered }) => updateLink(link.id, {
+                    fromAnchorSide: side,
+                    fromAnchorLockedCenter: !!centered,
+                    fromAlongPos: along,
+                    fromAnchorId: null,
+                    fromJunctionLinkId: null,
+                    fromJunctionJointId: null,
+                  })}
+                  onEndAnchorChange={({ side, along, centered }) => updateLink(link.id, {
+                    toAnchorSide: side,
+                    toAnchorLockedCenter: !!centered,
+                    toAlongPos: along,
+                    toAnchorId: null,
+                  })}
+                  renderControls={!isExporting}
+                />
+              );
+            })}
 
           {nodes.filter(isMirrorNode).map(node => {
-            const binding = mirrorBindingById[node.id];
-            if (!binding) return null;
-            return (
-              <MirrorShape
-                key={node.id}
-                mirror={node}
-                binding={binding}
-                isSelected={selectedId === node.id}
-                isInSelection={selectedIds.includes(node.id)}
-                onSelect={(shiftHeld) => handleNodeSelect(node.id, shiftHeld)}
-                onContextMenu={handleNodeContextMenu}
-                onGroupDragStart={handleGroupDragStart}
-                onGroupDragMove={handleGroupDragMove}
-                onSelectSourceNode={handleNodeSelect}
-                onSelectSourceLink={handleLinkSelectWithShift}
-                onSourceNodeContextMenu={handleNodeContextMenu}
-                onSourceLinkContextMenu={handleLinkContextMenu}
-                onMirrorNodeRename={(mirrorId, sourceNodeId, childNode) => {
-                  const mirrorNode = nodes.find(n => n.id === mirrorId);
-                  const override = mirrorNode?.mirrorNodeOverrides?.[sourceNodeId] ?? {};
-                  const sourceNode = nodes.find(n => n.id === sourceNodeId);
-                  const initialLabel = override.label ?? sourceNode?.label ?? '';
-                  setEditingLabel(initialLabel);
-                  setEditingMirror({ mirrorId, sourceNodeId, childNode, initialLabel });
-                }}
-                onStartSourceLink={handleStartLink}
-                onEndSourceLink={handleEndLink}
-                selectedSourceId={selectedId}
-                selectedSourceIds={selectedIds}
-                isLinking={!!linkingFrom}
-                onResizeMirror={handleResizeMirror}
-                onSourceGroupDragStart={handleGroupDragStart}
-                onSourceGroupDragMove={handleGroupDragMove}
-              />
-            );
-          })}
+              const binding = mirrorBindingById[node.id];
+              if (!binding) return null;
+              return (
+                <MirrorShape
+                  key={node.id}
+                  mirror={node}
+                  binding={binding}
+                  isSelected={!isExporting && selectedId === node.id}
+                  isInSelection={!isExporting && selectedIds.includes(node.id)}
+                  onSelect={(shiftHeld) => handleNodeSelect(node.id, shiftHeld)}
+                  onContextMenu={handleNodeContextMenu}
+                  onGroupDragStart={handleGroupDragStart}
+                  onGroupDragMove={handleGroupDragMove}
+                  onSelectSourceNode={handleNodeSelect}
+                  onSelectSourceLink={handleLinkSelectWithShift}
+                  onSourceNodeContextMenu={handleNodeContextMenu}
+                  onSourceLinkContextMenu={handleLinkContextMenu}
+                  onMirrorNodeRename={(mirrorId, sourceNodeId, childNode) => {
+                    const mirrorNode = nodes.find(n => n.id === mirrorId);
+                    const override = mirrorNode?.mirrorNodeOverrides?.[sourceNodeId] ?? {};
+                    const sourceNode = nodes.find(n => n.id === sourceNodeId);
+                    const initialLabel = override.label ?? sourceNode?.label ?? '';
+                    setEditingLabel(initialLabel);
+                    setEditingMirror({ mirrorId, sourceNodeId, childNode, initialLabel });
+                  }}
+                  onStartSourceLink={handleStartLink}
+                  onEndSourceLink={handleEndLink}
+                  selectedSourceId={!isExporting ? selectedId : null}
+                  selectedSourceIds={!isExporting ? selectedIds : []}
+                  isLinking={!isExporting && !!linkingFrom}
+                  onResizeMirror={handleResizeMirror}
+                  onSourceGroupDragStart={handleGroupDragStart}
+                  onSourceGroupDragMove={handleGroupDragMove}
+                  renderEditorChrome={!isExporting}
+                />
+              );
+            })}
 
-          {nodes.map(node => {
-            if (isMirrorNode(node) || isAreaNode(node)) return null;
-            if (isSubdiagramNode(node)) return (
-              <SubdiagramShape
-                key={node.id}
-                node={node}
-                isSelected={selectedId === node.id}
-                isInSelection={selectedIds.includes(node.id)}
-                onSelect={(shiftHeld) => handleNodeSelect(node.id, shiftHeld)}
-                onStartLink={handleStartLink}
-                onEndLink={handleEndLink}
-                onContextMenu={handleNodeContextMenu}
-                isLinking={!!linkingFrom}
-                onGroupDragStart={handleGroupDragStart}
-                onGroupDragMove={handleGroupDragMove}
-                onExpand={() => setExpandedSubdiagramId(node.id)}
-              />
-            );
-            if (node.type === 'monitor') return (
-              <MonitorShape
-                key={node.id}
-                node={node}
-                isSelected={selectedId === node.id}
-                isInSelection={selectedIds.includes(node.id)}
-                onSelect={(shiftHeld) => handleNodeSelect(node.id, shiftHeld)}
-                onStartLink={handleStartLink}
-                onEndLink={handleEndLink}
-                onContextMenu={handleNodeContextMenu}
-                isLinking={!!linkingFrom}
-                onGroupDragStart={handleGroupDragStart}
-                onGroupDragMove={handleGroupDragMove}
-              />
-            );
-            return (
-              <NodeShape
-                key={node.id}
-                node={node}
-                isSelected={selectedId === node.id}
-                isInSelection={selectedIds.includes(node.id)}
-                onSelect={(shiftHeld) => handleNodeSelect(node.id, shiftHeld)}
-                onStartLink={handleStartLink}
-                onEndLink={handleEndLink}
-                onRenameStart={(nodeId) => setEditingNodeId(nodeId)}
-                onContextMenu={handleNodeContextMenu}
-                isLinking={!!linkingFrom}
-                onGroupDragStart={handleGroupDragStart}
-                onGroupDragMove={handleGroupDragMove}
-              />
-            );
-          })}
-
-          {selectedLink && selectedLinkFromNode && selectedLinkToNode && (
-            <LinkShape
-              key={`overlay-${selectedLink.id}`}
-              link={selectedLink}
-              allLinks={links}
-              fromNode={selectedLinkFromNode}
-              toNode={selectedLinkToNode}
-              isSelected
-              selectedJointId={selectedJointId}
-              onSelect={() => handleLinkSelect(selectedLink.id)}
-              onContextMenu={(e) => handleLinkContextMenu(e, selectedLink.id)}
-              onJointSelect={(jointId) => {
-                setSelected(selectedLink.id);
-                setSelectedJoint(jointId);
-              }}
-              onJointContextMenu={(e, jointId) => handleJointContextMenu(e, selectedLink.id, jointId)}
-              onStartBranchFromJoint={(jointId) => handleStartJunctionLink(selectedLink.id, jointId)}
-              onEndLinkAtJunction={handleEndLinkAtJunction}
-              isLinking={!!linkingFrom}
-              onJointDragStart={(jointId) => {
-                setSelected(selectedLink.id);
-                setSelectedJoint(jointId);
-              }}
-              onJointDragMove={(jointId, point) => updateLinkJoint(selectedLink.id, jointId, point)}
-              onJointDragEnd={(jointId, point) => updateLinkJoint(selectedLink.id, jointId, point)}
-              onStartAnchorChange={({ side, along, centered }) => updateLink(selectedLink.id, {
-                fromAnchorSide: side,
-                fromAnchorLockedCenter: !!centered,
-                fromAlongPos: along,
-                fromAnchorId: null,
-                fromJunctionLinkId: null,
-                fromJunctionJointId: null,
-              })}
-              onEndAnchorChange={({ side, along, centered }) => updateLink(selectedLink.id, {
-                toAnchorSide: side,
-                toAnchorLockedCenter: !!centered,
-                toAlongPos: along,
-                toAnchorId: null,
-                toJunctionLinkId: null,
-                toJunctionJointId: null,
-              })}
-              renderPaths={false}
-            />
-          )}
-
-          {symmetryGuides.map((guide, idx) => (
+          {/* Draw symmetry guides and selection box BEFORE aura cutouts so they are also cleared */}
+          {!isExporting && symmetryGuides.map((guide, idx) => (
             <Line
               key={guide.id ?? idx}
               points={guide.points}
@@ -1131,7 +1148,7 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
             />
           ))}
 
-          {selectionBox && (() => {
+          {!isExporting && selectionBox && (() => {
             const sx = Math.min(selectionBox.x1, selectionBox.x2);
             const sy = Math.min(selectionBox.y1, selectionBox.y2);
             const sw = Math.abs(selectionBox.x2 - selectionBox.x1);
@@ -1148,7 +1165,72 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
             );
           })()}
 
-          {linkingFrom && linkingStart && (
+          {/* Selected-link overlay should render BEFORE aura cutouts so it is also
+              erased by destination-out. */}
+          
+
+          {/* Render aura ("clear background") nodes last so their destination-out cutout
+              erases ALL surrounding content (links + other nodes), not just what was
+              drawn before them. Stable sort keeps the rest in place. */}
+          {[...nodes].sort((a, b) => (a.textAura ? 1 : 0) - (b.textAura ? 1 : 0)).map(node => {
+              if (isMirrorNode(node) || isAreaNode(node)) return null;
+              if (isSubdiagramNode(node)) return (
+                <SubdiagramShape
+                  key={node.id}
+                  node={node}
+                  isSelected={!isExporting && selectedId === node.id}
+                  isInSelection={!isExporting && selectedIds.includes(node.id)}
+                  onSelect={(shiftHeld) => handleNodeSelect(node.id, shiftHeld)}
+                  onStartLink={handleStartLink}
+                  onEndLink={handleEndLink}
+                  onContextMenu={handleNodeContextMenu}
+                  isLinking={!isExporting && !!linkingFrom}
+                  onGroupDragStart={handleGroupDragStart}
+                  onGroupDragMove={handleGroupDragMove}
+                  onExpand={() => setExpandedSubdiagramId(node.id)}
+                  renderEditorChrome={!isExporting}
+                />
+              );
+              if (node.type === 'monitor') return (
+                <MonitorShape
+                  key={node.id}
+                  node={node}
+                  isSelected={!isExporting && selectedId === node.id}
+                  isInSelection={!isExporting && selectedIds.includes(node.id)}
+                  onSelect={(shiftHeld) => handleNodeSelect(node.id, shiftHeld)}
+                  onStartLink={handleStartLink}
+                  onEndLink={handleEndLink}
+                  onContextMenu={handleNodeContextMenu}
+                  isLinking={!isExporting && !!linkingFrom}
+                  onGroupDragStart={handleGroupDragStart}
+                  onGroupDragMove={handleGroupDragMove}
+                  renderEditorChrome={!isExporting}
+                />
+              );
+              return (
+                <NodeShape
+                  key={node.id}
+                  node={node}
+                  isSelected={!isExporting && selectedId === node.id}
+                  isInSelection={!isExporting && selectedIds.includes(node.id)}
+                  onSelect={(shiftHeld) => handleNodeSelect(node.id, shiftHeld)}
+                  onStartLink={handleStartLink}
+                  onEndLink={handleEndLink}
+                  onRenameStart={(nodeId) => setEditingNodeId(nodeId)}
+                  onContextMenu={handleNodeContextMenu}
+                  isLinking={!isExporting && !!linkingFrom}
+                  onGroupDragStart={handleGroupDragStart}
+                  onGroupDragMove={handleGroupDragMove}
+                  renderEditorChrome={!isExporting}
+                />
+              );
+            })}
+
+          
+
+
+
+          {!isExporting && linkingFrom && linkingStart && (
             <Line
               points={[
                 linkingStart.x,
@@ -1163,6 +1245,9 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
               listening={false}
             />
           )}
+
+          {/* Ephemeral Ctrl+B alignment ghost — viewport only, never exported. */}
+          {!isExporting && <GhostOverlay />}
         </Layer>
       </Stage>
 
@@ -1185,6 +1270,214 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
           </p>
         </div>
       )}
+
+      {captureFrame?.visible && (
+        <div style={{ position: 'absolute', inset: 0, zIndex: 2, pointerEvents: 'none' }}>
+          <svg
+            width={dims.w}
+            height={dims.h}
+            style={{ position: 'absolute', left: 0, top: 0, pointerEvents: 'none' }}
+          >
+            {(() => {
+              const x = stagePos.x + captureFrame.x * scale;
+              const y = stagePos.y + captureFrame.y * scale;
+              const w = captureFrame.width * scale;
+              const h = captureFrame.height * scale;
+
+              const startResize = (kind, ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                if (ev.nativeEvent && typeof ev.nativeEvent.stopImmediatePropagation === 'function') {
+                  ev.nativeEvent.stopImmediatePropagation();
+                }
+                const start = {
+                  clientX: ev.clientX,
+                  clientY: ev.clientY,
+                  fx: captureFrame.x,
+                  fy: captureFrame.y,
+                  fw: captureFrame.width,
+                  fh: captureFrame.height,
+                };
+                const minW = 120;
+                const minH = 80;
+                const onMove = (me) => {
+                  const dx = (me.clientX - start.clientX) / scale;
+                  const dy = (me.clientY - start.clientY) / scale;
+                  let nx = start.fx;
+                  let ny = start.fy;
+                  let nw = start.fw;
+                  let nh = start.fh;
+                  switch (kind) {
+                    case 'move':
+                      nx = start.fx + dx; ny = start.fy + dy; break;
+                    case 'n':
+                      ny = start.fy + dy; nh = start.fh - dy; break;
+                    case 's':
+                      nh = start.fh + dy; break;
+                    case 'w':
+                      nx = start.fx + dx; nw = start.fw - dx; break;
+                    case 'e':
+                      nw = start.fw + dx; break;
+                    case 'nw':
+                      nx = start.fx + dx; nw = start.fw - dx; ny = start.fy + dy; nh = start.fh - dy; break;
+                    case 'ne':
+                      nw = start.fw + dx; ny = start.fy + dy; nh = start.fh - dy; break;
+                    case 'sw':
+                      nx = start.fx + dx; nw = start.fw - dx; nh = start.fh + dy; break;
+                    case 'se':
+                      nw = start.fw + dx; nh = start.fh + dy; break;
+                    default:
+                      break;
+                  }
+                  if (nw < minW) { if (kind.includes('w')) nx += (nw - minW) * -1; nw = minW; }
+                  if (nh < minH) { if (kind.includes('n')) ny += (nh - minH) * -1; nh = minH; }
+                  setCaptureFrame({ x: Math.round(nx), y: Math.round(ny), width: Math.round(nw), height: Math.round(nh) });
+                };
+                const onUp = () => {
+                  window.removeEventListener('mousemove', onMove);
+                  window.removeEventListener('mouseup', onUp);
+                };
+                window.addEventListener('mousemove', onMove);
+                window.addEventListener('mouseup', onUp, { once: true });
+              };
+
+              const handleSize = 12;
+              const half = handleSize / 2;
+              return (
+                <g>
+                  <rect x={x} y={y} width={w} height={h}
+                    fill="rgba(138, 91, 214, 0.06)"
+                    stroke={pageColors.purpleAccent}
+                    strokeDasharray="8 6"
+                    strokeWidth={1}
+                    style={{ pointerEvents: 'none' }}
+                  />
+                  {/* Move handle (top-left) — shown but non-interactive in SVG */}
+                  <rect
+                    x={x - 8} y={y - 8} width={16} height={16}
+                    fill={pageColors.purpleAccent}
+                    rx={4} ry={4}
+                    style={{ cursor: 'move', pointerEvents: 'none' }}
+                  />
+
+                  {/* Corner handles */}
+                  <rect x={x - half} y={y - half} width={handleSize} height={handleSize}
+                    fill={pageColors.purpleAccent}
+                    rx={3} ry={3}
+                    style={{ cursor: 'nwse-resize', pointerEvents: 'none' }} />
+                  <rect x={x + w - half} y={y - half} width={handleSize} height={handleSize}
+                    fill={pageColors.purpleAccent}
+                    rx={3} ry={3}
+                    style={{ cursor: 'nesw-resize', pointerEvents: 'none' }} />
+                  <rect x={x - half} y={y + h - half} width={handleSize} height={handleSize}
+                    fill={pageColors.purpleAccent}
+                    rx={3} ry={3}
+                    style={{ cursor: 'nesw-resize', pointerEvents: 'none' }} />
+                  <rect x={x + w - half} y={y + h - half} width={handleSize} height={handleSize}
+                    fill={pageColors.purpleAccent}
+                    rx={3} ry={3}
+                    style={{ cursor: 'nwse-resize', pointerEvents: 'none' }} />
+
+                  {/* Edge handles */}
+                  <rect x={x + w/2 - half} y={y - half} width={handleSize} height={handleSize}
+                    fill={pageColors.purpleAccent}
+                    rx={3} ry={3}
+                    style={{ cursor: 'ns-resize', pointerEvents: 'none' }} />
+                  <rect x={x + w/2 - half} y={y + h - half} width={handleSize} height={handleSize}
+                    fill={pageColors.purpleAccent}
+                    rx={3} ry={3}
+                    style={{ cursor: 'ns-resize', pointerEvents: 'none' }} />
+                  <rect x={x - half} y={y + h/2 - half} width={handleSize} height={handleSize}
+                    fill={pageColors.purpleAccent}
+                    rx={3} ry={3}
+                    style={{ cursor: 'ew-resize', pointerEvents: 'none' }} />
+                  <rect x={x + w - half} y={y + h/2 - half} width={handleSize} height={handleSize}
+                    fill={pageColors.purpleAccent}
+                    rx={3} ry={3}
+                    style={{ cursor: 'ew-resize', pointerEvents: 'none' }} />
+
+                  <text x={x + 8} y={y - 10} fill={pageColors.purpleAccent} fontSize={11} fontWeight={700} style={{ pointerEvents: 'none' }}>
+                    Screen Preview {Math.round(captureFrame.width)}×{Math.round(captureFrame.height)}
+                  </text>
+                </g>
+              );
+            })()}
+          </svg>
+        </div>
+      )}
+
+      {captureFrame?.visible && (() => {
+        const x = stagePos.x + captureFrame.x * scale;
+        const y = stagePos.y + captureFrame.y * scale;
+        const w = captureFrame.width * scale;
+        const h = captureFrame.height * scale;
+        const handleSize = 12;
+        const half = handleSize / 2;
+
+        const startResize = (kind, ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (ev.nativeEvent && typeof ev.nativeEvent.stopImmediatePropagation === 'function') {
+            ev.nativeEvent.stopImmediatePropagation();
+          }
+          const start = {
+            clientX: ev.clientX,
+            clientY: ev.clientY,
+            fx: captureFrame.x,
+            fy: captureFrame.y,
+            fw: captureFrame.width,
+            fh: captureFrame.height,
+          };
+          const minW = 120;
+          const minH = 80;
+          const onMove = (me) => {
+            const dx = (me.clientX - start.clientX) / scale;
+            const dy = (me.clientY - start.clientY) / scale;
+            let nx = start.fx;
+            let ny = start.fy;
+            let nw = start.fw;
+            let nh = start.fh;
+            switch (kind) {
+              case 'move': nx = start.fx + dx; ny = start.fy + dy; break;
+              case 'n': ny = start.fy + dy; nh = start.fh - dy; break;
+              case 's': nh = start.fh + dy; break;
+              case 'w': nx = start.fx + dx; nw = start.fw - dx; break;
+              case 'e': nw = start.fw + dx; break;
+              case 'nw': nx = start.fx + dx; nw = start.fw - dx; ny = start.fy + dy; nh = start.fh - dy; break;
+              case 'ne': nw = start.fw + dx; ny = start.fy + dy; nh = start.fh - dy; break;
+              case 'sw': nx = start.fx + dx; nw = start.fw - dx; nh = start.fh + dy; break;
+              case 'se': nw = start.fw + dx; nh = start.fh + dy; break;
+              default: break;
+            }
+            if (nw < minW) { if (kind.includes('w')) nx += (nw - minW) * -1; nw = minW; }
+            if (nh < minH) { if (kind.includes('n')) ny += (nh - minH) * -1; nh = minH; }
+            setCaptureFrame({ x: Math.round(nx), y: Math.round(ny), width: Math.round(nw), height: Math.round(nh) });
+          };
+          const onUp = () => {
+            window.removeEventListener('mousemove', onMove);
+            window.removeEventListener('mouseup', onUp);
+          };
+          window.addEventListener('mousemove', onMove);
+          window.addEventListener('mouseup', onUp, { once: true });
+        };
+
+        return (
+          <>
+            {/* Move handle */}
+            <div onMouseDown={(e) => startResize('move', e)} style={{ position: 'absolute', left: x - 8, top: y - 8, width: 16, height: 16, background: pageColors.purpleAccent, borderRadius: 4, cursor: 'move', zIndex: 3 }} />
+            {/* Corners */}
+            <div onMouseDown={(e) => startResize('nw', e)} style={{ position: 'absolute', left: x - half, top: y - half, width: handleSize, height: handleSize, background: pageColors.purpleAccent, borderRadius: 3, cursor: 'nwse-resize', zIndex: 3 }} />
+            <div onMouseDown={(e) => startResize('ne', e)} style={{ position: 'absolute', left: x + w - half, top: y - half, width: handleSize, height: handleSize, background: pageColors.purpleAccent, borderRadius: 3, cursor: 'nesw-resize', zIndex: 3 }} />
+            <div onMouseDown={(e) => startResize('sw', e)} style={{ position: 'absolute', left: x - half, top: y + h - half, width: handleSize, height: handleSize, background: pageColors.purpleAccent, borderRadius: 3, cursor: 'nesw-resize', zIndex: 3 }} />
+            <div onMouseDown={(e) => startResize('se', e)} style={{ position: 'absolute', left: x + w - half, top: y + h - half, width: handleSize, height: handleSize, background: pageColors.purpleAccent, borderRadius: 3, cursor: 'nwse-resize', zIndex: 3 }} />
+            {/* Edges */}
+            <div onMouseDown={(e) => startResize('n', e)} style={{ position: 'absolute', left: x + w/2 - half, top: y - half, width: handleSize, height: handleSize, background: pageColors.purpleAccent, borderRadius: 3, cursor: 'ns-resize', zIndex: 3 }} />
+            <div onMouseDown={(e) => startResize('s', e)} style={{ position: 'absolute', left: x + w/2 - half, top: y + h - half, width: handleSize, height: handleSize, background: pageColors.purpleAccent, borderRadius: 3, cursor: 'ns-resize', zIndex: 3 }} />
+            <div onMouseDown={(e) => startResize('w', e)} style={{ position: 'absolute', left: x - half, top: y + h/2 - half, width: handleSize, height: handleSize, background: pageColors.purpleAccent, borderRadius: 3, cursor: 'ew-resize', zIndex: 3 }} />
+            <div onMouseDown={(e) => startResize('e', e)} style={{ position: 'absolute', left: x + w - half, top: y + h/2 - half, width: handleSize, height: handleSize, background: pageColors.purpleAccent, borderRadius: 3, cursor: 'ew-resize', zIndex: 3 }} />
+          </>
+        );
+      })()}
 
       <div
         style={{

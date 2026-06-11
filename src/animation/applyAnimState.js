@@ -1,5 +1,13 @@
 import { buildLinkRenderData, getAnimatedArrowHead, getPointAtProgress } from '../links/linkGeometry';
-import { pageColors } from '../../colorThemes';
+import { pageColors } from '../colorThemes';
+import { getManualTokenTextAtTime } from './manualTokenTiming';
+import { getNodeTextMorphs, getTextMorphRenderState } from '../text/textMorphs';
+import { formatEquationText } from '../text/equationText';
+
+function getRenderedLabelText(label, value) {
+  const text = String(value ?? '');
+  return label?.getAttr('equationMode') ? formatEquationText(text) : text;
+}
 
 export function computeLinkRenders(nodes, links) {
   const nodeMap = Object.fromEntries(nodes.map(node => [node.id, node]));
@@ -53,6 +61,64 @@ function mixColor(from, to, progress) {
   return `rgb(${r}, ${g}, ${b})`;
 }
 
+// Resolve a monitor value's text color across its morphs. Each morph owns the
+// color from its keyframe onward: the color shown after a morph is that morph's
+// own color (its picker value, which falls back to the node's default when the
+// morph leaves it unset). This matches the per-morph color picker exactly, so a
+// later morph never "inherits" an earlier morph's color — when a morph ends, you
+// see the color that morph specifies, held until the next morph takes over.
+function resolveMonitorTextColor(node, morphs, time) {
+  const fallback = node.textColor;
+  let committed = fallback;
+  for (const morph of morphs) {
+    if (time < morph.startTime) break;        // future morph: stop here
+    const effective = morph.textColor ?? fallback;
+    const end = morph.startTime + morph.duration;
+    if (time >= end) {
+      committed = effective;                  // morph finished: its color is in effect
+      continue;
+    }
+    // Active morph: blend from the previous color to this morph's color.
+    const progress = clamp((time - morph.startTime) / morph.duration, 0, 1);
+    return mixColor(committed, effective, progress);
+  }
+  return committed;
+}
+
+// Clip a Konva group to a layer-space rect (the scrolling area). Clip coordinates
+// live in the group's local space, so use Konva's full transform rather than
+// reconstructing translation/offset/scale by hand. This also handles centered node
+// offsets and keeps the clip fixed while the group moves during a scroll step.
+function applyScrollClip(group, clip) {
+  if (!clip) return;
+  const transform = group.getTransform().copy().invert();
+  const corners = [
+    transform.point({ x: clip.x, y: clip.y }),
+    transform.point({ x: clip.x + clip.w, y: clip.y }),
+    transform.point({ x: clip.x, y: clip.y + clip.h }),
+    transform.point({ x: clip.x + clip.w, y: clip.y + clip.h }),
+  ];
+  const xs = corners.map(point => point.x);
+  const ys = corners.map(point => point.y);
+  const minX = Math.min(...xs);
+  const minY = Math.min(...ys);
+  const maxX = Math.max(...xs);
+  const maxY = Math.max(...ys);
+  group.clipX(minX);
+  group.clipY(minY);
+  group.clipWidth(Math.max(0, maxX - minX));
+  group.clipHeight(Math.max(0, maxY - minY));
+}
+
+function clearScrollClip(group) {
+  if (group.clipWidth() != null || group.clipHeight() != null) {
+    group.clipX(undefined);
+    group.clipY(undefined);
+    group.clipWidth(undefined);
+    group.clipHeight(undefined);
+  }
+}
+
 function ensureBaseAttr(node, attr, fallback) {
   const current = node.getAttr(attr);
   if (current != null) return current;
@@ -76,7 +142,7 @@ function getCachedNode(layer, selector) {
   return node;
 }
 
-function applyNodeStateToId(layer, id, state) {
+function applyNodeStateToId(layer, id, state, currentTime = 0) {
   const group = getCachedNode(layer, `#node-${id}`);
   const label = getCachedNode(layer, `#node-label-${id}`);
   const morphLabel = getCachedNode(layer, `#node-label-morph-${id}`);
@@ -109,12 +175,18 @@ function applyNodeStateToId(layer, id, state) {
       return;
     }
 
-    // 'fade' mode — ensure the rect stays at its real dimensions and let
-    // the group opacity/scale animation below handle the fade.
+    // 'fade' mode — keep the rect at its real dimensions and fade in via opacity
+    // only. The area group has no center offset (its origin is the top-left), so
+    // applying the generic entry scale (0.82→1) would make the area grow out of
+    // its corner and visibly drift. Force scale to 1 and return so it stays solid.
     areaRect.width(baseW);
     areaRect.height(baseH);
     const areaLabel = getCachedNode(layer, `#area-label-${id}`);
     if (areaLabel) areaLabel.opacity(1);
+    group.opacity(state.opacity);
+    group.scaleX(1);
+    group.scaleY(1);
+    return;
   }
   // ── end area handling ───────────────────────────────────────────────────────
 
@@ -123,6 +195,57 @@ function applyNodeStateToId(layer, id, state) {
   const scale = state.scale;
   group.scaleX(scale);
   group.scaleY(scale);
+
+  // Scrolling-area offset: translate the node from its rest position. We cache the
+  // rest position once so we can both apply the live offset and restore it on stop.
+  if (state.scrollDX != null || state.scrollDY != null) {
+    let baseX = group.getAttr('scrollBaseX');
+    let baseY = group.getAttr('scrollBaseY');
+    if (baseX == null) { baseX = group.x(); group.setAttr('scrollBaseX', baseX); }
+    if (baseY == null) { baseY = group.y(); group.setAttr('scrollBaseY', baseY); }
+    const nextX = baseX + (state.scrollDX ?? 0);
+    const nextY = baseY + (state.scrollDY ?? 0);
+    const previousTime = group.getAttr('scrollPreviousTime');
+    const timeMovedForward = previousTime == null || currentTime >= previousTime;
+    // Re-entry fade fires off the engine's deterministic per-band cycle index, which
+    // ticks once per wrap — reliable for every band, unlike a position-jump threshold.
+    const cycleIndex = state.scrollCycleIndex;
+    const previousCycleIndex = group.getAttr('scrollCycleIndex');
+    const wrapped = timeMovedForward && cycleIndex != null && previousCycleIndex != null
+      && cycleIndex !== previousCycleIndex;
+
+    // Seamless loops keep the wrap off-screen, so the re-entry fade only adds a blink
+    // at the loop seam (esp. in exported GIFs) — skip it.
+    if (wrapped && !state.scrollSeamless) group.setAttr('scrollFadeStartTime', currentTime);
+    if (!timeMovedForward || state.scrollSeamless) group.setAttr('scrollFadeStartTime', undefined);
+    group.setAttr('scrollCycleIndex', cycleIndex);
+
+    const fadeStartTime = group.getAttr('scrollFadeStartTime');
+    if (fadeStartTime != null) {
+      const fadeProgress = clamp((currentTime - fadeStartTime) / 0.18, 0, 1);
+      const fadeOpacity = 0.18 + 0.82 * easeOut3(fadeProgress);
+      group.opacity(state.opacity * fadeOpacity);
+      if (fadeProgress >= 1) group.setAttr('scrollFadeStartTime', undefined);
+    }
+
+    group.x(nextX);
+    group.y(nextY);
+    group.setAttr('scrollPreviousX', nextX);
+    group.setAttr('scrollPreviousY', nextY);
+    group.setAttr('scrollPreviousTime', currentTime);
+    applyScrollClip(group, state.scrollClip);
+  } else {
+    const baseX = group.getAttr('scrollBaseX');
+    const baseY = group.getAttr('scrollBaseY');
+    if (baseX != null) group.x(baseX);
+    if (baseY != null) group.y(baseY);
+    group.setAttr('scrollPreviousX', undefined);
+    group.setAttr('scrollPreviousY', undefined);
+    group.setAttr('scrollPreviousTime', undefined);
+    group.setAttr('scrollFadeStartTime', undefined);
+    group.setAttr('scrollCycleIndex', undefined);
+    clearScrollClip(group);
+  }
 
   // Graph node draw animation (when present)
   // Support single or split graph lines
@@ -178,8 +301,17 @@ function applyNodeStateToId(layer, id, state) {
   // Fail X: fades in during the last 30% of the node's entry animation
   const failMark = getCachedNode(layer, `#node-fail-${id}`);
   if (failMark) {
-    const xOpacity = state.opacity < 0.55 ? 0 : Math.min(1, (state.opacity - 0.55) / 0.45);
+    const xOpacity = state.failureOpacity ?? (state.opacity < 0.55 ? 0 : Math.min(1, (state.opacity - 0.55) / 0.45));
     failMark.opacity(xOpacity);
+    const xScale = 0.82 + xOpacity * 0.18;
+    failMark.scale({ x: xScale, y: xScale });
+  }
+
+  // Failure tint veil matches Fail X visibility
+  const failTint = getCachedNode(layer, `#node-fail-tint-${id}`);
+  if (failTint) {
+    const xOpacity = state.failureOpacity ?? (state.opacity < 0.55 ? 0 : Math.min(1, (state.opacity - 0.55) / 0.45));
+    failTint.opacity(xOpacity);
   }
 
   if (label) {
@@ -188,16 +320,16 @@ function applyNodeStateToId(layer, id, state) {
     if (label.getAttr('independentText')) {
       if (state.textMode === 'write') {
         const charCount = Math.max(0, Math.ceil(baseText.length * (state.textProgress ?? 1)));
-        label.text(baseText.slice(0, charCount));
+        label.text(getRenderedLabelText(label, baseText.slice(0, charCount)));
       } else {
-        label.text(baseText);
+        label.text(getRenderedLabelText(label, baseText));
       }
       label.opacity(1);
     } else {
-      label.text(state.labelText ?? baseText);
+      label.text(getRenderedLabelText(label, state.labelText ?? baseText));
       label.opacity(state.labelOpacity ?? 1);
     }
-    label.fill(mixColor(baseFill, state.targetTextColor, state.transformProgress ?? 0));
+    label.fill(mixColor(state.morphFromTextColor ?? baseFill, state.targetTextColor, state.transformProgress ?? 0));
   }
 
   if (morphLabel) {
@@ -206,14 +338,13 @@ function applyNodeStateToId(layer, id, state) {
       morphLabel.text('');
       morphLabel.opacity(0);
     } else {
-      morphLabel.text(state.morphLabelText ?? '');
+      morphLabel.text(getRenderedLabelText(morphLabel, state.morphLabelText ?? ''));
       morphLabel.opacity(state.morphLabelOpacity ?? 0);
     }
-    morphLabel.fill(mixColor(morphBaseFill, state.targetTextColor, state.transformProgress ?? 0));
+    morphLabel.fill(mixColor(state.morphFromTextColor ?? morphBaseFill, state.targetTextColor, state.transformProgress ?? 0));
   }
 
   const transformBody = getCachedNode(layer, `#node-body-transform-${id}`);
-  const shadow = getCachedNode(layer, `#node-shadow-${id}`);
   const highlight = getCachedNode(layer, `#node-highlight-${id}`);
   const transformHighlight = getCachedNode(layer, `#node-highlight-transform-${id}`);
 
@@ -225,7 +356,6 @@ function applyNodeStateToId(layer, id, state) {
       // Cross-fade: original body fades out, transform body (with target shape + colors) fades in.
       body.opacity(1 - progress);
       transformBody.opacity(progress);
-      if (shadow) shadow.opacity(1 - progress);
       if (highlight) highlight.opacity(1 - progress);
       if (transformHighlight) transformHighlight.opacity(progress);
 
@@ -243,13 +373,20 @@ function applyNodeStateToId(layer, id, state) {
         ? ensureBaseAttr(body, 'baseCornerRadius', body.cornerRadius())
         : null;
 
-      body.fill(mixColor(baseFill, state.targetFill, progress));
-      body.stroke(mixColor(baseStroke, state.targetStroke, progress));
+      // For chained morphs, blend from the previously committed morph value
+      // (state.morphFrom*) instead of the node's original base, so a later morph
+      // transitions out of the prior morph's color rather than the base color.
+      const fromFill = state.morphFromFill ?? baseFill;
+      const fromStroke = state.morphFromStroke ?? baseStroke;
+      const fromStrokeWidth = state.morphFromStrokeWidth ?? baseStrokeWidth;
+      const fromCornerRadius = state.morphFromCornerRadius ?? baseCornerRadius;
+      body.fill(mixColor(fromFill, state.targetFill, progress));
+      body.stroke(mixColor(fromStroke, state.targetStroke, progress));
       if (state.targetStrokeWidth != null) {
-        body.strokeWidth(lerp(baseStrokeWidth, state.targetStrokeWidth, progress));
+        body.strokeWidth(lerp(fromStrokeWidth, state.targetStrokeWidth, progress));
       }
       if (baseCornerRadius != null && state.targetCornerRadius != null && typeof body.cornerRadius === 'function') {
-        body.cornerRadius(lerp(baseCornerRadius, state.targetCornerRadius, progress));
+        body.cornerRadius(lerp(fromCornerRadius, state.targetCornerRadius, progress));
       }
     }
   }
@@ -279,12 +416,137 @@ function applyNodeStateToId(layer, id, state) {
   }
 }
 
-function applyLinkStateToId(layer, id, state, linkRenders, opts = {}) {
+function applyLinkStateToId(layer, id, state, linkRenders, opts = {}, sourceId = id) {
   const shaft = getCachedNode(layer, `#link-shaft-${id}`);
   const head = getCachedNode(layer, `#link-head-${id}`);
   const token = getCachedNode(layer, `#link-token-${id}`);
   const tokenLabel = getCachedNode(layer, `#link-token-label-${id}`);
   if (!shaft) return;
+
+  // Carry the whole link with its scrolling endpoints: translate the wrapping group
+  // and fade it with the nodes. Cached base lets us restore the rest position on stop.
+  const wrap = getCachedNode(layer, `#link-wrap-${id}`);
+  if (wrap) {
+    if (state.scrollDX != null || state.scrollDY != null) {
+      let baseX = wrap.getAttr('scrollBaseX');
+      let baseY = wrap.getAttr('scrollBaseY');
+      if (baseX == null) { baseX = wrap.x(); wrap.setAttr('scrollBaseX', baseX); }
+      if (baseY == null) { baseY = wrap.y(); wrap.setAttr('scrollBaseY', baseY); }
+      const nextX = baseX + (state.scrollDX ?? 0);
+      const nextY = baseY + (state.scrollDY ?? 0);
+      const previousTime = wrap.getAttr('scrollPreviousTime');
+      const currentTime = opts.currentTime ?? 0;
+      const timeMovedForward = previousTime == null || currentTime >= previousTime;
+
+      // Wrap detection is driven by the engine's deterministic per-band cycle index,
+      // which ticks by exactly one each time the band wraps around the area edge — i.e.
+      // each time its tile re-enters as the freshest message. Only the band that just
+      // wrapped restarts its token, so the tokens stagger into a stream (one per ratchet
+      // click across the columns) rather than all firing on the same frame. This fires
+      // reliably regardless of where in the viewport the band sits — unlike a
+      // frame-to-frame position-jump threshold, which the "wrap mismatch" frame
+      // (scrollDX forced to 0) and seeks made misfire. On wrap we restart the manual
+      // token from its own start so it replays exactly once, then stays hidden until the
+      // next time this tile wraps.
+      const cycleIndex = state.scrollCycleIndex;
+      const previousCycleIndex = wrap.getAttr('scrollCycleIndex');
+      if (timeMovedForward && cycleIndex != null && previousCycleIndex != null
+          && cycleIndex !== previousCycleIndex) {
+        // Record the time between consecutive wraps so the token's pass can be scaled
+        // to finish inside one cycle (see getManualDuration). Without this a token
+        // whose configured duration is longer than the gap between wraps only reaches
+        // the middle of the link before the next wrap resets it. Prefer the engine's
+        // deterministic seconds-per-wrap (known from the first wrap, jitter-free); fall
+        // back to the measured frame-to-frame interval only when it is unavailable.
+        const lastRestart = wrap.getAttr('manualTokenRestartTime');
+        if (!(state.scrollCyclePeriod > 0.0001)
+            && lastRestart != null && currentTime > lastRestart) {
+          wrap.setAttr('manualTokenCycleDuration', currentTime - lastRestart);
+        }
+        wrap.setAttr('manualTokenRestartTime', currentTime);
+        // Re-entry fade: a wrapped link should reappear fresh like the nodes do
+        // (which use the same fade), instead of teleporting in fully solid. This is
+        // a gentle opacity fade — NOT a draw-in replay, which broke the smooth glide.
+        // Seamless loops keep the wrap off-screen, so this fade only adds a blink at
+        // the loop seam — skip it there.
+        if (!state.scrollSeamless) wrap.setAttr('scrollFadeStartTime', currentTime);
+        // Also briefly re-draw the link shaft on wrap so the link "plays" at each
+        // re-entry in the loop area. This only affects fully-drawn links; bound/drawing
+        // links continue their normal progress.
+        wrap.setAttr('wrapDrawStartTime', currentTime);
+      }
+      if (!timeMovedForward) {
+        wrap.setAttr('manualTokenRestartTime', undefined);
+        if (!(state.scrollCyclePeriod > 0.0001)) {
+          wrap.setAttr('manualTokenCycleDuration', undefined);
+        }
+        wrap.setAttr('scrollFadeStartTime', undefined);
+      }
+      if (state.scrollSeamless) wrap.setAttr('scrollFadeStartTime', undefined);
+      // Deterministic seconds-per-wrap from the engine: publish it every carried frame
+      // so the token's pass is sized to one cycle from the very first wrap (no need to
+      // wait for two wraps to measure the gap). Falls back to the measured value above.
+      if (state.scrollCyclePeriod > 0.0001) {
+        wrap.setAttr('manualTokenCycleDuration', state.scrollCyclePeriod);
+      }
+      wrap.setAttr('scrollCycleIndex', cycleIndex);
+
+      wrap.x(nextX);
+      wrap.y(nextY);
+      wrap.setAttr('scrollPreviousX', nextX);
+      wrap.setAttr('scrollPreviousY', nextY);
+      wrap.setAttr('scrollPreviousTime', currentTime);
+      let wrapOpacity = state.scrollOpacity ?? 1;
+      const fadeStartTime = wrap.getAttr('scrollFadeStartTime');
+      if (fadeStartTime != null) {
+        const fadeProgress = clamp((currentTime - fadeStartTime) / 0.18, 0, 1);
+        wrapOpacity *= 0.18 + 0.82 * easeOut3(fadeProgress);
+        if (fadeProgress >= 1) wrap.setAttr('scrollFadeStartTime', undefined);
+      }
+      wrap.opacity(wrapOpacity);
+      // Clip to the area edge when carried; a hidden (wrap-mismatch) link needs no clip.
+      if ((state.scrollOpacity ?? 1) > 0) applyScrollClip(wrap, state.scrollClip);
+      else clearScrollClip(wrap);
+    } else if (wrap.getAttr('scrollBaseX') != null) {
+      wrap.x(wrap.getAttr('scrollBaseX'));
+      wrap.y(wrap.getAttr('scrollBaseY'));
+      wrap.opacity(1);
+      wrap.setAttr('scrollPreviousX', undefined);
+      wrap.setAttr('scrollPreviousY', undefined);
+      wrap.setAttr('scrollPreviousTime', undefined);
+      wrap.setAttr('manualTokenRestartTime', undefined);
+      wrap.setAttr('manualTokenCycleDuration', undefined);
+      wrap.setAttr('scrollCycleIndex', undefined);
+      wrap.setAttr('scrollFadeStartTime', undefined);
+      clearScrollClip(wrap);
+    }
+  }
+
+  // Manual tokens normally use absolute timeline time. Once a carried link wraps,
+  // restart from that token's own start point so it immediately reappears at the
+  // beginning of the link and replays its duration, direction, and text keyframes.
+  const absoluteTime = opts.currentTime ?? 0;
+  const manualRestartTime = wrap?.getAttr('manualTokenRestartTime');
+  const manualElapsedAfterWrap = manualRestartTime != null
+    ? Math.max(0, absoluteTime - manualRestartTime)
+    : null;
+  const getManualTime = manual => (
+    manualElapsedAfterWrap != null && manual
+      ? (manual.start ?? 0) + manualElapsedAfterWrap // single pass after reset, then hide
+      : absoluteTime
+  );
+  // Effective token duration. When the link is carried by a scrolling area we clamp
+  // the configured duration to a little under the measured wrap interval, so the
+  // token always completes one full pass and briefly disappears before the next
+  // object spawns — instead of being cut off mid-link when cycles are short.
+  const manualCycleDuration = wrap?.getAttr('manualTokenCycleDuration');
+  const clampToCycle = seconds => {
+    const s = Math.max(0.0001, seconds);
+    return manualCycleDuration != null && manualCycleDuration > 0.0001
+      ? Math.min(s, manualCycleDuration * 0.9)
+      : s;
+  };
+  const getManualDuration = manual => clampToCycle(manual?.duration ?? 0.6);
 
   const renderData = linkRenders[id];
   const drawLength = renderData?.visibleLength ?? renderData?.length ?? 200;
@@ -314,14 +576,100 @@ function applyLinkStateToId(layer, id, state, linkRenders, opts = {}) {
     }
   }
 
-  shaft.opacity(drawProgress > 0.001 ? 1 : 0);
+  // If the link just wrapped and it's otherwise fully drawn, briefly replay a draw-in
+  // so the link visibly "plays" per wrap. Use a short ease to avoid a harsh blink.
+  let effectiveDrawProgress = drawProgress;
+  if (wrap) {
+    const wds = wrap.getAttr('wrapDrawStartTime');
+    const now = opts.currentTime ?? 0;
+    if (wds != null) {
+      const dt = now - wds;
+      const RDUR = 0.5;
+      if (dt >= 0 && dt <= RDUR) {
+        const p = easeOut3(Math.max(0, Math.min(1, dt / RDUR)));
+        if (drawProgress >= 1) effectiveDrawProgress = p;
+      } else {
+        wrap.setAttr('wrapDrawStartTime', undefined);
+      }
+    }
+  }
+  shaft.opacity(effectiveDrawProgress > 0.001 ? 1 : 0);
 
-  if (drawProgress >= 1) {
+  // Fail-at-ends overlay: briefly tint entire shaft red at the END while playing.
+  const failEndsActive = !!opts.failAtEndsById?.[sourceId];
+  const isPlayingNow = opts.isPlaying !== false; // default true unless explicitly false
+
+  // Determine 'end' progress to use for failure timing: prefer token timing (bound/variable/manual) else draw progress
+  const tNow = opts.currentTime ?? 0;
+  let endProgress = drawProgress; // fallback
+  let manualTiming = null;
+  if (!isBoundDraw) {
+    // Try variable web token timing first
+    let foundWeb = null;
+    let foundTiming = null;
+    const webs = opts.webs ?? [];
+    for (const w of webs) {
+      const tt = w?.tokenTiming?.[id];
+      if (tt && !tt.skipped && w.inputMode !== 'silent' && tNow >= tt.start && tNow <= tt.start + tt.duration) {
+        foundWeb = w; foundTiming = tt; break;
+      }
+    }
+    if (foundTiming) {
+      endProgress = Math.max(0, Math.min(1, (tNow - foundTiming.start) / Math.max(0.0001, foundTiming.duration)));
+    } else {
+      // Fall back to manual timing if present and active
+      const manual = opts.manualTokenTimingById?.[sourceId] ?? opts.manualTokenTimingById?.[id] ?? null;
+      manualTiming = manual;
+      if (manual) {
+        const mStart = manual.start ?? -Infinity;
+        const mDur = getManualDuration(manual);
+        const manualTime = getManualTime(manual);
+        let mp = (manualTime - mStart) / mDur;
+        if (manual.invert === true) mp = 1 - mp;
+        if (mp >= 0 && mp <= 1) endProgress = mp;
+      }
+    }
+  }
+
+  const failOverlay = getCachedNode(layer, `#link-shaft-fail-overlay-${id}`);
+  const tokenEndMode = !!opts.failOnTokenEndById?.[sourceId];
+  // Manual token end COMPLETE detection (independent of invert): after start+duration
+  const manualHasTiming = !!manualTiming;
+  const manualTimingTime = getManualTime(manualTiming);
+  const manualTimingDuration = manualHasTiming ? getManualDuration(manualTiming) : 0.6;
+  const manualEndReached = manualHasTiming
+    ? ((manualTimingTime - (manualTiming.start ?? -Infinity)) >= manualTimingDuration)
+    : false;
+  // Decide which progress metric to use for non-manual end-fade display
+  const progressForFail = endProgress; // already prefers token where available
+
+  if (failOverlay) {
+    if (tokenEndMode && manualHasTiming && renderData) {
+      // Smooth transition from normal to failure after manual token finishes
+      const TRANS = 0.25; // seconds
+      const endT = (manualTiming.start ?? -Infinity) + manualTimingDuration;
+      const mix = manualEndReached ? Math.max(0, Math.min(1, (manualTimingTime - endT) / TRANS)) : 0;
+      failOverlay.opacity(mix);
+    } else if (failEndsActive && isPlayingNow && renderData && progressForFail > 0 && progressForFail < 1) {
+      const WIN = 0.08;
+      const nearEnd = progressForFail >= (1 - WIN);
+      if (nearEnd) {
+        const alpha = Math.max(0, Math.min(1, (progressForFail - (1 - WIN)) / WIN));
+        failOverlay.opacity(alpha);
+      } else {
+        failOverlay.opacity(0);
+      }
+    } else {
+      failOverlay.opacity(0);
+    }
+  }
+
+  if (effectiveDrawProgress >= 1) {
     shaft.dashEnabled(false);
   } else {
     shaft.dashEnabled(true);
     shaft.dash([drawLength, totalLength + drawLength]);
-    shaft.dashOffset(drawLength * (1 - drawProgress));
+    shaft.dashOffset(drawLength * (1 - effectiveDrawProgress));
   }
 
   if (head && renderData) {
@@ -330,7 +678,7 @@ function applyLinkStateToId(layer, id, state, linkRenders, opts = {}) {
       // Hide arrow head entirely when following token timing
       head.opacity(0);
     } else {
-      const animatedHead = getAnimatedArrowHead(renderData, state.progress);
+      const animatedHead = getAnimatedArrowHead(renderData, effectiveDrawProgress);
       head.points(animatedHead.points);
       head.opacity(head.getAttr('showTip') ? animatedHead.opacity : 0);
     }
@@ -363,7 +711,7 @@ function applyLinkStateToId(layer, id, state, linkRenders, opts = {}) {
     }
 
     if (isBound) {
-      // When bound, token rides the drawing tip based on draw progress
+      // Bound: token rides the drawing tip based on draw progress only.
       if (drawProgress <= 0 || drawProgress > 1) {
         token.opacity(0);
       } else {
@@ -374,30 +722,155 @@ function applyLinkStateToId(layer, id, state, linkRenders, opts = {}) {
         if (tokenLabel) tokenLabel.text((web?.displayText ?? '') || '');
       }
     } else {
-      if (!isActive(web, timing)) {
-        token.opacity(0);
-      } else {
+      // Manual per-link token timing (independent of variables)
+      const manual = opts.manualTokenTimingById?.[sourceId] ?? opts.manualTokenTimingById?.[id] ?? null;
+      if (isActive(web, timing)) {
         const tokenProgress = (tNow - timing.start) / timing.duration;
         const { point } = getPointAtProgress(renderData, tokenProgress, true);
         token.x(point.x);
         token.y(point.y);
         token.opacity(1);
         if (tokenLabel) tokenLabel.text(web.displayText ?? '');
+      } else if (manual) {
+        // When the link participates in a scrolling area, suppress manual tokens until
+        // the first wrap after a reset. This prevents every manual token from firing
+        // immediately at timeline start; instead, each token replays once when its tile
+        // re-enters (on wrap), then stays hidden until the next wrap.
+        const isInScrollContext = (
+          state.scrollCycleIndex != null ||
+          state.scrollClip != null
+        );
+        const hasWrapRestart = manualElapsedAfterWrap != null;
+        const cycleElapsed = state.scrollCycleElapsed;
+        // A deterministic per-wrap period (engine-computed seconds between this band's
+        // wraps) is the export-safe signal. When it's known we drive the token from the
+        // engine's per-tile "seconds since this band's wrap" for BOTH seamless and
+        // non-seamless loops — the only difference between them is the re-entry fade
+        // (handled in the carried-wrap block above), not the token timing.
+        const hasCyclePeriod = manualCycleDuration != null && manualCycleDuration > 0.0001;
+        if (isInScrollContext && cycleElapsed != null && (state.scrollSeamless || hasCyclePeriod)) {
+          // Drive the token from the engine's deterministic per-band "seconds since this
+          // band's wrap" (`cycleElapsed`) instead of the frame-to-frame wrap event. The
+          // event never fires reliably in exported GIFs/PPTX (state is reset and only a
+          // single cycle is captured), which left looped tokens hidden or wrong on export.
+          // Because it's per-band, only the band that just wrapped launches its token.
+          const mStart = manual.start ?? 0;
+          // Replay the token as a SHORT pass ("dart") of its configured duration right
+          // after this band wraps, then hide it until the band wraps again — for both
+          // seamless and non-seamless loops. The window must stay near the per-tile
+          // spawn cadence: a full-cycle glide (≈0.9 × cyclePeriod) keeps almost every
+          // band's token on screen at once, so all but the about-to-wrap band appear lit
+          // ("all fire except the wrapping one"). The configured duration (which clamps
+          // to the cycle) keeps only the freshly-wrapped band visible at a time.
+          const mDur = getManualDuration(manual);
+          const manualTime = mStart + cycleElapsed;
+          let mp = cycleElapsed / mDur;
+          if (manual.invert === true) mp = 1 - mp;
+          if (absoluteTime >= mStart && mp >= 0 && mp <= 1) {
+            const { point } = getPointAtProgress(renderData, mp, true);
+            token.x(point.x);
+            token.y(point.y);
+            // Fade the token in as it appears on each wrap (over the first slice of the
+            // pass) instead of popping in solid. Driven by `cycleElapsed` (seconds since
+            // this band wrapped), so the fade is deterministic and identical in viewport
+            // and export.
+            const fadeDur = Math.min(0.18, mDur * 0.5);
+            token.opacity(clamp(cycleElapsed / Math.max(0.0001, fadeDur), 0, 1));
+            if (tokenLabel) {
+              tokenLabel.text(
+                getManualTokenTextAtTime(manual, manualTime).slice(0, manual.textMaxLength ?? 6)
+              );
+            }
+          } else {
+            token.opacity(0);
+            if (tokenLabel) tokenLabel.text('');
+          }
+        } else if (isInScrollContext && !hasWrapRestart) {
+          token.opacity(0);
+          // Also keep label hidden pre-wrap for consistency
+          if (tokenLabel) tokenLabel.text('');
+        } else {
+          const mStart = manual.start ?? -Infinity;
+          const mDur = getManualDuration(manual);
+          const manualTime = getManualTime(manual);
+          let mp = (manualTime - mStart) / mDur;
+          // Invert manual token flow if requested
+          if (manual.invert === true) mp = 1 - mp;
+          if (mp >= 0 && mp <= 1) {
+            const { point } = getPointAtProgress(renderData, mp, true);
+            token.x(point.x);
+            token.y(point.y);
+            token.opacity(1);
+            if (tokenLabel) {
+              tokenLabel.text(
+                getManualTokenTextAtTime(manual, manualTime).slice(0, manual.textMaxLength ?? 6)
+              );
+            }
+          } else {
+            token.opacity(0);
+          }
+        }
+      } else {
+        token.opacity(0);
       }
     }
   }
 
-  // Fail X: fades in as the drawing front crosses the midpoint (~50% progress)
+  // Fail X: a "broken link" marker drawn at the link midpoint. It must read as a
+  // state, not just a brief moment during playback — when a fail option is on, the
+  // X should be visible while paused, scrubbing, or stopped too, otherwise enabling
+  // the option looks like nothing happened. Position is always the current midpoint.
   const failMark = getCachedNode(layer, `#link-fail-${id}`);
   if (failMark) {
-    const xOpacity = state.progress < 0.42 ? 0 : Math.min(1, (state.progress - 0.42) / 0.2);
-    failMark.opacity(xOpacity);
+    const failAtEnds = !!opts.failAtEndsById?.[sourceId];
+    const tokenEndMode = !!opts.failOnTokenEndById?.[sourceId];
+    const isFailing = !!opts.failingById?.[sourceId];
+
+    const mid = renderData
+      ? (getPointAtProgress(renderData, 0.5, true)?.point ?? renderData.endPoint)
+      : null;
+    if (mid) { failMark.x(mid.x); failMark.y(mid.y); }
+
+    const setMark = (alpha) => {
+      const a = Math.max(0, Math.min(1, alpha));
+      failMark.opacity(a);
+      failMark.scaleX(0.9 + 0.1 * a);
+      failMark.scaleY(0.9 + 0.1 * a);
+    };
+
+    if (tokenEndMode && manualHasTiming && renderData) {
+      // Smooth fade/scale once the manual token finishes its run.
+      const TRANS = 0.25;
+      const endT = (manualTiming.start ?? -Infinity) + manualTimingDuration;
+      const mix = manualEndReached ? (manualTimingTime - endT) / TRANS : 0;
+      setMark(1 - Math.pow(1 - Math.max(0, Math.min(1, mix)), 3));
+    } else if (tokenEndMode && renderData) {
+      // Web/variable token (or no manual timing): reveal the X as the token
+      // reaches the end of the link, then keep it shown afterwards.
+      const TRANS_P = 0.12;
+      const past = progressForFail >= 1 ? 1 : (progressForFail - (1 - TRANS_P)) / TRANS_P;
+      setMark(1 - Math.pow(1 - Math.max(0, Math.min(1, past)), 3));
+    } else if (failAtEnds && renderData) {
+      // Reveal the X as the draw/token front reaches the end, then keep it shown.
+      const WIN = 0.08;
+      setMark(progressForFail >= 1 ? 1 : (progressForFail - (1 - WIN)) / WIN);
+    } else if (isFailing) {
+      // Static "failing" link: show the X once the link has drawn in.
+      const drawn = state.progress ?? 1;
+      setMark(drawn < 0.42 ? 0 : (drawn - 0.42) / 0.2);
+    } else {
+      failMark.opacity(0);
+    }
   }
 }
 
-function formatMonitorTemplate(template, web) {
-  const value = web?.variableValue || web?.variableName || '';
-  const name = web?.variableName || '';
+function formatMonitorTemplate(template, track, time, explicitValue) {
+  const value = explicitValue != null
+    ? explicitValue
+    : track?.textKeyframes
+      ? getManualTokenTextAtTime(track, time)
+      : (track?.variableValue || track?.variableName || '');
+  const name = track?.variableName || '';
   if (!template) return value;
   return template.replace(/\{value\}/g, value).replace(/\{name\}/g, name);
 }
@@ -406,23 +879,61 @@ function applyMonitorStates(layer, options, currentTime) {
   const monitors = options.monitors;
   if (!monitors || !monitors.length) return;
   const webs = options.webs ?? [];
+  const manualTracks = Object.values(options.manualTokenTimingById ?? {});
 
   for (const monitor of monitors) {
     const valueNode = getCachedNode(layer, `#monitor-value-${monitor.id}`);
     const nextNode = getCachedNode(layer, `#monitor-value-next-${monitor.id}`);
     if (!valueNode) continue;
-    const web = webs.find(w => w.sourceNodeId === monitor.variableNodeId);
-    const watches = monitor.monitorWatches ?? [];
+
+    // Morphs take precedence: when a monitor carries text morphs they script the
+    // displayed value and its color directly, independent of token arrivals. The
+    // body fill/stroke morphs are already applied via applyNodeStateToId.
+    const morphs = getNodeTextMorphs(monitor);
+    if (morphs.length) {
+      const timing = { start: 0, duration: 0.5 };
+      const baseValue = monitor.initialValue ?? '';
+      const textState = getTextMorphRenderState({ ...monitor, label: baseValue }, timing, currentTime);
+      const valueColor = resolveMonitorTextColor(monitor, morphs, currentTime);
+      valueNode.text(textState.baseText);
+      valueNode.opacity(textState.baseOpacity);
+      valueNode.fill(valueColor);
+      if (nextNode) {
+        nextNode.text(textState.overlayText);
+        nextNode.opacity(textState.overlayOpacity);
+        nextNode.fill(valueColor);
+      }
+      continue;
+    }
+
+    const track = webs.find(w => w.sourceNodeId === monitor.variableNodeId)
+      ?? manualTracks.find(item => item.sourceNodeId === monitor.variableNodeId);
+    const configuredWatches = monitor.monitorWatches ?? [];
+    const watches = configuredWatches.length > 0
+      ? configuredWatches
+      : track?.destinationNodeId
+        ? [{ id: 'implicit-destination', nodeId: track.destinationNodeId, template: '{value}' }]
+        : [];
     const initialValue = monitor.initialValue ?? '';
 
     // Determine the latest arrived watch (<= currentTime) and the immediate previous one
     let best = null;
     let prev = null;
-    if (web && watches.length) {
-      const arrivals = watches
-        .map(w => ({ w, at: web.arrivalAtNode?.[w.nodeId] }))
-        .filter(item => item.at != null)
-        .sort((a, b) => a.at - b.at);
+    if (track && watches.length) {
+      const template = watches[0]?.template ?? '{value}';
+      const arrivals = Array.isArray(track.monitorEvents)
+        ? track.monitorEvents
+            .map(event => ({
+              w: { id: event.id, template },
+              at: event.at,
+              value: event.value,
+            }))
+            .filter(item => item.at != null)
+            .sort((a, b) => a.at - b.at)
+        : watches
+            .map(w => ({ w, at: track.arrivalAtNode?.[w.nodeId] }))
+            .filter(item => item.at != null)
+            .sort((a, b) => a.at - b.at);
       for (const item of arrivals) {
         if (item.at <= currentTime) {
           if (!best || item.at >= best.at) {
@@ -435,8 +946,12 @@ function applyMonitorStates(layer, options, currentTime) {
       }
     }
 
-    const prevText = prev ? formatMonitorTemplate(prev.w.template, web) : initialValue;
-    const targetText = best ? formatMonitorTemplate(best.w.template, web) : initialValue;
+    const prevText = prev
+      ? formatMonitorTemplate(prev.w.template, track, prev.at, prev.value)
+      : initialValue;
+    const targetText = best
+      ? formatMonitorTemplate(best.w.template, track, best.at, best.value)
+      : initialValue;
 
     const FADE_DUR = 0.25;
     if (!best) {
@@ -482,19 +997,18 @@ function applyMonitorStates(layer, options, currentTime) {
 }
 
 export function applyAnimState(layer, animState, linkRenders, mirrorBindings = null, options = {}) {
+  const currentTime = options.currentTime ?? 0;
   for (const [id, state] of Object.entries(animState.nodeStates)) {
-    applyNodeStateToId(layer, id, state);
+    applyNodeStateToId(layer, id, state, currentTime);
     for (const mirrorId of mirrorBindings?.nodeIdsBySourceId?.[id] ?? []) {
-      applyNodeStateToId(layer, mirrorId, state);
+      applyNodeStateToId(layer, mirrorId, state, currentTime);
     }
 
     // Graph vectors (arrows) draw timing per node
     const vectorsGroup = getCachedNode(layer, `#graph-vectors-${id}`);
     if (vectorsGroup && typeof vectorsGroup.getChildren === 'function') {
       const tAbs = options.currentTime ?? 0;
-      const isChain = !!vectorsGroup.getAttr('gLocal');
-      const chainAnchor = (state.eventStart ?? 0) + (isChain ? (state.eventDuration ?? 0) : 0);
-      const tNow = tAbs - chainAnchor;
+      const tNow = tAbs;
       const children = vectorsGroup.getChildren() || [];
       for (const child of children) {
         const start = Number(child.getAttr('vStart')) || 0;
@@ -536,9 +1050,7 @@ export function applyAnimState(layer, animState, linkRenders, mirrorBindings = n
     const pointsGroup = getCachedNode(layer, `#graph-points-${id}`);
     if (pointsGroup && typeof pointsGroup.getChildren === 'function') {
       const tAbs = options.currentTime ?? 0;
-      const isChain = !!pointsGroup.getAttr('gLocal') || !!vectorsGroup?.getAttr('gLocal');
-      const chainAnchor = (state.eventStart ?? 0) + (isChain ? (state.eventDuration ?? 0) : 0);
-      const tNow = isChain ? (tAbs - chainAnchor) : tAbs; // chain starts after the graph node finishes its own entry
+      const tNow = tAbs;
       const isSeq = !!vectorsGroup?.getAttr('vSeq');
       let inboundEndByToId = null;
       if (isSeq && vectorsGroup && typeof vectorsGroup.getChildren === 'function') {
@@ -555,6 +1067,7 @@ export function applyAnimState(layer, animState, linkRenders, mirrorBindings = n
       }
       const children = pointsGroup.getChildren() || [];
       for (const child of children) {
+        if (child.getAttr('editorPreview')) continue;
         const ptId = child.getAttr('pId') || null;
         const startKF = Number(child.getAttr('pStart')) || 0;
         const durKF = Math.max(0.0001, Number(child.getAttr('pDur')) || 0.35);
@@ -565,19 +1078,72 @@ export function applyAnimState(layer, animState, linkRenders, mirrorBindings = n
         child.opacity(p);
       }
     }
+
+    // HKDF domain circles: fade each domain in from its startTime, and scatter the
+    // "calculate" dots inside it (each dot fades in at its own cStart/cDur).
+    const domainsGroup = getCachedNode(layer, `#graph-domains-${id}`);
+    if (domainsGroup && typeof domainsGroup.getChildren === 'function') {
+      const tNow = options.currentTime ?? 0;
+      for (const domGroup of domainsGroup.getChildren() || []) {
+        const start = Number(domGroup.getAttr('dStart')) || 0;
+        const dur = Math.max(0.0001, Number(domGroup.getAttr('dDur')) || 0.4);
+        domGroup.opacity(Math.max(0, Math.min(1, (tNow - start) / dur)));
+
+        // Time-aware override clip: a higher-priority domain only carves its hole
+        // out of this one once it has appeared. Until then this domain renders whole,
+        // so a domain whose appear keyframe comes later doesn't erase what's beneath it.
+        const overrides = domGroup.getAttr('overrideCircles');
+        if (Array.isArray(overrides) && overrides.length) {
+          const active = overrides.filter(o => tNow >= (Number(o.start) || 0));
+          const sig = active.map(o => `${o.sx},${o.sy},${o.rad}`).join('|');
+          if (sig !== domGroup.getAttr('clipSig')) {
+            domGroup.setAttr('clipSig', sig);
+            domGroup.clipFunc(active.length ? (ctx) => {
+              const BIG = 100000;
+              // Subtract each higher-priority circle by intersecting the clip with that
+              // circle's complement (rect-minus-circle). Composing one clip() per circle
+              // is correct for ANY number of overlaps — a single winding path leaks a
+              // lower domain through wherever 2+ higher circles overlap.
+              for (const o of active) {
+                ctx.beginPath();
+                ctx.rect(-BIG, -BIG, 2 * BIG, 2 * BIG);
+                ctx.arc(o.sx, o.sy, o.rad, 0, Math.PI * 2, true);
+                ctx.clip();
+              }
+              // Konva issues one final clip() after this; hand it a full-area path so it
+              // doesn't narrow the region we just built.
+              ctx.beginPath();
+              ctx.rect(-BIG, -BIG, 2 * BIG, 2 * BIG);
+            } : null);
+          }
+        } else if (domGroup.clipFunc()) {
+          domGroup.clipFunc(null);
+          domGroup.setAttr('clipSig', undefined);
+        }
+
+        const dotsGroup = typeof domGroup.findOne === 'function' ? domGroup.findOne('.calc-dots') : null;
+        if (dotsGroup && typeof dotsGroup.getChildren === 'function') {
+          for (const dot of dotsGroup.getChildren() || []) {
+            const cs = Number(dot.getAttr('cStart')) || 0;
+            const cd = Math.max(0.0001, Number(dot.getAttr('cDur')) || 0.2);
+            dot.opacity(Math.max(0, Math.min(1, (tNow - cs) / cd)));
+          }
+        }
+      }
+    }
   }
 
   for (const [id, state] of Object.entries(animState.linkStates)) {
     applyLinkStateToId(layer, id, state, linkRenders, options);
     for (const mirrorId of mirrorBindings?.linkIdsBySourceId?.[id] ?? []) {
-      applyLinkStateToId(layer, mirrorId, state, linkRenders, options);
+      applyLinkStateToId(layer, mirrorId, state, linkRenders, options, id);
     }
   }
 
   applyMonitorStates(layer, options, options.currentTime ?? 0);
 }
 
-function resetNodeById(layer, id) {
+function resetNodeById(layer, id, isFailing = false) {
   const group = getCachedNode(layer, `#node-${id}`);
   const label = getCachedNode(layer, `#node-label-${id}`);
   const morphLabel = getCachedNode(layer, `#node-label-morph-${id}`);
@@ -591,7 +1157,18 @@ function resetNodeById(layer, id) {
   group.scaleX(1);
   group.scaleY(1);
   group.setAttr('isPopupActive', false);
-  if (label) label.text(label.getAttr('baseText') ?? label.text());
+  // Undo any scrolling-area translation/clip so the node returns to its rest state.
+  const scrollBaseX = group.getAttr('scrollBaseX');
+  const scrollBaseY = group.getAttr('scrollBaseY');
+  if (scrollBaseX != null) group.x(scrollBaseX);
+  if (scrollBaseY != null) group.y(scrollBaseY);
+  group.setAttr('scrollPreviousX', undefined);
+  group.setAttr('scrollPreviousY', undefined);
+  group.setAttr('scrollPreviousTime', undefined);
+  group.setAttr('scrollFadeStartTime', undefined);
+  group.setAttr('scrollCycleIndex', undefined);
+  clearScrollClip(group);
+  if (label) label.text(getRenderedLabelText(label, label.getAttr('baseText') ?? label.text()));
   if (label) label.opacity(1);
   if (label) label.fill(label.getAttr('baseFill') ?? label.fill());
   if (morphLabel) {
@@ -606,8 +1183,6 @@ function resetNodeById(layer, id) {
     body.strokeWidth(body.getAttr('baseStrokeWidth') ?? body.strokeWidth());
   }
   if (highlight) highlight.opacity(1);
-  const shadowReset = getCachedNode(layer, `#node-shadow-${id}`);
-  if (shadowReset) shadowReset.opacity(1);
   const transformBodyReset = getCachedNode(layer, `#node-body-transform-${id}`);
   if (transformBodyReset) transformBodyReset.opacity(0);
   const transformHighlightReset = getCachedNode(layer, `#node-highlight-transform-${id}`);
@@ -624,7 +1199,23 @@ function resetNodeById(layer, id) {
   const pointsGroup = getCachedNode(layer, `#graph-points-${id}`);
   if (pointsGroup && typeof pointsGroup.getChildren === 'function') {
     for (const child of pointsGroup.getChildren()) {
+      if (child.getAttr('editorPreview')) continue;
       child.opacity(0);
+    }
+  }
+
+  const domainsGroupReset = getCachedNode(layer, `#graph-domains-${id}`);
+  if (domainsGroupReset && typeof domainsGroupReset.getChildren === 'function') {
+    for (const domGroup of domainsGroupReset.getChildren()) {
+      domGroup.opacity(0);
+      if (typeof domGroup.clipFunc === 'function' && domGroup.clipFunc()) {
+        domGroup.clipFunc(null);
+        domGroup.setAttr('clipSig', undefined);
+      }
+      const dotsGroup = typeof domGroup.findOne === 'function' ? domGroup.findOne('.calc-dots') : null;
+      if (dotsGroup && typeof dotsGroup.getChildren === 'function') {
+        for (const dot of dotsGroup.getChildren()) dot.opacity(0);
+      }
     }
   }
 
@@ -656,7 +1247,15 @@ function resetNodeById(layer, id) {
   }
 
   const failMark = getCachedNode(layer, `#node-fail-${id}`);
-  if (failMark) failMark.opacity(1);
+  if (failMark) {
+    failMark.opacity(isFailing ? 1 : 0);
+    failMark.scale({ x: 1, y: 1 });
+  }
+
+  const failTint = getCachedNode(layer, `#node-fail-tint-${id}`);
+  if (failTint) {
+    failTint.opacity(isFailing ? 1 : 0);
+  }
 
   // Area reset — restore rect to full dimensions and label to full opacity
   const areaRect = getCachedNode(layer, `#area-rect-${id}`);
@@ -668,11 +1267,27 @@ function resetNodeById(layer, id) {
   if (areaLabel) areaLabel.opacity(1);
 }
 
-function resetLinkById(layer, id) {
+function resetLinkById(layer, id, isFailing = false) {
   const shaft = getCachedNode(layer, `#link-shaft-${id}`);
   const head = getCachedNode(layer, `#link-head-${id}`);
   const token = getCachedNode(layer, `#link-token-${id}`);
   if (!shaft) return;
+
+  // Undo any scrolling-area translation/clip on the link's wrapping group.
+  const wrap = getCachedNode(layer, `#link-wrap-${id}`);
+  if (wrap && wrap.getAttr('scrollBaseX') != null) {
+    wrap.x(wrap.getAttr('scrollBaseX'));
+    wrap.y(wrap.getAttr('scrollBaseY'));
+    wrap.opacity(1);
+    wrap.setAttr('scrollPreviousX', undefined);
+    wrap.setAttr('scrollPreviousY', undefined);
+    wrap.setAttr('scrollPreviousTime', undefined);
+    wrap.setAttr('manualTokenRestartTime', undefined);
+    wrap.setAttr('manualTokenCycleDuration', undefined);
+    wrap.setAttr('scrollCycleIndex', undefined);
+    wrap.setAttr('scrollFadeStartTime', undefined);
+    clearScrollClip(wrap);
+  }
 
   shaft.dashEnabled(false);
   shaft.opacity(1);
@@ -682,26 +1297,38 @@ function resetLinkById(layer, id) {
   }
 
   const failMark = getCachedNode(layer, `#link-fail-${id}`);
-  if (failMark) failMark.opacity(1);
+  if (failMark) failMark.opacity(isFailing ? 1 : 0);
+  const failOverlay = getCachedNode(layer, `#link-shaft-fail-overlay-${id}`);
+  if (failOverlay) failOverlay.opacity(0);
   if (token) token.opacity(0);
 }
 
 export function resetAnimState(layer, nodes, links, mirrorBindings = null) {
   for (const node of nodes) {
-    resetNodeById(layer, node.id);
+    resetNodeById(layer, node.id, !!node.failing);
     for (const mirrorId of mirrorBindings?.nodeIdsBySourceId?.[node.id] ?? []) {
-      resetNodeById(layer, mirrorId);
+      resetNodeById(layer, mirrorId, !!node.failing);
     }
     if (node.type === 'monitor') {
       const valueNode = getCachedNode(layer, `#monitor-value-${node.id}`);
-      if (valueNode) valueNode.text(node.initialValue ?? '');
+      if (valueNode) {
+        valueNode.text(node.initialValue ?? '');
+        valueNode.opacity(1);
+        valueNode.fill(node.textColor);
+      }
+      const nextValueNode = getCachedNode(layer, `#monitor-value-next-${node.id}`);
+      if (nextValueNode) {
+        nextValueNode.text('');
+        nextValueNode.opacity(0);
+        nextValueNode.fill(node.textColor);
+      }
     }
   }
 
   for (const link of links) {
-    resetLinkById(layer, link.id);
+    resetLinkById(layer, link.id, !!link.failing);
     for (const mirrorId of mirrorBindings?.linkIdsBySourceId?.[link.id] ?? []) {
-      resetLinkById(layer, mirrorId);
+      resetLinkById(layer, mirrorId, !!link.failing);
     }
   }
 
