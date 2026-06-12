@@ -9,7 +9,24 @@ import { getTimelineCursor } from '../timelineCursor';
 import { getManualTokenLinkId } from '../animation/manualTokenTiming';
 import { normalizeNodeFailureKeyframes } from '../animation/nodeFailureTiming';
 import { buildLinkRenderData, getLinkParallelOffset } from '../links/linkGeometry';
-import { orthogonalizeJointPoint } from '../components/canvas/symmetryGuides';
+import { DEFAULT_ALIGNMENT_SETTINGS, orthogonalizeJointPoint } from '../components/canvas/alignmentEngine';
+
+// Alignment/snapping preferences persist across sessions (app-level, not
+// per-project — same model as Figma/draw.io).
+const ALIGNMENT_SETTINGS_KEY = 'echo-vis-alignment-settings';
+function loadAlignmentSettings() {
+  try {
+    const raw = localStorage.getItem(ALIGNMENT_SETTINGS_KEY);
+    if (!raw) return { ...DEFAULT_ALIGNMENT_SETTINGS };
+    return { ...DEFAULT_ALIGNMENT_SETTINGS, ...JSON.parse(raw) };
+  } catch {
+    return { ...DEFAULT_ALIGNMENT_SETTINGS };
+  }
+}
+
+// Arrow-key nudges arrive in bursts (key repeat); collapse a burst into one
+// undo step instead of one per keypress.
+let lastNudgeAt = 0;
 
 // Cross-tab clipboard for the Ctrl+B alignment ghost. localStorage is shared across
 // all tabs of the same origin, so a selection copied in one tab can be ghost-pasted in
@@ -792,11 +809,10 @@ const useStore = create((set, get) => ({
   isExporting: false,
   exportProgress: 0,
   exportStatus: '',
-  showGridLines: false,
-  showSymmetryLines: true,
-  snapToSymmetryLines: true,
-  snapToOrthogonal: true,
-  symmetryGuides: [],
+  // Alignment & snapping preferences (see DEFAULT_ALIGNMENT_SETTINGS).
+  alignment: loadAlignmentSettings(),
+  // Ephemeral guide lines drawn while a drag is snapped.
+  alignmentGuides: [],
 
   // Token appearance options (always-on; variables drive tokens automatically).
   simulateOptions: {
@@ -1766,11 +1782,35 @@ const useStore = create((set, get) => ({
   setLinkingFrom: (nodeId) => set({ linkingFrom: nodeId }),
   setContextMenu: (menu) => set({ contextMenu: menu }),
 
-  setShowGridLines: (value) => set({ showGridLines: value }),
-  setShowSymmetryLines: (value) => set({ showSymmetryLines: value }),
-  setSnapToSymmetryLines: (value) => set({ snapToSymmetryLines: value }),
-  setSnapToOrthogonal: (value) => set({ snapToOrthogonal: value }),
-  setSymmetryGuides: (guides) => set({ symmetryGuides: guides }),
+  setAlignment: (updates) => set(state => {
+    const alignment = { ...state.alignment, ...(updates ?? {}) };
+    try { localStorage.setItem(ALIGNMENT_SETTINGS_KEY, JSON.stringify(alignment)); } catch { /* quota/SSR */ }
+    return { alignment };
+  }),
+  setAlignmentGuides: (guides) => set({ alignmentGuides: guides }),
+
+  // Move the current selection by (dx, dy) — arrow-key nudging. Joints of
+  // links whose ends are both selected (or that are selected themselves)
+  // travel with the nodes, mirroring group-drag behaviour.
+  nudgeSelected: (dx, dy) => {
+    const state = get();
+    const ids = new Set([...(state.selectedIds ?? []), state.selectedId].filter(Boolean));
+    if (!ids.size) return false;
+    const nodeIds = new Set(state.nodes.filter(n => ids.has(n.id)).map(n => n.id));
+    if (!nodeIds.size) return false;
+    const now = Date.now();
+    if (now - lastNudgeAt > 900) get()._pushHistory();
+    lastNudgeAt = now;
+    set(s => ({
+      nodes: s.nodes.map(n => (nodeIds.has(n.id) ? { ...n, x: n.x + dx, y: n.y + dy } : n)),
+      links: s.links.map(link => {
+        const moveJoints = ids.has(link.id) || (nodeIds.has(link.fromId) && nodeIds.has(link.toId));
+        if (!moveJoints || !(link.joints?.length)) return link;
+        return { ...link, joints: link.joints.map(j => ({ ...j, x: j.x + dx, y: j.y + dy })) };
+      }),
+    }));
+    return true;
+  },
   setSimulateOptions: (updates) => set(state => ({ simulateOptions: { ...state.simulateOptions, ...(updates ?? {}) } })),
   updateNextLinkDefaults: (updates) =>
     set(state => ({

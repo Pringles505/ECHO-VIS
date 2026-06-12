@@ -7,7 +7,7 @@ import useStore from '../../store/useStore';
 import { getClosestNodeOutlinePosition, getNodeAnchorPoint } from '../../links/linkGeometry';
 import { getTimelineCursor } from '../../timelineCursor';
 import { getNodeDisplayText, getNodeTextFontFamily } from '../../text/equationText';
-import { collectGuideMatches, collectVisibleGuides, isSameGuideMatch, SNAP_DISTANCE, UNSNAP_DISTANCE } from './symmetryGuides';
+import { snapDraggedBox } from './dragSnap';
 import NodeStatusMark, { getNodeStatusDash, getNodeStatusStroke, getNodeStatusTextColor } from './NodeStatusMark';
 
 const PORT_R = 7;
@@ -296,11 +296,9 @@ function renderNodeBody(node, stroke, strokeWidth, isInSelection, fill, shadow =
 function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onEndLink, onRenameStart, onContextMenu, isLinking, onGroupDragStart, onGroupDragMove, renderEditorChrome = true }) {
   // Use individual selectors so NodeShape only re-renders when the specific values it needs change,
   // not on every node array update (which would cause O(n) re-renders per drag frame).
-  const updateNode        = useStore(state => state.updateNode);
-  const updateNodeAnchor  = useStore(state => state.updateNodeAnchor);
-  const showSymmetryLines = useStore(state => state.showSymmetryLines);
-  const snapToSymmetryLines = useStore(state => state.snapToSymmetryLines);
-  const setSymmetryGuides = useStore(state => state.setSymmetryGuides);
+  const updateNode         = useStore(state => state.updateNode);
+  const updateNodeAnchor   = useStore(state => state.updateNodeAnchor);
+  const setAlignmentGuides = useStore(state => state.setAlignmentGuides);
 
   // Targeted selector — only subscribes to the specific transform target node, not the whole array
   const transformTargetNodeId = node.transformMode === 'existing' ? node.transformTargetNodeId : null;
@@ -321,7 +319,6 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
   const popupTextRef = useRef(null);
   const popupBgRef = useRef(null);
   const popupTimerRef = useRef(null);
-  const dragSnapRef   = useRef(null);
   const dragStartPosRef = useRef(null);
   const dragWriteTimeRef = useRef(0);
   const graphResizeRef = useRef(null);
@@ -345,8 +342,7 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
   };
 
   const handleDragStart = (e) => {
-    dragSnapRef.current = null;
-    setSymmetryGuides([]);
+    setAlignmentGuides([]);
     e.cancelBubble = true;
     if (!isSelected && !isInSelection) {
       onSelect(false);
@@ -356,51 +352,17 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
   };
 
   const handleDragMove = (e) => {
-    let nextPos = {
+    const raw = {
+      id: node.id,
       x: e.target.x() - node.width / 2,
       y: e.target.y() - node.height / 2,
       width: node.width,
       height: node.height,
-      id: node.id,
     };
+    const { x, y, guides } = snapDraggedBox(raw, e, dragStartPosRef.current);
+    const nextPos = { x, y };
 
-    const canShowGuides = showSymmetryLines;
-    const canSnap = showSymmetryLines && snapToSymmetryLines;
-    // Read nodes on-demand during drag — avoids subscribing to the nodes array in render
-    const nodes = (canShowGuides || canSnap) ? useStore.getState().nodes : [];
-    let guideMatches = (canShowGuides || canSnap) ? collectGuideMatches(nextPos, nodes) : [];
-    let guideMatch = guideMatches[0] ?? null;
-
-    if (canSnap && dragSnapRef.current) {
-      const activeSnap = dragSnapRef.current;
-      const rawAxisValue = nextPos[activeSnap.axis];
-      if (Math.abs(rawAxisValue - activeSnap.snapPos) <= UNSNAP_DISTANCE) {
-        nextPos = { ...nextPos, [activeSnap.axis]: activeSnap.snapPos };
-        guideMatches = collectGuideMatches(nextPos, nodes);
-        guideMatch = guideMatches.find(match =>
-          isSameGuideMatch(match, activeSnap)
-        ) ?? activeSnap;
-        dragSnapRef.current = guideMatch;
-      } else {
-        dragSnapRef.current = null;
-      }
-    }
-
-    if (canSnap && !dragSnapRef.current && guideMatch && guideMatch.delta <= SNAP_DISTANCE) {
-      dragSnapRef.current = guideMatch;
-      nextPos = { ...nextPos, [guideMatch.axis]: guideMatch.snapPos };
-      guideMatches = collectGuideMatches(nextPos, nodes);
-      guideMatch = guideMatches.find(match =>
-        isSameGuideMatch(match, dragSnapRef.current)
-      ) ?? dragSnapRef.current;
-      dragSnapRef.current = guideMatch;
-    }
-
-    const visibleGuides = canShowGuides
-      ? collectVisibleGuides(guideMatches, dragSnapRef.current)
-      : [];
-
-    setSymmetryGuides(visibleGuides);
+    setAlignmentGuides(guides);
     applyDraggedPosition(e.target, nextPos);
 
     // The Konva group above tracks the pointer at full frame rate; the store
@@ -420,8 +382,7 @@ function NodeShape({ node, isSelected, isInSelection, onSelect, onStartLink, onE
   };
 
   const handleDragEnd = (e) => {
-    dragSnapRef.current = null;
-    setSymmetryGuides([]);
+    setAlignmentGuides([]);
     const x = e.target.x() - node.width  / 2;
     const y = e.target.y() - node.height / 2;
     updateNode(node.id, { x, y });

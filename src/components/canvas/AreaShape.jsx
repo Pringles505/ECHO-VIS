@@ -2,13 +2,14 @@ import React, { useRef, useState } from 'react';
 import { Circle, Group, Rect, Text } from 'react-konva';
 import { pageColors } from '../../colorThemes';
 import useStore from '../../store/useStore';
+import { snapDraggedBox } from './dragSnap';
 
 const MIN_W = 120;
 const MIN_H = 80;
 const HANDLE_R = 5;
 
 function AreaShape({ area, isSelected, isInSelection, onSelect, onContextMenu, onGroupDragStart, onGroupDragMove, renderEditorChrome = true }) {
-  const { updateNode } = useStore();
+  const { updateNode, setAlignmentGuides } = useStore();
   const [hovered, setHovered] = useState(false);
   const resizeRef = useRef(null);
   const dragStartPosRef = useRef(null);
@@ -87,6 +88,7 @@ function AreaShape({ area, isSelected, isInSelection, onSelect, onContextMenu, o
       draggable
       onDragStart={(e) => {
         e.cancelBubble = true;
+        setAlignmentGuides([]);
         if (!isSelected && !isInSelection) {
           onSelect(false);
         }
@@ -94,7 +96,12 @@ function AreaShape({ area, isSelected, isInSelection, onSelect, onContextMenu, o
         onGroupDragStart?.(area.id);
       }}
       onDragMove={(e) => {
-        updateNode(area.id, { x: e.target.x(), y: e.target.y() });
+        const raw = { id: area.id, x: e.target.x(), y: e.target.y(), width: area.width, height: area.height };
+        const { x, y, guides } = snapDraggedBox(raw, e, dragStartPosRef.current);
+        setAlignmentGuides(guides);
+        e.target.x(x);
+        e.target.y(y);
+        updateNode(area.id, { x, y });
         if (dragStartPosRef.current) {
           onGroupDragMove?.(
             area.id,
@@ -105,6 +112,7 @@ function AreaShape({ area, isSelected, isInSelection, onSelect, onContextMenu, o
       }}
       onDragEnd={(e) => {
         dragStartPosRef.current = null;
+        setAlignmentGuides([]);
         updateNode(area.id, { x: e.target.x(), y: e.target.y() });
       }}
       onClick={(e) => { e.cancelBubble = true; onSelect(e.evt?.shiftKey); }}

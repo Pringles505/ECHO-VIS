@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Layer, Line, Rect, Stage } from 'react-konva';
+import { Layer, Line, Rect, Stage, Text } from 'react-konva';
 import { v4 as uuid } from 'uuid';
 import { pageColors } from '../../colorThemes';
 import { AnimationEngine } from '../../animation/AnimationEngine';
@@ -20,15 +20,14 @@ import SubdiagramOverlay from '../SubdiagramOverlay';
 const MIN_SCALE = 0.15;
 const MAX_SCALE = 4;
 const TOP_BAR_H = 52;
-const GRID_SPACING = 72;
+// Major grid lines land every N minor cells (draw.io-style two-level grid).
+const GRID_MAJOR_EVERY = 4;
+// Hide minor lines when cells get too small on screen to stay readable.
+const GRID_MIN_CELL_PX = 13;
 
 const GRID_STYLE = {
   position: 'absolute',
   inset: 0,
-  backgroundImage: [
-    `linear-gradient(0deg, ${pageColors.canvasGridMajor} 0 1px, ${pageColors.transparent} 1px 100%)`,
-    `linear-gradient(90deg, ${pageColors.canvasGridMajor} 0 1px, ${pageColors.transparent} 1px 100%)`,
-  ].join(', '),
   pointerEvents: 'none',
   zIndex: 2,
 };
@@ -151,8 +150,9 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
     deleteSelected,
     alignNodes,
     distributeNodes,
-    showGridLines,
-    symmetryGuides,
+    nudgeSelected,
+    alignment,
+    alignmentGuides,
     pendingMorphEdit,
     setPendingMorphEdit,
     expandedSubdiagramId,
@@ -346,10 +346,21 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
 
       if (e.key === 'Delete' || e.key === 'Backspace') deleteSelected();
       if (e.key === 'Escape') setLinkingFrom(null);
+
+      // Arrow keys nudge the selection (Figma-style). With grid snapping on,
+      // nudges move by whole grid cells; Shift = bigger steps.
+      const arrows = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+      if (arrows[e.key]) {
+        const { alignment: align } = useStore.getState();
+        const base = align.snapToGrid && align.gridSize > 0 ? align.gridSize : 1;
+        const step = e.shiftKey ? base * (align.snapToGrid ? 4 : 10) : base;
+        const [dx, dy] = arrows[e.key];
+        if (nudgeSelected(dx * step, dy * step)) e.preventDefault();
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [deleteSelected, setLinkingFrom, undo, redo, copySelected, pasteClipboard, selectAll]);
+  }, [deleteSelected, setLinkingFrom, undo, redo, copySelected, pasteClipboard, selectAll, nudgeSelected]);
 
   const editingNode = useMemo(
     () => nodes.find(node => node.id === editingNodeId) ?? null,
@@ -500,22 +511,36 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
   useEffect(() => { dragNodesRef.current = dragNodes; }, [dragNodes]);
   useEffect(() => { linkNodesRef.current = allNodes; }, [allNodes]);
   const gridStyle = useMemo(() => {
-    const gridPx = Math.max(12, Math.round(GRID_SPACING * scale));
-    const offsetX = ((stagePos.x % gridPx) + gridPx) % gridPx;
-    const offsetY = ((stagePos.y % gridPx) + gridPx) % gridPx;
+    const cellPx = (alignment.gridSize > 0 ? alignment.gridSize : 24) * scale;
+    const majorPx = cellPx * GRID_MAJOR_EVERY;
+    const showMinor = cellPx >= GRID_MIN_CELL_PX;
+
+    const layers = [
+      { size: majorPx, color: pageColors.canvasGridMajor },
+      ...(showMinor ? [{ size: cellPx, color: pageColors.canvasGridMinor }] : []),
+    ];
+
+    const images = [];
+    const sizes = [];
+    const positions = [];
+    for (const layer of layers) {
+      const offsetX = ((stagePos.x % layer.size) + layer.size) % layer.size;
+      const offsetY = ((stagePos.y % layer.size) + layer.size) % layer.size;
+      images.push(
+        `linear-gradient(0deg, ${layer.color} 0 1px, ${pageColors.transparent} 1px 100%)`,
+        `linear-gradient(90deg, ${layer.color} 0 1px, ${pageColors.transparent} 1px 100%)`,
+      );
+      sizes.push(`${layer.size}px ${layer.size}px`, `${layer.size}px ${layer.size}px`);
+      positions.push(`0 ${offsetY}px`, `${offsetX}px 0`);
+    }
 
     return {
       ...GRID_STYLE,
-      backgroundSize: [
-        `${gridPx}px ${gridPx}px`,
-        `${gridPx}px ${gridPx}px`,
-      ].join(', '),
-      backgroundPosition: [
-        `0 ${offsetY}px`,
-        `${offsetX}px 0`,
-      ].join(', '),
+      backgroundImage: images.join(', '),
+      backgroundSize: sizes.join(', '),
+      backgroundPosition: positions.join(', '),
     };
-  }, [scale, stagePos.x, stagePos.y]);
+  }, [scale, stagePos.x, stagePos.y, alignment.gridSize]);
 
   useEffect(() => {
     if (!editingNode) return;
@@ -996,7 +1021,7 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
   return (
     <div ref={containerRef} onWheel={handleContainerWheel} style={{ flex: 1, position: 'relative', overflow: 'hidden', background: CANVAS_BASE, cursor: linkingFrom ? 'crosshair' : 'default' }}>
       <div style={CANVAS_TEXTURE_STYLE} />
-      {showGridLines && <div style={gridStyle} />}
+      {alignment.showGrid && <div style={gridStyle} />}
 
       {!isExporting && selectedNodeIds.length >= 2 && (
         <AlignmentToolbar
@@ -1135,17 +1160,30 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
               );
             })}
 
-          {/* Draw symmetry guides and selection box BEFORE aura cutouts so they are also cleared */}
-          {!isExporting && symmetryGuides.map((guide, idx) => (
-            <Line
-              key={guide.id ?? idx}
-              points={guide.points}
-              stroke={guide.stroke ?? pageColors.warningMain}
-              strokeWidth={guide.strokeWidth ?? 1.5}
-              dash={guide.dash ?? [6, 6]}
-              opacity={guide.opacity ?? 0.95}
-              listening={false}
-            />
+          {/* Draw alignment guides and selection box BEFORE aura cutouts so they are also cleared.
+              Stroke widths / dashes / labels divide by scale so guides stay 1px on screen at any zoom. */}
+          {!isExporting && alignmentGuides.map((guide, idx) => (
+            <React.Fragment key={guide.id ?? idx}>
+              <Line
+                points={guide.points}
+                stroke={guide.stroke ?? pageColors.warningMain}
+                strokeWidth={(guide.strokeWidth ?? 1) / scale}
+                dash={guide.dash ? guide.dash.map(d => d / scale) : undefined}
+                opacity={guide.opacity ?? 0.95}
+                listening={false}
+              />
+              {guide.label && (
+                <Text
+                  x={guide.label.x}
+                  y={guide.label.y}
+                  text={guide.label.text}
+                  fontSize={11 / scale}
+                  fontStyle="600"
+                  fill={guide.stroke ?? pageColors.warningMain}
+                  listening={false}
+                />
+              )}
+            </React.Fragment>
           ))}
 
           {!isExporting && selectionBox && (() => {

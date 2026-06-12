@@ -3,7 +3,7 @@ import { Circle, Ellipse, Group, Line, Path, Rect, Text } from 'react-konva';
 import { pageColors } from '../../colorThemes';
 import { getNodeLabelFrame } from '../../nodeLabelFrame';
 import useStore from '../../store/useStore';
-import { collectGuideMatches, collectVisibleGuides, isSameGuideMatch, SNAP_DISTANCE, UNSNAP_DISTANCE } from './symmetryGuides';
+import { snapDraggedBox } from './dragSnap';
 import NodeStatusMark, { getNodeStatusDash, getNodeStatusStroke, getNodeStatusTextColor } from './NodeStatusMark';
 
 const PORT_R = 7;
@@ -185,12 +185,9 @@ function SubdiagramShape({
 }) {
   const {
     updateNode,
-    showSymmetryLines,
-    snapToSymmetryLines,
-    setSymmetryGuides,
+    setAlignmentGuides,
   } = useStore();
   const [hovered, setHovered] = useState(false);
-  const dragSnapRef = useRef(null);
   const dragStartPosRef = useRef(null);
   const transformTargetNodeId = node.transformMode === 'existing' ? node.transformTargetNodeId : null;
   const transformTargetNode = useStore(state =>
@@ -231,56 +228,25 @@ function SubdiagramShape({
   };
 
   const handleDragStart = (e) => {
-    dragSnapRef.current = null;
     e.cancelBubble = true;
     if (!isSelected && !isInSelection) onSelect(false);
-    setSymmetryGuides?.([]);
+    setAlignmentGuides?.([]);
     dragStartPosRef.current = { x: node.x, y: node.y };
     onGroupDragStart?.(node.id);
   };
 
   const handleDragMove = (e) => {
-    let nextPos = {
+    const raw = {
+      id: node.id,
       x: e.target.x() - w / 2,
       y: e.target.y() - h / 2,
       width: w,
       height: h,
-      id: node.id,
     };
+    const { x, y, guides } = snapDraggedBox(raw, e, dragStartPosRef.current);
+    const nextPos = { x, y };
 
-    const canShowGuides = showSymmetryLines;
-    const canSnap = showSymmetryLines && snapToSymmetryLines;
-    // Read nodes on-demand during drag — avoids subscribing to the nodes array in render
-    const currentNodes = (canShowGuides || canSnap) ? useStore.getState().nodes : [];
-    let guideMatches = (canShowGuides || canSnap) ? collectGuideMatches(nextPos, currentNodes) : [];
-    let guideMatch = guideMatches[0] ?? null;
-
-    if (canSnap && dragSnapRef.current) {
-      const activeSnap = dragSnapRef.current;
-      const rawAxisValue = nextPos[activeSnap.axis];
-      if (Math.abs(rawAxisValue - activeSnap.snapPos) <= UNSNAP_DISTANCE) {
-        nextPos = { ...nextPos, [activeSnap.axis]: activeSnap.snapPos };
-        guideMatches = collectGuideMatches(nextPos, nodes);
-        guideMatch = guideMatches.find(match => isSameGuideMatch(match, activeSnap)) ?? activeSnap;
-        dragSnapRef.current = guideMatch;
-      } else {
-        dragSnapRef.current = null;
-      }
-    }
-
-    if (canSnap && !dragSnapRef.current && guideMatch && guideMatch.delta <= SNAP_DISTANCE) {
-      dragSnapRef.current = guideMatch;
-      nextPos = { ...nextPos, [guideMatch.axis]: guideMatch.snapPos };
-      guideMatches = collectGuideMatches(nextPos, nodes);
-      guideMatch = guideMatches.find(match => isSameGuideMatch(match, dragSnapRef.current)) ?? dragSnapRef.current;
-      dragSnapRef.current = guideMatch;
-    }
-
-    const visibleGuides = canShowGuides
-      ? collectVisibleGuides(guideMatches, dragSnapRef.current)
-      : [];
-
-    setSymmetryGuides(visibleGuides);
+    setAlignmentGuides(guides);
     applyDraggedPosition(e.target, nextPos);
     updateNode(node.id, { x: nextPos.x, y: nextPos.y });
 
@@ -290,8 +256,7 @@ function SubdiagramShape({
   };
 
   const handleDragEnd = (e) => {
-    dragSnapRef.current = null;
-    setSymmetryGuides([]);
+    setAlignmentGuides([]);
     dragStartPosRef.current = null;
     updateNode(node.id, {
       x: e.target.x() - w / 2,

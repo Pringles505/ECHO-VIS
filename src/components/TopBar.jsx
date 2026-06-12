@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import useStore from '../store/useStore';
 import { exportGifPackageZip } from '../export/GifPackageExporter';
 import {
@@ -47,10 +47,7 @@ function TopBar({ stageRef, layerRef, onGoHome }) {
     activeProject, renameActiveProject, setActiveProject, loadProjectData,
     isExporting, exportProgress, exportStatus,
     setExporting, setExportProgress, setExportStatus,
-    showGridLines, setShowGridLines,
-    showSymmetryLines, setShowSymmetryLines,
-    snapToSymmetryLines, setSnapToSymmetryLines,
-    snapToOrthogonal, setSnapToOrthogonal,
+    alignment, setAlignment,
   } = useStore();
 
   const fileInputRef   = useRef(null);
@@ -353,26 +350,11 @@ function TopBar({ stageRef, layerRef, onGoHome }) {
       {!isExporting && (
         <>
           <ToggleChip
-            label="Grid lines"
-            enabled={showGridLines}
-            onToggle={() => setShowGridLines(!showGridLines)}
+            label="Snap"
+            enabled={alignment.snapEnabled}
+            onToggle={() => setAlignment({ snapEnabled: !alignment.snapEnabled })}
           />
-          <ToggleChip
-            label="Symmetry lines"
-            enabled={showSymmetryLines}
-            onToggle={() => setShowSymmetryLines(!showSymmetryLines)}
-          />
-          <ToggleChip
-            label="Snap to symmetry"
-            enabled={snapToSymmetryLines}
-            disabled={!showSymmetryLines}
-            onToggle={() => setSnapToSymmetryLines(!snapToSymmetryLines)}
-          />
-          <ToggleChip
-            label="Snap 90°"
-            enabled={snapToOrthogonal}
-            onToggle={() => setSnapToOrthogonal(!snapToOrthogonal)}
-          />
+          <SnapSettingsMenu alignment={alignment} setAlignment={setAlignment} />
         </>
       )}
 
@@ -607,6 +589,128 @@ function Select({ value, onChange, options, suffix = '', title = '' }) {
         position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)',
         color: 'var(--text-dim)', fontSize: 9, pointerEvents: 'none',
       }}>▼</span>
+    </div>
+  );
+}
+
+// Figma/draw.io-style snapping preferences, tucked behind a compact popover so
+// the top bar stays clean. The master "Snap" chip lives next to the trigger.
+function SnapSettingsMenu({ alignment, setAlignment }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onDown = (e) => {
+      if (rootRef.current && !rootRef.current.contains(e.target)) setOpen(false);
+    };
+    window.addEventListener('mousedown', onDown);
+    return () => window.removeEventListener('mousedown', onDown);
+  }, [open]);
+
+  const Row = ({ label, settingKey, disabled = false }) => (
+    <label
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 18,
+        padding: '5px 6px',
+        borderRadius: 6,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.4 : 1,
+        fontSize: 12,
+        color: 'var(--text-main)',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      <span>{label}</span>
+      <input
+        type="checkbox"
+        checked={!!alignment[settingKey]}
+        disabled={disabled}
+        onChange={() => setAlignment({ [settingKey]: !alignment[settingKey] })}
+        style={{ accentColor: 'var(--purple-bright)', cursor: disabled ? 'not-allowed' : 'pointer' }}
+      />
+    </label>
+  );
+
+  return (
+    <div ref={rootRef} style={{ position: 'relative' }}>
+      <button
+        onClick={() => setOpen(o => !o)}
+        title="Snapping & grid settings"
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+          background: open ? 'var(--purple-surface-soft)' : 'var(--panel-bg)',
+          border: `1px solid ${open ? 'var(--purple-border-soft)' : 'var(--border-strong)'}`,
+          borderRadius: 999,
+          color: 'var(--text-muted)',
+          padding: '5px 10px',
+          fontSize: 12,
+          cursor: 'pointer',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        <span>Snap settings</span>
+        <span style={{ fontSize: 9 }}>▼</span>
+      </button>
+
+      {open && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 'calc(100% + 8px)',
+            right: 0,
+            width: 224,
+            padding: '8px 8px 6px',
+            background: 'linear-gradient(180deg, var(--panel-bg-2), var(--panel-bg))',
+            border: '1px solid var(--border-strong)',
+            borderRadius: 10,
+            boxShadow: '0 10px 30px var(--menu-shadow)',
+            zIndex: 300,
+          }}
+        >
+          <Row label="Snap to objects" settingKey="snapToObjects" disabled={!alignment.snapEnabled} />
+          <Row label="Equal-spacing snap" settingKey="snapSpacing" disabled={!alignment.snapEnabled || !alignment.snapToObjects} />
+          <Row label="Snap links to 90°" settingKey="snapOrthogonal" disabled={!alignment.snapEnabled} />
+          <Row label="Show guide lines" settingKey="showGuides" disabled={!alignment.snapEnabled} />
+
+          <div style={{ height: 1, background: 'var(--border-strong)', margin: '6px 2px' }} />
+
+          <Row label="Show grid" settingKey="showGrid" />
+          <Row label="Snap to grid" settingKey="snapToGrid" disabled={!alignment.snapEnabled} />
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 18,
+              padding: '5px 6px',
+              fontSize: 12,
+              color: 'var(--text-main)',
+            }}
+          >
+            <span>Grid size</span>
+            <Select
+              value={String(alignment.gridSize)}
+              onChange={(v) => setAlignment({ gridSize: Number(v) })}
+              options={['8', '12', '16', '24', '36', '48', '72']}
+              suffix="px"
+            />
+          </div>
+
+          <div style={{ height: 1, background: 'var(--border-strong)', margin: '6px 2px' }} />
+
+          <div style={{ padding: '4px 6px 2px', fontSize: 10.5, lineHeight: 1.5, color: 'var(--text-dim)' }}>
+            Alt — pause snapping while dragging<br />
+            Shift — constrain drag to one axis<br />
+            Arrows — nudge selection
+          </div>
+        </div>
+      )}
     </div>
   );
 }

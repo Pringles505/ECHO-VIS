@@ -5,16 +5,13 @@ import { buildLinkRenderData, getLinkParallelOffset, getNodeAnchorCandidates, JO
 import useStore from '../../store/useStore';
 import { buildWebByLinkId, computeVariableWebs } from '../../variables/flow';
 import { getManualTokenBaseText, normalizeManualTokenTextKeyframes } from '../../animation/manualTokenTiming';
-import { collectGuideMatches, collectVisibleGuides, isSameGuideMatch, resolveOrthogonalSnap, SNAP_DISTANCE, UNSNAP_DISTANCE } from './symmetryGuides';
+import { resolveJointSnap } from './alignmentEngine';
 import LinkFailureMark from './LinkFailureMark';
 
 const END_HANDLE_RADIUS = 7;
 const ANCHOR_PAD = 12;
 
 const SIDE_CENTER_SNAP = 10;
-const GRID_SPACING = 72;
-const GRID_SNAP_DISTANCE = 10;
-const GRID_UNSNAP_DISTANCE = 18;
 
 function resolveAnchor(cursor, anchors, node) {
   let best = null;
@@ -43,15 +40,6 @@ function resolveAnchor(cursor, anchors, node) {
   return { side, along, point, centered: along === 0 };
 }
 
-function getGridSnappedPoint(point) {
-  const snapX = Math.round(point.x / GRID_SPACING) * GRID_SPACING;
-  const snapY = Math.round(point.y / GRID_SPACING) * GRID_SPACING;
-  return {
-    x: Math.abs(point.x - snapX) <= GRID_SNAP_DISTANCE ? snapX : point.x,
-    y: Math.abs(point.y - snapY) <= GRID_SNAP_DISTANCE ? snapY : point.y,
-  };
-}
-
 function LinkShape({
   link,
   allLinks,
@@ -77,11 +65,8 @@ function LinkShape({
 }) {
   const {
     nodes,
-    showGridLines,
-    showSymmetryLines,
-    snapToSymmetryLines,
-    snapToOrthogonal,
-    setSymmetryGuides,
+    alignment,
+    setAlignmentGuides,
   } = useStore();
   const render = buildLinkRenderData(link, fromNode, toNode, allLinks, nodes);
   const renderJointMap = Object.fromEntries(render.jointRenderPoints.map(joint => [joint.id, joint]));
@@ -99,10 +84,6 @@ function LinkShape({
   const [draggedEndPoint, setDraggedEndPoint] = useState(null);
   const startHandlePoint = draggedStartPoint ?? render.startPoint;
   const endHandlePoint = draggedEndPoint ?? render.endPoint;
-  const jointSnapRef = useRef(null);
-  const jointGridSnapRef = useRef(null);
-  const jointOrthoSnapRef = useRef({ x: null, y: null });
-
   // Neighbour route points (in render space) on either side of a joint, used
   // for orthogonal/90° snapping while dragging.
   const getJointNeighbors = (jointId) => {
@@ -407,134 +388,33 @@ function LinkShape({
             draggable
             onDragStart={(e) => {
               e.cancelBubble = true;
-              jointSnapRef.current = null;
-              jointGridSnapRef.current = null;
-              jointOrthoSnapRef.current = { x: null, y: null };
-              setSymmetryGuides([]);
+              setAlignmentGuides([]);
               onJointDragStart(joint.id);
             }}
             onDragMove={(e) => {
               e.cancelBubble = true;
-              let nextPoint = { x: e.target.x(), y: e.target.y(), width: 0, height: 0, id: `joint-${joint.id}` };
-              const canShowGuides = showSymmetryLines;
-              const canSnap = showSymmetryLines && snapToSymmetryLines;
-
-              // --- Orthogonal (90°) snapping: highest priority, per axis ---
-              let orthoGuides = [];
-              const orthoPinned = { x: false, y: false };
-              if (snapToOrthogonal) {
-                const ortho = resolveOrthogonalSnap(nextPoint, getJointNeighbors(joint.id), jointOrthoSnapRef.current);
-                jointOrthoSnapRef.current = ortho.state;
-                nextPoint = { ...nextPoint, x: ortho.point.x, y: ortho.point.y };
-                orthoGuides = ortho.guides;
-                orthoPinned.x = ortho.state.x != null;
-                orthoPinned.y = ortho.state.y != null;
-              } else {
-                jointOrthoSnapRef.current = { x: null, y: null };
-              }
-
-              let guideMatches = (canShowGuides || canSnap) ? collectGuideMatches(nextPoint, nodes) : [];
-              let guideMatch = guideMatches[0] ?? null;
-              // Don't let symmetry override an axis already pinned to 90°.
-              if (guideMatch && orthoPinned[guideMatch.axis]) {
-                guideMatch = guideMatches.find(match => !orthoPinned[match.axis]) ?? null;
-              }
-
-              // Release a symmetry snap whose axis is now pinned to 90°.
-              if (jointSnapRef.current && orthoPinned[jointSnapRef.current.axis]) {
-                jointSnapRef.current = null;
-              }
-
-              if (canSnap && jointSnapRef.current) {
-                const activeSnap = jointSnapRef.current;
-                const rawAxisValue = nextPoint[activeSnap.axis];
-                if (Math.abs(rawAxisValue - activeSnap.snapPos) <= UNSNAP_DISTANCE) {
-                  nextPoint = { ...nextPoint, [activeSnap.axis]: activeSnap.snapPos };
-                  guideMatches = collectGuideMatches(nextPoint, nodes);
-                  guideMatch = guideMatches.find(match =>
-                    isSameGuideMatch(match, activeSnap)
-                  ) ?? activeSnap;
-                  jointSnapRef.current = guideMatch;
-                } else {
-                  jointSnapRef.current = null;
+              const { x, y, guides } = resolveJointSnap(
+                { x: e.target.x(), y: e.target.y() },
+                {
+                  neighbors: getJointNeighbors(joint.id),
+                  nodes,
+                  settings: alignment,
+                  scale: e.target.getStage()?.scaleX() ?? 1,
+                  disableSnap: !!e.evt?.altKey,
                 }
-              }
+              );
 
-              if (canSnap && !jointSnapRef.current && guideMatch && guideMatch.delta <= SNAP_DISTANCE) {
-                jointSnapRef.current = guideMatch;
-                nextPoint = { ...nextPoint, [guideMatch.axis]: guideMatch.snapPos };
-                guideMatches = collectGuideMatches(nextPoint, nodes);
-                guideMatch = guideMatches.find(match =>
-                  isSameGuideMatch(match, jointSnapRef.current)
-                ) ?? jointSnapRef.current;
-                jointSnapRef.current = guideMatch;
-              }
-
-              if (!jointSnapRef.current && showGridLines) {
-                const rawGridX = Math.round(nextPoint.x / GRID_SPACING) * GRID_SPACING;
-                const rawGridY = Math.round(nextPoint.y / GRID_SPACING) * GRID_SPACING;
-
-                if (jointGridSnapRef.current) {
-                  const activeGridSnap = jointGridSnapRef.current;
-                  const keepX = activeGridSnap.x != null && Math.abs(nextPoint.x - activeGridSnap.x) <= GRID_UNSNAP_DISTANCE;
-                  const keepY = activeGridSnap.y != null && Math.abs(nextPoint.y - activeGridSnap.y) <= GRID_UNSNAP_DISTANCE;
-                  jointGridSnapRef.current = {
-                    x: keepX ? activeGridSnap.x : null,
-                    y: keepY ? activeGridSnap.y : null,
-                  };
-                  if (!keepX && !keepY) {
-                    jointGridSnapRef.current = null;
-                  }
-                }
-
-                if (!jointGridSnapRef.current) {
-                  jointGridSnapRef.current = {
-                    x: Math.abs(nextPoint.x - rawGridX) <= GRID_SNAP_DISTANCE ? rawGridX : null,
-                    y: Math.abs(nextPoint.y - rawGridY) <= GRID_SNAP_DISTANCE ? rawGridY : null,
-                  };
-                  if (jointGridSnapRef.current.x == null && jointGridSnapRef.current.y == null) {
-                    jointGridSnapRef.current = null;
-                  }
-                }
-
-                if (jointGridSnapRef.current) {
-                  nextPoint = {
-                    ...nextPoint,
-                    // Never let the grid move an axis already pinned to 90°.
-                    x: orthoPinned.x ? nextPoint.x : (jointGridSnapRef.current.x ?? nextPoint.x),
-                    y: orthoPinned.y ? nextPoint.y : (jointGridSnapRef.current.y ?? nextPoint.y),
-                  };
-                } else {
-                  const gridSnapped = getGridSnappedPoint(nextPoint);
-                  nextPoint = {
-                    ...nextPoint,
-                    x: orthoPinned.x ? nextPoint.x : gridSnapped.x,
-                    y: orthoPinned.y ? nextPoint.y : gridSnapped.y,
-                  };
-                }
-              } else {
-                jointGridSnapRef.current = null;
-              }
-
-              const visibleGuides = [
-                ...orthoGuides,
-                ...(canShowGuides ? collectVisibleGuides(guideMatches, jointSnapRef.current) : []),
-              ];
-
-              setSymmetryGuides(visibleGuides);
-              e.target.x(nextPoint.x);
-              e.target.y(nextPoint.y);
+              setAlignmentGuides(guides);
+              e.target.x(x);
+              e.target.y(y);
               onJointDragMove(joint.id, {
-                x: nextPoint.x - parallelOffset.x,
-                y: nextPoint.y - parallelOffset.y,
+                x: x - parallelOffset.x,
+                y: y - parallelOffset.y,
               });
             }}
             onDragEnd={(e) => {
               e.cancelBubble = true;
-              jointSnapRef.current = null;
-              jointGridSnapRef.current = null;
-              jointOrthoSnapRef.current = { x: null, y: null };
-              setSymmetryGuides([]);
+              setAlignmentGuides([]);
               onJointDragEnd(joint.id, {
                 x: e.target.x() - parallelOffset.x,
                 y: e.target.y() - parallelOffset.y,

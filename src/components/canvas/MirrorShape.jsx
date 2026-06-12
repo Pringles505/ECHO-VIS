@@ -5,7 +5,7 @@ import { getNodeLabelFrame } from '../../nodeLabelFrame';
 import useStore from '../../store/useStore';
 import { getSourceCenterFromMirrorPoint } from '../../mirror/mirrorData';
 import { getNodeDisplayText, getNodeTextFontFamily } from '../../text/equationText';
-import { collectGuideMatches, collectVisibleGuides, isSameGuideMatch, SNAP_DISTANCE, UNSNAP_DISTANCE } from './symmetryGuides';
+import { snapDraggedBox } from './dragSnap';
 import NodeStatusMark, { getNodeStatusDash, getNodeStatusStroke, getNodeStatusTextColor } from './NodeStatusMark';
 import LinkFailureMark from './LinkFailureMark';
 
@@ -325,21 +325,16 @@ function MirrorShape({
   renderEditorChrome = true,
 }) {
   const {
-    nodes,
     updateNode,
-    showSymmetryLines,
-    snapToSymmetryLines,
-    setSymmetryGuides,
+    setAlignmentGuides,
   } = useStore();
-  const dragSnapRef = useRef(null);
   const dragStartPosRef = useRef(null);
 
   const frameWidth = binding.frameWidth ?? mirror.width;
   const frameHeight = binding.frameHeight ?? mirror.height;
 
   const handleDragStart = (e) => {
-    dragSnapRef.current = null;
-    setSymmetryGuides([]);
+    setAlignmentGuides([]);
     e.cancelBubble = true;
     if (!isSelected && !isInSelection) {
       onSelect(false);
@@ -349,41 +344,17 @@ function MirrorShape({
   };
 
   const handleDragMove = (e) => {
-    let nextPos = {
+    const raw = {
+      id: mirror.id,
       x: e.target.x() - frameWidth / 2,
       y: e.target.y() - frameHeight / 2,
       width: frameWidth,
       height: frameHeight,
-      id: mirror.id,
     };
+    const { x, y, guides } = snapDraggedBox(raw, e, dragStartPosRef.current);
+    const nextPos = { x, y };
 
-    const canShowGuides = showSymmetryLines;
-    const canSnap = showSymmetryLines && snapToSymmetryLines;
-    let guideMatches = (canShowGuides || canSnap) ? collectGuideMatches(nextPos, nodes) : [];
-    let guideMatch = guideMatches[0] ?? null;
-
-    if (canSnap && dragSnapRef.current) {
-      const activeSnap = dragSnapRef.current;
-      const rawAxisValue = nextPos[activeSnap.axis];
-      if (Math.abs(rawAxisValue - activeSnap.snapPos) <= UNSNAP_DISTANCE) {
-        nextPos = { ...nextPos, [activeSnap.axis]: activeSnap.snapPos };
-        guideMatches = collectGuideMatches(nextPos, nodes);
-        guideMatch = guideMatches.find(match => isSameGuideMatch(match, activeSnap)) ?? activeSnap;
-        dragSnapRef.current = guideMatch;
-      } else {
-        dragSnapRef.current = null;
-      }
-    }
-
-    if (canSnap && !dragSnapRef.current && guideMatch && guideMatch.delta <= SNAP_DISTANCE) {
-      dragSnapRef.current = guideMatch;
-      nextPos = { ...nextPos, [guideMatch.axis]: guideMatch.snapPos };
-      guideMatches = collectGuideMatches(nextPos, nodes);
-      guideMatch = guideMatches.find(match => isSameGuideMatch(match, dragSnapRef.current)) ?? dragSnapRef.current;
-      dragSnapRef.current = guideMatch;
-    }
-
-    setSymmetryGuides(canShowGuides ? collectVisibleGuides(guideMatches, dragSnapRef.current) : []);
+    setAlignmentGuides(guides);
     e.target.x(nextPos.x + frameWidth / 2);
     e.target.y(nextPos.y + frameHeight / 2);
     updateNode(mirror.id, { x: nextPos.x, y: nextPos.y });
@@ -394,8 +365,7 @@ function MirrorShape({
   };
 
   const handleDragEnd = (e) => {
-    dragSnapRef.current = null;
-    setSymmetryGuides([]);
+    setAlignmentGuides([]);
     updateNode(mirror.id, {
       x: e.target.x() - frameWidth / 2,
       y: e.target.y() - frameHeight / 2,
