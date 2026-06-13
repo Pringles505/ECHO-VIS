@@ -7,7 +7,7 @@ import useStore from '../store/useStore';
 import { buildWebByLinkId } from '../variables/flow';
 
 export function usePlayback({ layerRef }) {
-  const { nodes, links } = useStore();
+  const { nodes, links, alignment } = useStore();
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -111,6 +111,7 @@ export function usePlayback({ layerRef }) {
         webByLinkId: webByLinkIdRef.current,
         monitors: monitorsRef.current,
         currentTime: t,
+        showGhostNodes: alignment?.showGhostNodes ?? false,
         timelineStart,
         bindToTokenHopById,
         bindMetaById,

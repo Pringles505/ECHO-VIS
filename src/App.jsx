@@ -167,7 +167,7 @@ function App() {
     return (
       <div style={{
         width: '100vw', height: '100vh', overflow: 'hidden',
-        background: '#07070f',
+        background: '#04081A',
         position: 'relative',
         display: 'flex', alignItems: 'stretch',
       }}>
@@ -193,7 +193,7 @@ function App() {
           transition: 'opacity 0.3s',
           pointerEvents: 'none',
         }}>
-          <span style={{ fontSize: 9, letterSpacing: '0.18em', color: '#a78bfa', textTransform: 'uppercase', fontWeight: 700 }}>
+          <span style={{ fontSize: 9, letterSpacing: '0.18em', color: '#60A5FA', textTransform: 'uppercase', fontWeight: 700 }}>
             ▲ controls
           </span>
         </div>
@@ -281,7 +281,7 @@ function PreviewIndicator({ side }) {
         width: 5,
         height: 5,
         borderRadius: '50%',
-        background: '#a78bfa',
+        background: '#60A5FA',
         boxShadow: '0 0 6px #a78bfa',
         flexShrink: 0,
       }} />
@@ -289,7 +289,7 @@ function PreviewIndicator({ side }) {
         <span style={{
           fontSize: 8,
           letterSpacing: '0.2em',
-          color: '#a78bfa',
+          color: '#60A5FA',
           fontWeight: 700,
           textTransform: 'uppercase',
         }}>

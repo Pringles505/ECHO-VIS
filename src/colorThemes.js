@@ -18,14 +18,14 @@ export function withAlpha(hex, alpha) {
 }
 
 export const colorThemes = {
-  uiBase: '#0C0D16',             // Main app chrome
-  uiRaised: '#090A13',           // Top bars and elevated shells
-  uiField: '#121521',            // Inputs and inset surfaces
-  uiAccentSurface: '#151A2A',    // Active blue button surface
-  uiBorderStrong: '#1A2031',     // Primary borders
-  uiBorderSoft: '#121726',       // Secondary borders
+  uiBase: '#080D1A',             // Main app chrome — deep navy
+  uiRaised: '#06091A',           // Top bars and elevated shells
+  uiField: '#0D1326',            // Inputs and inset surfaces
+  uiAccentSurface: '#0E1830',    // Active blue button surface
+  uiBorderStrong: '#142038',     // Primary borders
+  uiBorderSoft: '#0F1830',       // Secondary borders
 
-  canvasBackground: '#101118',   // Main diagram canvas background
+  canvasBackground: '#0A0F1E',   // Main diagram canvas background
   canvasTexturePrimary: '#76A8FF',
   canvasTextureSecondary: '#5076D6',
   canvasTextureTertiary: '#385CA8',
@@ -35,12 +35,12 @@ export const colorThemes = {
   textDim: '#5B6B86',
   textFaint: '#2F3A4E',
 
-  purpleAccent: '#8a5bd6',       // All purple highlights and node accents
-  blueMain: '#1D4ED8',           // Main link / active action blue
+  purpleAccent: '#3B82F6',       // Logo-matching blue (was purple #8a5bd6)
+  blueMain: '#1D4ED8',           // Logo's primary blue — ring, arms, play triangle
   blueBright: '#7FB0FF',
   blueSelection: '#93C5FD',
   blueLink: '#60A5FA',
-  blueNodeFill: '#1E3A5F',
+  blueNodeFill: '#0E1E40',
   blueNodeStroke: '#3B82F6',
 
   successMain: '#10B981',
@@ -62,8 +62,8 @@ export const colorThemes = {
   timelineSectionBackground: '#06080F',
   timelineRowDivider: '#0D1117',
 
-  scrollbarThumb: '#243146',
-  scrollbarThumbHover: '#31435F',
+  scrollbarThumb: '#1A2E50',
+  scrollbarThumbHover: '#2A4470',
 
   white: '#FFFFFF',
   black: '#000000',

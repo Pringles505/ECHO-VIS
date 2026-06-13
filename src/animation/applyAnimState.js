@@ -996,12 +996,23 @@ function applyMonitorStates(layer, options, currentTime) {
   }
 }
 
+const GHOST_OPACITY = 0.13;
+
 export function applyAnimState(layer, animState, linkRenders, mirrorBindings = null, options = {}) {
   const currentTime = options.currentTime ?? 0;
+  const showGhostNodes = options.showGhostNodes ?? false;
   for (const [id, state] of Object.entries(animState.nodeStates)) {
     applyNodeStateToId(layer, id, state, currentTime);
+    if (showGhostNodes && state.opacity < 0.01) {
+      const g = getCachedNode(layer, `#node-${id}`);
+      if (g) g.opacity(GHOST_OPACITY);
+    }
     for (const mirrorId of mirrorBindings?.nodeIdsBySourceId?.[id] ?? []) {
       applyNodeStateToId(layer, mirrorId, state, currentTime);
+      if (showGhostNodes && state.opacity < 0.01) {
+        const g = getCachedNode(layer, `#node-${mirrorId}`);
+        if (g) g.opacity(GHOST_OPACITY);
+      }
     }
 
     // Graph vectors (arrows) draw timing per node

@@ -37,6 +37,7 @@ export const DEFAULT_ALIGNMENT_SETTINGS = {
   snapOrthogonal: true,  // link joints snap segments to 90°
   showGuides: true,      // draw guide lines while snapped
   showGrid: false,       // visual grid backdrop
+  showGhostNodes: false, // show nodes at low opacity when not yet visible in current frame
 };
 
 // Edge values of a box along one axis: [min, center, max].
