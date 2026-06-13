@@ -1626,7 +1626,7 @@ function KeyframePanel({ playback }) {
         </span>
 
         <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>
-          {nodes.length}n · {links.length}l
+          {nodes.length} nodes · {links.length} links
         </span>
 
         <VSep />
@@ -1692,7 +1692,7 @@ function KeyframePanel({ playback }) {
                       onClick={() => addTextMorph(selData.id)}
                       style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text-main)', fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
                     >
-                      add morph
+                      Add morph
                     </button>
                     <div style={{ width: 6 }} />
                   </>
@@ -1705,7 +1705,7 @@ function KeyframePanel({ playback }) {
                       onClick={() => addNodeFailure(selData.id)}
                       style={{ background: 'none', border: '1px solid var(--danger-border-soft)', borderRadius: 4, color: FAILURE_HUE.bright, fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
                     >
-                      add failure
+                      Add failure
                     </button>
                     <div style={{ width: 6 }} />
                   </>
@@ -1735,7 +1735,7 @@ function KeyframePanel({ playback }) {
                 <NumberField value={selMorph.startTime} step={0.05} min={0} onChange={v => updateTextMorph(selData.id, selMorph.id, { startTime: r2(Math.max(0, v)) })} />
                 <FieldLabel>s</FieldLabel>
                 <div style={{ width: 6 }} />
-                <FieldLabel>Dur</FieldLabel>
+                <FieldLabel>Duration</FieldLabel>
                 <NumberField value={selMorph.duration} step={0.05} min={0.1} onChange={v => updateTextMorph(selData.id, selMorph.id, { duration: r2(Math.max(0.1, v)) })} />
                 <FieldLabel>s</FieldLabel>
                 <VSep />
@@ -1757,7 +1757,7 @@ function KeyframePanel({ playback }) {
                   style={{ width: 28, height: 20, padding: 0, border: '1px solid var(--border-strong)', borderRadius: 4, background: 'transparent', cursor: 'pointer' }}
                 />
                 <div style={{ width: 6 }} />
-                <FieldLabel>Text clr</FieldLabel>
+                <FieldLabel>Text</FieldLabel>
                 <input
                   type="color"
                   value={toColorInputValue(selMorph.textColor ?? selData.textColor, '#ffffff')}
@@ -1785,7 +1785,7 @@ function KeyframePanel({ playback }) {
                   onClick={() => removeTextMorph(selData.id, selMorph.id)}
                   style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--danger-bright)', fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
                 >
-                  remove
+                  Remove
                 </button>
               </>
             )}
@@ -1805,7 +1805,7 @@ function KeyframePanel({ playback }) {
                 }} />
                 <FieldLabel>s</FieldLabel>
                 <div style={{ width: 6 }} />
-                <FieldLabel>Dur</FieldLabel>
+                <FieldLabel>Duration</FieldLabel>
                 <NumberField value={Number.isFinite(selGraphPoint.duration) ? selGraphPoint.duration : 0.35} step={0.05} min={0.05} onChange={v => {
                   const gp = (selData.graphPoints ?? []).map(p => p.id === selGraphPoint.id ? { ...p, duration: r2(Math.max(0.05, v)) } : p);
                   _pushHistory();
@@ -1829,7 +1829,7 @@ function KeyframePanel({ playback }) {
                 />
                 <FieldLabel>s</FieldLabel>
                 <div style={{ width: 6 }} />
-                <FieldLabel>Dur</FieldLabel>
+                <FieldLabel>Duration</FieldLabel>
                 <NumberField
                   value={selNodeFailure.duration}
                   step={0.05}
@@ -1841,7 +1841,7 @@ function KeyframePanel({ playback }) {
                   onClick={() => removeNodeFailure(selData.id, selNodeFailure.id)}
                   style={{ background: 'none', border: '1px solid var(--danger-border-soft)', borderRadius: 4, color: FAILURE_HUE.bright, fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
                 >
-                  remove
+                  Remove
                 </button>
               </>
             )}
@@ -1872,7 +1872,7 @@ function KeyframePanel({ playback }) {
                   onClick={() => removeScrollStep(selData.id, selScrollStep.id)}
                   style={{ background: 'none', border: '1px solid var(--purple-border-strong)', borderRadius: 4, color: SCROLL_HUE.bright, fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
                 >
-                  remove
+                  Remove
                 </button>
               </>
             )}
@@ -1905,7 +1905,7 @@ function KeyframePanel({ playback }) {
                   onClick={() => addManualTokenTextKeyframe(selData.id)}
                   style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: TOKEN_HUE.bright, fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
                 >
-                  add text key
+                  Add text key
                 </button>
                 <VSep />
               </>
@@ -1939,7 +1939,7 @@ function KeyframePanel({ playback }) {
                   onClick={() => removeManualTokenTextKeyframe(selData.id, selManualTokenTextKeyframe.id)}
                   style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--danger-bright)', fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
                 >
-                  remove
+                  Remove
                 </button>
               </>
             )}
@@ -1961,7 +1961,7 @@ function KeyframePanel({ playback }) {
                     onClick={() => doUpdate({ animStartTime: null, animDuration: null })}
                     style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text-dim)', fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
                   >
-                    reset auto
+                    Reset to auto
                   </button>
                 )}
               </>
@@ -2016,7 +2016,7 @@ function KeyframePanel({ playback }) {
                   <VSep />
                   {!timing.skipped && (
                     <>
-                      <FieldLabel>Dur</FieldLabel>
+                      <FieldLabel>Duration</FieldLabel>
                       <NumberField
                         value={timing.duration}
                         step={0.05}
@@ -2067,7 +2067,7 @@ function KeyframePanel({ playback }) {
                           }}
                           style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text-dim)', fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
                         >
-                          reset dur
+                          Reset duration
                         </button>
                       )}
                       {timing.hasDelay && (
@@ -2083,7 +2083,7 @@ function KeyframePanel({ playback }) {
                           }}
                           style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text-dim)', fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
                         >
-                          reset delay
+                          Reset delay
                         </button>
                       )}
                     </>
@@ -2114,7 +2114,7 @@ function KeyframePanel({ playback }) {
                       whiteSpace: 'nowrap',
                     }}
                   >
-                    {timing.skipped ? 'restore hop' : 'remove hop'}
+                    {timing.skipped ? 'Restore hop' : 'Remove hop'}
                   </button>
                 </>
               );
@@ -2135,21 +2135,21 @@ function KeyframePanel({ playback }) {
               title="Add GIF divider at playhead time. The last divider ends the final GIF."
               style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text-main)', fontSize: 10, padding: '2px 8px', cursor: 'pointer', whiteSpace: 'nowrap' }}
             >
-              add divider @ {r2(currentTime)}s
+              Add divider @ {r2(currentTime)}s
             </button>
             <button
               onClick={clearSlideBreaks}
               disabled={!slideBreaks.length}
-              title="Clear all slide breaks"
+              title="Remove all GIF dividers"
               style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text-dim)', fontSize: 10, padding: '2px 8px', cursor: slideBreaks.length ? 'pointer' : 'not-allowed', whiteSpace: 'nowrap', opacity: slideBreaks.length ? 1 : 0.6 }}
             >
-              clear
+              Clear
             </button>
           </>
         )}
 
         {!collapsed && isEmpty && (
-          <span style={{ color: 'var(--text-faint)', fontSize: 12 }}>Add nodes to see timeline</span>
+          <span style={{ color: 'var(--text-faint)', fontSize: 12 }}>Add a node to the canvas to start the timeline.</span>
         )}
 
         <div style={{ flex: 1 }} />

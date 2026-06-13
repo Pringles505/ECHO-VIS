@@ -1,6 +1,20 @@
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Lalezar&display=swap');
+  
+  .iris-title {
+    font-family: 'Lalezar', sans-serif;
+    color: #000;
+  }
+  @media (prefers-color-scheme: dark) {
+    .iris-title {
+      color: #fff;
+    }
+  }
+</style>
+
 <p align="center">
-  <img src="./EchoVisLogo.svg" alt="ECHO-VIS" width="140" valign="middle" />&nbsp;&nbsp;
-  <big><big><big><strong>ECHO-VIS</strong></big></big></big>
+  <img src="./IrisTextLogoWhite.svg" alt="IRIS" width="230" valign="middle" />&nbsp;&nbsp;
+
 </p>
 
 ---

@@ -16,7 +16,10 @@ import { capturePreview } from './projects/capturePreview';
 const AUTOSAVE_DELAY = 1500;
 
 function App() {
-  const [page, setPage] = useState('loading');
+  const [page, setPage]               = useState('loading');
+  const [previewMode, setPreviewMode] = useState(false);
+  const [previewBarVisible, setPreviewBarVisible] = useState(false);
+  const hideBarTimer = useRef(null);
 
   const {
     nodes, links, slideBreaks, captureFrame,
@@ -51,7 +54,7 @@ function App() {
   const reportSaveResult = (saved) => {
     if (saved || saveFailureWarnedRef.current) return;
     saveFailureWarnedRef.current = true;
-    alert('Saving failed — browser storage is full. Download the project (Download button) to avoid losing work.');
+    alert('Autosave failed — browser storage is full. Use "Save file" in the top bar to keep a copy of your work.');
   };
 
   useEffect(() => {
@@ -64,6 +67,19 @@ function App() {
     }, AUTOSAVE_DELAY);
     return () => clearTimeout(saveTimer.current);
   }, [nodes, links, page, slideBreaks, captureFrame]);
+
+  useEffect(() => {
+    if (!previewMode) { setPreviewBarVisible(false); return; }
+    const onMove = (e) => {
+      if (e.clientY < 64) {
+        setPreviewBarVisible(true);
+        clearTimeout(hideBarTimer.current);
+        hideBarTimer.current = setTimeout(() => setPreviewBarVisible(false), 2400);
+      }
+    };
+    window.addEventListener('mousemove', onMove);
+    return () => { window.removeEventListener('mousemove', onMove); clearTimeout(hideBarTimer.current); };
+  }, [previewMode]);
 
   const playback = usePlayback({ layerRef });
   const { isPlaying, play, pause } = playback;
@@ -147,6 +163,76 @@ function App() {
     );
   }
 
+  if (previewMode) {
+    return (
+      <div style={{
+        width: '100vw', height: '100vh', overflow: 'hidden',
+        background: '#07070f',
+        position: 'relative',
+        display: 'flex', alignItems: 'stretch',
+      }}>
+        {/* Canvas inset with visible margin */}
+        <div style={{ position: 'absolute', inset: 48, display: 'flex' }}>
+          <DiagramCanvas stageRef={stageRef} layerRef={layerRef} playback={playback} />
+        </div>
+
+        {/* Margin indicators — corners */}
+        <PreviewIndicator side="bottom-left" />
+        <PreviewIndicator side="bottom-right" />
+
+        {/* Top hint — hover cue */}
+        <div style={{
+          position: 'absolute',
+          top: 14,
+          left: '50%',
+          transform: 'translateX(-50%)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+          opacity: previewBarVisible ? 0 : 0.28,
+          transition: 'opacity 0.3s',
+          pointerEvents: 'none',
+        }}>
+          <span style={{ fontSize: 9, letterSpacing: '0.18em', color: '#a78bfa', textTransform: 'uppercase', fontWeight: 700 }}>
+            ▲ controls
+          </span>
+        </div>
+
+        {/* Invisible hover-trigger zone at top */}
+        <div
+          style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 56, zIndex: 9990 }}
+          onMouseMove={() => {
+            setPreviewBarVisible(true);
+            clearTimeout(hideBarTimer.current);
+            hideBarTimer.current = setTimeout(() => setPreviewBarVisible(false), 2400);
+          }}
+        />
+
+        {/* Slide-down TopBar */}
+        <div style={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          right: 0,
+          zIndex: 9999,
+          transform: previewBarVisible ? 'translateY(0)' : 'translateY(-100%)',
+          transition: 'transform 0.22s cubic-bezier(0.16, 1, 0.3, 1)',
+          willChange: 'transform',
+          boxShadow: previewBarVisible ? '0 4px 32px rgba(0,0,0,0.6)' : 'none',
+        }}>
+          <TopBar
+            stageRef={stageRef}
+            layerRef={layerRef}
+            onGoHome={handleGoHome}
+            onTogglePreview={() => setPreviewMode(false)}
+          />
+        </div>
+
+        <ContextMenu />
+      </div>
+    );
+  }
+
   return (
     <div style={{
       display: 'flex',
@@ -155,7 +241,12 @@ function App() {
       overflow: 'hidden',
       background: 'var(--app-bg)',
     }}>
-      <TopBar stageRef={stageRef} layerRef={layerRef} onGoHome={handleGoHome} />
+      <TopBar
+        stageRef={stageRef}
+        layerRef={layerRef}
+        onGoHome={handleGoHome}
+        onTogglePreview={() => setPreviewMode(true)}
+      />
 
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden', minHeight: 0 }}>
         <DiagramCanvas stageRef={stageRef} layerRef={layerRef} playback={playback} />
@@ -165,6 +256,46 @@ function App() {
       <KeyframePanel playback={playback} />
 
       <ContextMenu />
+    </div>
+  );
+}
+
+function PreviewIndicator({ side }) {
+  const isBottom = side.startsWith('bottom');
+  const isLeft   = side.endsWith('left');
+  return (
+    <div style={{
+      position: 'absolute',
+      bottom: isBottom ? 14 : undefined,
+      top:    !isBottom ? 14 : undefined,
+      left:   isLeft ? 14 : undefined,
+      right:  !isLeft ? 14 : undefined,
+      display: 'flex',
+      alignItems: 'center',
+      gap: 5,
+      opacity: 0.22,
+      pointerEvents: 'none',
+      userSelect: 'none',
+    }}>
+      <div style={{
+        width: 5,
+        height: 5,
+        borderRadius: '50%',
+        background: '#a78bfa',
+        boxShadow: '0 0 6px #a78bfa',
+        flexShrink: 0,
+      }} />
+      {isLeft && (
+        <span style={{
+          fontSize: 8,
+          letterSpacing: '0.2em',
+          color: '#a78bfa',
+          fontWeight: 700,
+          textTransform: 'uppercase',
+        }}>
+          IRIS Preview
+        </span>
+      )}
     </div>
   );
 }

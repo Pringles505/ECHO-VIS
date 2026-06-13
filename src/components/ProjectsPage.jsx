@@ -26,10 +26,10 @@ export default function ProjectsPage({ onOpen }) {
     if (project) onOpen(project);
   };
 
-  const handleDelete = (e, id) => {
+  const handleDelete = (e, meta) => {
     e.stopPropagation();
-    if (!window.confirm('Delete this project?')) return;
-    deleteProject(id);
+    if (!window.confirm(`Delete "${meta.name}"? This can't be undone.`)) return;
+    deleteProject(meta.id);
     refresh();
   };
 
@@ -97,9 +97,9 @@ export default function ProjectsPage({ onOpen }) {
         height: 56,
         flexShrink: 0,
       }}>
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: 1 }}>
-          <span style={{ color: 'var(--purple-bright)', fontSize: 16, fontWeight: 800, letterSpacing: '0.06em' }}>ECHO</span>
-          <span style={{ color: 'var(--blue-bright)', fontSize: 16, fontWeight: 300, letterSpacing: '0.06em' }}>VIS</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <img src="/IrisLogo.svg" alt="IRIS" style={{ width: 26, height: 26 }} />
+          <span style={{ fontFamily: 'Lalezar, sans-serif', fontSize: 18, color: 'var(--text-main)', letterSpacing: '0.04em', lineHeight: 1 }}>IRIS</span>
         </div>
       </div>
 
@@ -158,7 +158,7 @@ export default function ProjectsPage({ onOpen }) {
                 isRenaming={renamingId === meta.id}
                 renameVal={renameVal}
                 onOpen={() => handleOpen(meta)}
-                onDelete={(e) => handleDelete(e, meta.id)}
+                onDelete={(e) => handleDelete(e, meta)}
                 onDownload={(e) => handleDownload(e, meta)}
                 onDuplicate={(e) => handleDuplicate(e, meta.id)}
                 onStartRename={(e) => startRename(e, meta)}
@@ -277,7 +277,7 @@ function ProjectCard({
           {formatDate(meta.updatedAt)}
         </span>
         <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
-          {meta.nodeCount}n · {meta.linkCount}l
+          {meta.nodeCount} node{meta.nodeCount !== 1 ? 's' : ''} · {meta.linkCount} link{meta.linkCount !== 1 ? 's' : ''}
         </span>
       </div>
     </div>

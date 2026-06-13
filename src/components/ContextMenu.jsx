@@ -89,33 +89,33 @@ function ContextMenu() {
     } else {
       menuItems.push({
         icon: '⬡',
-        label: 'Add Node',
+        label: 'Add node',
         onClick: () => addNode(contextMenu.canvasX, contextMenu.canvasY),
       });
       menuItems.push({
         icon: '𝑽',
-        label: 'Add Variable',
+        label: 'Add variable',
         onClick: () => addVariableNode(contextMenu.canvasX, contextMenu.canvasY),
       });
       menuItems.push({
         icon: '⊡',
-        label: 'Add Monitor',
+        label: 'Add monitor',
         onClick: () => addMonitorNode(contextMenu.canvasX, contextMenu.canvasY),
       });
       menuItems.push({
         icon: 'ƒ',
-        label: 'Add Graph',
+        label: 'Add graph',
         onClick: () => addGraphNode(contextMenu.canvasX, contextMenu.canvasY),
       });
       menuItems.push({
         icon: '◇',
-        label: 'Add Shape',
+        label: 'Add shape',
         onClick: () => setCanvasMenuView('add-node'),
         keepOpen: true,
       });
       menuItems.push({
         icon: '▣',
-        label: 'Add Mirror',
+        label: 'Add mirror',
         onClick: () => addMirrorNode(
           contextMenu.canvasX,
           contextMenu.canvasY,
@@ -124,17 +124,17 @@ function ContextMenu() {
       });
       menuItems.push({
         icon: 'T',
-        label: 'Add Text',
+        label: 'Add text',
         onClick: () => addTextNode(contextMenu.canvasX, contextMenu.canvasY),
       });
       menuItems.push({
         icon: '⬚',
-        label: 'Add Area',
+        label: 'Add area',
         onClick: () => addArea(contextMenu.canvasX, contextMenu.canvasY),
       });
       menuItems.push({
         icon: '▶',
-        label: 'Add Sub-diagram',
+        label: 'Add sub-diagram',
         onClick: () => addSubdiagramNode(contextMenu.canvasX, contextMenu.canvasY),
       });
     }
@@ -155,7 +155,7 @@ function ContextMenu() {
     });
     menuItems.push({
       icon: '◆',
-      label: 'Add Joint',
+      label: 'Add joint',
       onClick: () => {
         const link = links.find(item => item.id === contextMenu.linkId);
         if (!link) return;
@@ -181,7 +181,7 @@ function ContextMenu() {
   if (contextMenu.type === 'node') {
     menuItems.push({
       icon: '◉',
-      label: 'Add Anchor',
+      label: 'Add anchor',
       onClick: () => {
         const node = nodes.find(item => item.id === contextMenu.nodeId);
         if (!node) return;
@@ -221,7 +221,7 @@ function ContextMenu() {
 
     menuItems.push({
       icon: '✂',
-      label: stripCount > 1 ? `Strip Animation (${stripCount})` : 'Strip Animation',
+      label: stripCount > 1 ? `Remove animation (${stripCount})` : 'Remove animation',
       onClick: () => stripAnimation(stripIds),
     });
   }
@@ -238,7 +238,7 @@ function ContextMenu() {
     });
     menuItems.push({
       icon: '◎',
-      label: 'Create Junction',
+      label: 'Create junction',
       onClick: () => {
         updateLinkJoint(contextMenu.linkId, contextMenu.jointId, { isJunction: true });
         setSelected(contextMenu.linkId);
@@ -275,7 +275,15 @@ function ContextMenu() {
         }
       `}</style>
 
-      <MenuLabel text={contextMenu.type === 'canvas' && canvasMenuView === 'add-node' ? 'ADD NODE' : 'ADD'} />
+      <MenuLabel text={
+        contextMenu.type === 'canvas'
+          ? (canvasMenuView === 'add-node' ? 'Shapes' : 'Insert')
+          : contextMenu.type === 'link'
+            ? 'Link'
+            : contextMenu.type === 'joint'
+              ? 'Joint'
+              : 'Node'
+      } />
       {menuItems.map(item => (
         <MenuItem
           key={item.label}

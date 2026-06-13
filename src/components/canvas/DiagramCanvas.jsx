@@ -584,14 +584,27 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
   const handleWheel = useCallback((e) => {
     e.evt.preventDefault();
     const stage = stageRef.current;
+    const ev = e.evt;
+
+    if (!ev.ctrlKey) {
+      // Two-finger trackpad pan
+      const lineH = ev.deltaMode === 1 ? 20 : 1;
+      setStagePos(prev => ({
+        x: prev.x - ev.deltaX * lineH,
+        y: prev.y - ev.deltaY * lineH,
+      }));
+      return;
+    }
+
+    // Pinch-to-zoom or ctrl+scroll — use magnitude for smooth scaling
     const oldScale = stage.scaleX();
     const ptr = stage.getPointerPosition();
     const origin = {
       x: (ptr.x - stage.x()) / oldScale,
       y: (ptr.y - stage.y()) / oldScale,
     };
-    const delta = e.evt.deltaY < 0 ? 1 : -1;
-    const newScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, oldScale + delta * oldScale * 0.1));
+    const factor = Math.pow(0.998, ev.deltaY);
+    const newScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, oldScale * factor));
     setScale(newScale);
     setStagePos({
       x: ptr.x - origin.x * newScale,
@@ -599,18 +612,29 @@ function DiagramCanvas({ stageRef, layerRef, playback }) {
     });
   }, [stageRef]);
 
-  // Enable zooming even when the overlay is on top by handling DOM wheel events
-  // and applying the same zoom math used for Konva's onWheel.
+  // Enable zooming/panning even when the overlay is on top by handling DOM wheel events.
   const handleDomWheel = useCallback((ev) => {
     ev.preventDefault();
     const stage = stageRef.current;
     if (!stage) return;
+
+    if (!ev.ctrlKey) {
+      // Two-finger trackpad pan
+      const lineH = ev.deltaMode === 1 ? 20 : 1;
+      setStagePos(prev => ({
+        x: prev.x - ev.deltaX * lineH,
+        y: prev.y - ev.deltaY * lineH,
+      }));
+      return;
+    }
+
+    // Pinch-to-zoom or ctrl+scroll
     const oldScale = stage.scaleX();
     const rect = containerRef.current.getBoundingClientRect();
     const ptr = { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
     const origin = { x: (ptr.x - stagePos.x) / oldScale, y: (ptr.y - stagePos.y) / oldScale };
-    const delta = ev.deltaY < 0 ? 1 : -1;
-    const newScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, oldScale + delta * oldScale * 0.1));
+    const factor = Math.pow(0.998, ev.deltaY);
+    const newScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, oldScale * factor));
     setScale(newScale);
     setStagePos({ x: ptr.x - origin.x * newScale, y: ptr.y - origin.y * newScale });
   }, [stageRef, containerRef, stagePos]);

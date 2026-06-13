@@ -459,7 +459,7 @@ function LinkBasics({ linkLike, onUpdate }) {
         <Row label="Tip style">
           <div style={{ display: 'flex', gap: 6 }}>
             <ModeChip
-              label="Flows"
+              label="Moves"
               active={!linkLike.arrowTipMode || linkLike.arrowTipMode === 'flow'}
               onClick={() => onUpdate({ arrowTipMode: 'flow' })}
             />
@@ -475,8 +475,8 @@ function LinkBasics({ linkLike, onUpdate }) {
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
           <ModeChip label="Normal" active={failureMode === 'normal'} onClick={() => setFailureMode('normal')} />
           <ModeChip label="Failing" active={failureMode === 'failing'} onClick={() => setFailureMode('failing')} />
-          <ModeChip label="Draw end" active={failureMode === 'draw-end'} onClick={() => setFailureMode('draw-end')} />
-          <ModeChip label="Token end" active={failureMode === 'token-end'} onClick={() => setFailureMode('token-end')} />
+          <ModeChip label="At draw end" active={failureMode === 'draw-end'} onClick={() => setFailureMode('draw-end')} />
+          <ModeChip label="At token end" active={failureMode === 'token-end'} onClick={() => setFailureMode('token-end')} />
         </div>
       </Row>
       <Row label="Instant">
@@ -486,7 +486,7 @@ function LinkBasics({ linkLike, onUpdate }) {
           label="Appear instantly (no draw-in)"
         />
       </Row>
-      <Row label="Bind hop">
+      <Row label="Timing">
         <ToggleInput
           checked={!!linkLike.bindToTokenHop}
           onChange={value => onUpdate({ bindToTokenHop: value })}
@@ -495,17 +495,17 @@ function LinkBasics({ linkLike, onUpdate }) {
       </Row>
       {linkLike.bindToTokenHop && (
         <>
-          <Row label="Auto trig">
+          <Row label="Auto-trigger">
             <ToggleInput
               checked={!!linkLike.autoTriggerTarget}
               onChange={v => onUpdate({ autoTriggerTarget: v })}
               label="Trigger target on hop end"
             />
           </Row>
-          <Row label="Hop offs">
+          <Row label="Hop offset">
             <NumberInput value={Number.isFinite(linkLike.bindHopOffset) ? linkLike.bindHopOffset : 0} min={-10} max={10} step={0.05} onChange={v => onUpdate({ bindHopOffset: v })} />
           </Row>
-          <Row label="Speed x">
+          <Row label="Speed ×">
             <NumberInput value={Number.isFinite(linkLike.bindHopScale) ? linkLike.bindHopScale : 1} min={0.1} max={5} step={0.05} onChange={v => onUpdate({ bindHopScale: v })} />
           </Row>
         </>
@@ -527,8 +527,8 @@ function LinkBasics({ linkLike, onUpdate }) {
               onChange={e => onUpdate({ manualTokenAnchor: e.target.value })}
               style={SELECT_INPUT_STYLE}
             >
-              <option value="start">After beginning</option>
-              <option value="end">After completion</option>
+              <option value="start">When the link starts</option>
+              <option value="end">When the link completes</option>
             </select>
           </Row>
           <Row label="Delay">
@@ -551,20 +551,20 @@ function LinkBasics({ linkLike, onUpdate }) {
               onChange={v => onUpdate({ manualTokenDuration: Math.max(0.05, v) })}
             />
           </Row>
-          <Row label="Invert flow">
+          <Row label="Direction">
             <ToggleInput
               checked={!!linkLike.manualTokenInvert}
               onChange={value => onUpdate({ manualTokenInvert: value })}
-              label="Travel from target → source"
+              label="Travel from target to source"
             />
           </Row>
-          <Row label="Var name">
+          <Row label="Name">
             <TextInput
               value={linkLike.manualTokenVariableName ?? ''}
               onChange={value => onUpdate({ manualTokenVariableName: value })}
             />
           </Row>
-          <Row label="Var value">
+          <Row label="Value">
             <TextInput
               value={linkLike.manualTokenVariableValue ?? ''}
               onChange={value => onUpdate({ manualTokenVariableValue: value })}
@@ -705,10 +705,10 @@ function PanelContent() {
         <Row label="Label">
           <TextInput value={simOpt.tokenText} onChange={v => setSimulateOptions({ tokenText: v })} />
         </Row>
-        <Row label="Lbl clr">
+        <Row label="Label color">
           <ColorInput value={simOpt.tokenTextColor} onChange={v => setSimulateOptions({ tokenTextColor: v })} />
         </Row>
-        <Row label="Lbl size">
+        <Row label="Label size">
           <NumberInput value={simOpt.tokenTextSize} min={8} max={24} onChange={v => setSimulateOptions({ tokenTextSize: v })} />
         </Row>
       </div>
@@ -806,7 +806,7 @@ function PanelContent() {
 
         {(selectedNode.snapshotNodes?.length ?? 0) > 0 && (
           <EmptyHint>
-            {(selectedNode.snapshotNodes?.length ?? 0)}n · {(selectedNode.snapshotLinks?.length ?? 0)}l loaded
+            {(selectedNode.snapshotNodes?.length ?? 0)} nodes · {(selectedNode.snapshotLinks?.length ?? 0)} links loaded
           </EmptyHint>
         )}
 
@@ -892,7 +892,7 @@ function PanelContent() {
                 onChange={value => updateResolveTarget({ textColor: value })}
               />
             </Row>
-            <Row label="Border W">
+            <Row label="Border width">
               <NumberInput
                 value={selectedNode.transformTarget?.strokeWidth ?? selectedNode.strokeWidth ?? 2}
                 min={0}
@@ -1109,7 +1109,7 @@ function PanelContent() {
         <Row label="Status">
           <NodeStatusControl node={selectedNode} onChange={updates => updateNode(selectedNode.id, updates)} />
         </Row>
-        <Row label="Timed fail">
+        <Row label="Failures">
           <NodeFailureControls node={selectedNode} onChange={updates => updateNode(selectedNode.id, updates)} />
         </Row>
         <Row label="Width">
@@ -1124,17 +1124,17 @@ function PanelContent() {
         <Row label="Border">
           <ColorInput value={selectedNode.stroke} onChange={v => up('stroke', v)} />
         </Row>
-        <Row label="Text clr">
+        <Row label="Text color">
           <ColorInput value={selectedNode.textColor} onChange={v => up('textColor', v)} />
         </Row>
-        <Row label="Font px">
+        <Row label="Font size">
           <NumberInput value={selectedNode.fontSize ?? 14} min={9} max={36} onChange={v => up('fontSize', v)} />
         </Row>
-        <Row label="Border">
+        <Row label="Value box">
           <ToggleInput
             checked={selectedNode.showMonitorTag !== false}
             onChange={v => up('showMonitorTag', v)}
-            label="Border around value"
+            label="Draw a box around the value"
           />
         </Row>
         <Row label="Appear">
@@ -1152,7 +1152,7 @@ function PanelContent() {
             onChange={(e) => setMonitorVariable(selectedNode.id, e.target.value || null)}
             style={SELECT_INPUT_STYLE}
           >
-            <option value="">— pick source —</option>
+            <option value="">Choose source…</option>
             {variableNodes.length > 0 && (
               <optgroup label="Variable nodes">
                 {variableNodes.map(v => {
@@ -1280,7 +1280,7 @@ function PanelContent() {
               }}
               style={SELECT_INPUT_STYLE}
             >
-              <option value="">— pick node —</option>
+              <option value="">Choose node…</option>
               {candidates.map(n => (
                 <option key={n.id} value={n.id}>{n.label || '(unnamed)'}</option>
               ))}
@@ -1361,7 +1361,7 @@ function PanelContent() {
                 />
               </div>
             </Row>
-            <Row label="Text clr">
+            <Row label="Text color">
               <ColorInput
                 value={morph.textColor ?? selectedNode.textColor}
                 onChange={value => updateMonitorMorphs(monitorMorphs.map(item => (
@@ -1546,7 +1546,7 @@ function PanelContent() {
                       onChange={value => updateMirrorNodeOverride(selectedNode.id, sourceNode.id, { label: value })}
                     />
                   </Row>
-                  <Row label="Text clr">
+                  <Row label="Text color">
                     <ColorInput
                       value={override.textColor ?? sourceNode.textColor}
                       onChange={value => updateMirrorNodeOverride(selectedNode.id, sourceNode.id, { textColor: value })}
@@ -1636,7 +1636,7 @@ function PanelContent() {
             <Row label="Status">
               <NodeStatusControl node={selectedNode} onChange={updates => updateNode(selectedNode.id, updates)} />
             </Row>
-            <Row label="Timed fail">
+            <Row label="Failures">
               <NodeFailureControls node={selectedNode} onChange={updates => updateNode(selectedNode.id, updates)} />
             </Row>
           </>
@@ -1659,7 +1659,7 @@ function PanelContent() {
             </Row>
             {selectedNode.equationMode && (
               <div
-                title={'Syntax: x^2 · a_i · \\frac{a}{b} · \\sqrt{x} · \\alpha · \\scalar for · · \\sum_{i=1}^{n}'}
+                title={'Syntax: x^2 · a_i · \\frac{a}{b} · \\sqrt{x} · \\alpha · \\sum_{i=1}^{n}'}
                 style={{
                   margin: '-2px 0 12px 80px',
                   padding: '10px 12px',
@@ -1964,10 +1964,10 @@ function PanelContent() {
             <Row label="Width">
               <NumberInput value={Number.isFinite(selectedNode.vectorWidthDefault) ? selectedNode.vectorWidthDefault : 1.5} min={0.5} max={10} step={0.1} onChange={v => up('vectorWidthDefault', Math.max(0.5, v))} />
             </Row>
-            <Row label="Head L">
+            <Row label="Head length">
               <NumberInput value={Number.isFinite(selectedNode.vectorHeadLengthDefault) ? selectedNode.vectorHeadLengthDefault : 8} min={1} max={40} step={1} onChange={v => up('vectorHeadLengthDefault', Math.max(1, v))} />
             </Row>
-            <Row label="Head W">
+            <Row label="Head width">
               <NumberInput value={Number.isFinite(selectedNode.vectorHeadWidthDefault) ? selectedNode.vectorHeadWidthDefault : 8} min={1} max={40} step={1} onChange={v => up('vectorHeadWidthDefault', Math.max(1, v))} />
             </Row>
             <Row label="Speed">
@@ -2227,10 +2227,10 @@ function PanelContent() {
         </Row>
         {isTextNode ? (
           <>
-            <Row label="Area X" title="Invisible zone around the text where links can attach">
+            <Row label="Padding X" title="Invisible zone around the text where links can attach">
               <NumberInput value={selectedNode.textPadX ?? 14} min={6} max={80} onChange={v => up('textPadX', v)} />
             </Row>
-            <Row label="Area Y" title="Invisible zone around the text where links can attach">
+            <Row label="Padding Y" title="Invisible zone around the text where links can attach">
               <NumberInput value={selectedNode.textPadY ?? 8} min={4} max={60} onChange={v => up('textPadY', v)} />
             </Row>
             <Section title="Morphs" hint="Scripted text changes — each morph gets a draggable block on this text's timeline row" />
@@ -2339,7 +2339,7 @@ function PanelContent() {
             <Row label="Radius">
               <NumberInput value={selectedNode.cornerRadius} min={0} max={60} onChange={v => up('cornerRadius', v)} />
             </Row>
-            <Row label="Border W">
+            <Row label="Border width">
               <NumberInput value={selectedNode.strokeWidth} min={0} max={10} onChange={v => up('strokeWidth', v)} />
             </Row>
 
@@ -2579,7 +2579,7 @@ function PanelContent() {
                   <Row label="Border">
                     <ColorInput value={morph.stroke ?? selectedNode.stroke} onChange={value => patchMorph({ stroke: value })} />
                   </Row>
-                  <Row label="Text clr">
+                  <Row label="Text color">
                     <ColorInput value={morph.textColor ?? selectedNode.textColor} onChange={value => patchMorph({ textColor: value })} />
                   </Row>
                   <Row label="Start">
@@ -2611,7 +2611,7 @@ function PanelContent() {
               if (passing.length === 0) return null;
               return (
                 <>
-                  <Section title="Tokens Through Node" hint="Per-variable token appearance, editable from this node — Kill stops the token here so it doesn't continue downstream" />
+                  <Section title="Passing Tokens" hint="Appearance of each variable token that travels through this node — Stop ends the token here so it doesn't continue downstream" />
                   {passing
                     .sort((a, b) => (a.variableLabel || a.displayText || '').localeCompare(b.variableLabel || b.displayText || ''))
                     .map(web => {
@@ -2653,11 +2653,11 @@ function PanelContent() {
                                   cursor: 'pointer',
                                 }}
                               >
-                                {isKilledHere ? 'Allow through' : 'Kill token here'}
+                                {isKilledHere ? 'Allow through' : 'Stop token here'}
                               </button>
                             </div>
                           </Row>
-                          <Row label="Lbl text">
+                          <Row label="Label text">
                             <TextInput value={v.tokenText ?? ''} onChange={val => updateNode(v.id, { tokenText: val })} />
                           </Row>
                           <Row label="Shape">
@@ -2680,10 +2680,10 @@ function PanelContent() {
                           <Row label="Border">
                             <ColorInput value={eff('tokenStroke')} onChange={val => updateNode(v.id, { tokenStroke: val })} />
                           </Row>
-                          <Row label="Lbl clr">
+                          <Row label="Label color">
                             <ColorInput value={eff('tokenTextColor')} onChange={val => updateNode(v.id, { tokenTextColor: val })} />
                           </Row>
-                          <Row label="Lbl size">
+                          <Row label="Label size">
                             <NumberInput value={eff('tokenTextSize')} min={8} max={24} onChange={val => updateNode(v.id, { tokenTextSize: val })} />
                           </Row>
                           {hasAny && (
@@ -2767,7 +2767,7 @@ function PanelContent() {
                         onChange={value => up('simplePopupDuration', value)}
                       />
                     </Row>
-                    <Row label="Stay popped up?">
+                    <Row label="Stay open">
                       <ToggleInput
                         checked={selectedNode.popupStayOpen ?? false}
                         onChange={value => up('popupStayOpen', value)}
@@ -2811,7 +2811,7 @@ function PanelContent() {
               const has = (key) => selectedNode[key] != null;
               return (
                 <>
-                  <Row label="Lbl text">
+                  <Row label="Label text">
                     <TextInput value={selectedNode.tokenText ?? ''} onChange={v => up('tokenText', v)} />
                   </Row>
                   <Row label="Shape">
@@ -2834,10 +2834,10 @@ function PanelContent() {
                   <Row label="Border">
                     <ColorInput value={eff('tokenStroke')} onChange={v => up('tokenStroke', v)} />
                   </Row>
-                  <Row label="Lbl clr">
+                  <Row label="Label color">
                     <ColorInput value={eff('tokenTextColor')} onChange={v => up('tokenTextColor', v)} />
                   </Row>
-                  <Row label="Lbl size">
+                  <Row label="Label size">
                     <NumberInput value={eff('tokenTextSize')} min={8} max={24} onChange={v => up('tokenTextSize', v)} />
                   </Row>
                   {(has('tokenText') || has('tokenShape') || has('tokenSize') || has('tokenFill') || has('tokenStroke') || has('tokenTextColor') || has('tokenTextSize')) && (
@@ -2936,7 +2936,7 @@ function PanelContent() {
                     onChange={value => updateResolveTarget({ textColor: value })}
                   />
                 </Row>
-                <Row label="Border W">
+                <Row label="Border width">
                   <NumberInput
                     value={selectedNode.transformTarget?.strokeWidth ?? selectedNode.strokeWidth ?? 2}
                     min={0}
