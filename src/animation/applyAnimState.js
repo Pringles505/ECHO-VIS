@@ -1005,13 +1005,13 @@ export function applyAnimState(layer, animState, linkRenders, mirrorBindings = n
     applyNodeStateToId(layer, id, state, currentTime);
     if (showGhostNodes && state.opacity < 0.01) {
       const g = getCachedNode(layer, `#node-${id}`);
-      if (g) g.opacity(GHOST_OPACITY);
+      if (g) { g.opacity(GHOST_OPACITY); g.scaleX(1); g.scaleY(1); }
     }
     for (const mirrorId of mirrorBindings?.nodeIdsBySourceId?.[id] ?? []) {
       applyNodeStateToId(layer, mirrorId, state, currentTime);
       if (showGhostNodes && state.opacity < 0.01) {
         const g = getCachedNode(layer, `#node-${mirrorId}`);
-        if (g) g.opacity(GHOST_OPACITY);
+        if (g) { g.opacity(GHOST_OPACITY); g.scaleX(1); g.scaleY(1); }
       }
     }
 

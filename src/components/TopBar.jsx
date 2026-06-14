@@ -334,6 +334,7 @@ function TopBar({ stageRef, layerRef, onGoHome, onTogglePreview }) {
 
         <DropMenu label="View" open={openMenu === 'view'} onToggle={() => toggleMenu('view')} onClose={closeMenu}>
           <MItem label="Preview" shortcut="P" onClick={() => { closeMenu(); onTogglePreview?.(); }} />
+          <MItem label="Documentation" onClick={() => { closeMenu(); import('../docsNav').then(m => m.docsNav.open('')); }} />
         </DropMenu>
 
         <DropMenu label="Settings" open={openMenu === 'settings'} onToggle={() => toggleMenu('settings')} onClose={closeMenu}>

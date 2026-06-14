@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { docsNav } from '../docsNav';
 import { toColorInputValue } from '../colorValue';
 import { v4 as uuid } from 'uuid';
 import useStore, { NODE_SHAPE_PRESETS, isSubdiagramNode } from '../store/useStore';
@@ -17,11 +18,37 @@ import { getTimelineCursor } from '../timelineCursor';
 import { DEFAULT_NODE_FAILURE_DURATION, normalizeNodeFailureKeyframes } from '../animation/nodeFailureTiming';
 import { DEFAULT_SCROLL_STEP_DURATION, normalizeScrollSteps } from '../animation/scrollStepTiming';
 
+function InfoBtn({ anchor }) {
+  return (
+    <button
+      onClick={() => docsNav.open(anchor)}
+      title="Open documentation"
+      style={{
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+        width: 16, height: 16, flexShrink: 0,
+        borderRadius: '50%',
+        border: '1px solid currentColor',
+        background: 'none', cursor: 'pointer', padding: 0,
+        color: 'var(--text-dim)',
+        fontSize: 10, fontWeight: 700, lineHeight: 1,
+        fontFamily: 'serif', fontStyle: 'italic',
+        opacity: 0.65,
+        verticalAlign: 'middle',
+      }}
+      onMouseEnter={e => { e.currentTarget.style.color = 'var(--purple-bright)'; e.currentTarget.style.opacity = '1'; }}
+      onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-dim)'; e.currentTarget.style.opacity = '0.65'; }}
+    >
+      i
+    </button>
+  );
+}
+
 // `hint` renders as a hover tooltip on the section header — detailed guidance
 // lives there instead of in always-visible helper paragraphs.
-function Section({ title, hint }) {
+function Section({ title, hint, docAnchor }) {
   return (
     <div title={hint} style={{
+      display: 'flex', alignItems: 'center', gap: 5,
       color: 'var(--purple-bright)',
       fontSize: 10,
       fontWeight: 700,
@@ -32,16 +59,20 @@ function Section({ title, hint }) {
       paddingBottom: 6,
       borderBottom: '1px solid var(--border-strong)',
       cursor: hint ? 'help' : 'default',
-    }}>{title}</div>
+    }}>
+      <span>{title}</span>
+      {docAnchor && <InfoBtn anchor={docAnchor} />}
+    </div>
   );
 }
 
-function Row({ label, title, children }) {
+function Row({ label, title, docAnchor, children }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
       <label
         title={title}
         style={{
+          display: 'flex', alignItems: 'center', gap: 3,
           color: 'var(--text-muted)',
           fontSize: 11,
           width: 72,
@@ -49,7 +80,8 @@ function Row({ label, title, children }) {
           cursor: title ? 'help' : 'default',
         }}
       >
-        {label}
+        <span>{label}</span>
+        {docAnchor && <InfoBtn anchor={docAnchor} />}
       </label>
       {children}
     </div>
@@ -511,7 +543,7 @@ function LinkBasics({ linkLike, onUpdate }) {
         </>
       )}
 
-      <Section title="Manual Token" />
+      <Section title="Manual Token" docAnchor="manual-token" />
       <Row label="Enabled">
         <ToggleInput
           checked={!!linkLike.manualTokenEnabled}
@@ -678,10 +710,10 @@ function PanelContent() {
   if (!selectedNode && !selectedLink) {
     return (
       <div style={wrap}>
-        <Section title="Next Link" hint="These settings apply to the next link you draw" />
+        <Section title="Next Link" hint="These settings apply to the next link you draw" docAnchor="next-link" />
         <LinkBasics linkLike={nextLinkDefaults} onUpdate={updateNextLinkDefaults} />
 
-        <Section title="Token Appearance" hint="Default look for the tokens that flow along every Variable node's web" />
+        <Section title="Token Appearance" hint="Default look for the tokens that flow along every Variable node's web" docAnchor="token-appearance" />
         <Row label="Shape">
           <select
             value={simOpt.tokenShape}
@@ -748,7 +780,7 @@ function PanelContent() {
 
     return (
       <div style={wrap}>
-        <Section title="Sub-diagram" />
+        <Section title="Sub-diagram" docAnchor="subdiagram" />
 
         <Row label="Label">
           <TextInput value={selectedNode.label ?? ''} onChange={v => up('label', v)} />
@@ -818,7 +850,7 @@ function PanelContent() {
           />
         </Row>
 
-        <Section title="Resolve" hint="Morph this element into another node's look when its animation completes — drag the amber timeline block to set the moment" />
+        <Section title="Resolve" hint="Morph this element into another node's look when its animation completes — drag the amber timeline block to set the moment" docAnchor="resolve" />
 
         <Row label="Mode">
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
@@ -952,7 +984,7 @@ function PanelContent() {
           </Row>
         )}
 
-        <Section title="Playback" />
+        <Section title="Playback" docAnchor="playback" />
 
         <Row label="Badge">
           <ToggleInput
@@ -1099,7 +1131,7 @@ function PanelContent() {
 
     return (
       <div style={wrap}>
-        <Section title="Monitor" />
+        <Section title="Monitor" docAnchor="monitor" />
         <Row label="Title">
           <TextInput value={selectedNode.monitorTitle ?? ''} onChange={v => up('monitorTitle', v)} />
         </Row>
@@ -1145,7 +1177,7 @@ function PanelContent() {
           />
         </Row>
 
-        <Section title="Variable / Token" />
+        <Section title="Variable / Token" docAnchor="variable" />
         <Row label="Track">
           <select
             value={selectedNode.variableNodeId ?? ''}
@@ -1209,14 +1241,14 @@ function PanelContent() {
 
         {trackedVariable && (
           <>
-            <Section title="Watched Nodes" hint="The monitor updates as the token passes each watched node — templates accept {value} and {name}" />
+            <Section title="Watched Nodes" hint="The monitor updates as the token passes each watched node — templates accept {value} and {name}" docAnchor="watched-nodes" />
             {webNodeIds.size === 0 && (
               <EmptyHint>No web yet — add an outgoing link to the variable.</EmptyHint>
             )}
           </>
         )}
         {trackedManualToken && (
-          <Section title="Monitor Output" hint="Updates at each diamond text keyframe in the timeline — templates accept {value} and {name}" />
+          <Section title="Monitor Output" hint="Updates at each diamond text keyframe in the timeline — templates accept {value} and {name}" docAnchor="monitor-output" />
         )}
         {trackedSource && (selectedNode.monitorWatches ?? []).map(watch => {
           const watchedNode = nodes.find(n => n.id === watch.nodeId);
@@ -1287,7 +1319,7 @@ function PanelContent() {
             </select>
           </Row>
         )}
-        <Section title="Morphs" hint="Scripted value and color changes that override the tracked value — each morph gets a draggable block on this monitor's timeline row" />
+        <Section title="Morphs" hint="Scripted value and color changes that override the tracked value — each morph gets a draggable block on this monitor's timeline row" docAnchor="morphs" />
         <div style={{ marginBottom: 10 }}>
           <ActionButton
             label="Add morph"
@@ -1476,7 +1508,7 @@ function PanelContent() {
 
     return (
       <div style={wrap}>
-        <Section title={isMirror ? 'Mirror' : isTextNode ? 'Text' : 'Node'} />
+        <Section title={isMirror ? 'Mirror' : isTextNode ? 'Text' : 'Node'} docAnchor={isMirror ? 'mirror' : isTextNode ? 'text-node' : 'node'} />
 
         {isMirror ? (
           <>
@@ -1520,7 +1552,7 @@ function PanelContent() {
                 Use current selection
               </button>
             </Row>
-            <Section title="Source" hint="Geometry and timing follow the captured source objects; text and color below can diverge inside this mirror" />
+            <Section title="Source" hint="Geometry and timing follow the captured source objects; text and color below can diverge inside this mirror" docAnchor="mirror-source" />
             <EmptyHint>
               {mirrorSources.sourceNodes.length} node{mirrorSources.sourceNodes.length !== 1 ? 's' : ''} · {mirrorSources.sourceLinks.length} link{mirrorSources.sourceLinks.length !== 1 ? 's' : ''}
             </EmptyHint>
@@ -1776,7 +1808,7 @@ function PanelContent() {
             </Row>
             {/* Points now appear at runtime based on vector playback when Sequential is enabled */}
 
-            <Section title="Domain Separation (HKDF)" hint="Each circle is an independent HKDF output domain — when two overlap, the one higher in this list wins (use ↑/↓ to set priority)" />
+            <Section title="Domain Separation (HKDF)" hint="Each circle is an independent HKDF output domain — when two overlap, the one higher in this list wins (use ↑/↓ to set priority)" docAnchor="hkdf" />
             <Row label="Domains">
               <ToggleInput checked={!!selectedNode.showDomains} onChange={v => up('showDomains', v)} label="Show domain circles" />
             </Row>
@@ -1957,7 +1989,7 @@ function PanelContent() {
               </>
             )}
 
-            <Section title="Vectors" />
+            <Section title="Vectors" docAnchor="vectors" />
             <Row label="Color">
               <ColorInput value={selectedNode.vectorColorDefault ?? '#FFFFFF'} onChange={v => up('vectorColorDefault', v)} />
             </Row>
@@ -1984,7 +2016,7 @@ function PanelContent() {
               <ToggleInput checked={!!selectedNode.graphChainPlayback} onChange={v => up('graphChainPlayback', v)} label="Chain points & vectors (join all points)" />
             </Row>
 
-            <Section title="Point Defaults" />
+            <Section title="Point Defaults" docAnchor="point-defaults" />
             <Row label="Size">
               <NumberInput value={Number.isFinite(selectedNode.graphPointSizeDefault) ? selectedNode.graphPointSizeDefault : 4} min={1} max={24} step={1} onChange={v => up('graphPointSizeDefault', Math.max(1, v))} />
             </Row>
@@ -1995,7 +2027,7 @@ function PanelContent() {
               <ColorInput value={selectedNode.graphPointStrokeDefault ?? '#FFFFFF'} onChange={v => up('graphPointStrokeDefault', v)} />
             </Row>
 
-            <Section title="Points" hint="Shift+click the graph to add a point; Alt+click a point to remove it" />
+            <Section title="Points" hint="Shift+click the graph to add a point; Alt+click a point to remove it" docAnchor="equation-points" />
             {(selectedNode.graphPoints ?? []).length === 0 && (
               <EmptyHint>Shift+click the graph to add a point.</EmptyHint>
             )}
@@ -2233,7 +2265,7 @@ function PanelContent() {
             <Row label="Padding Y" title="Invisible zone around the text where links can attach">
               <NumberInput value={selectedNode.textPadY ?? 8} min={4} max={60} onChange={v => up('textPadY', v)} />
             </Row>
-            <Section title="Morphs" hint="Scripted text changes — each morph gets a draggable block on this text's timeline row" />
+            <Section title="Morphs" hint="Scripted text changes — each morph gets a draggable block on this text's timeline row" docAnchor="morphs" />
             <div style={{ marginBottom: 10 }}>
               <ActionButton
                 label="Add morph"
@@ -2346,7 +2378,7 @@ function PanelContent() {
             {/* Scrolling grid — turns the area into a looping viewport over the nodes inside it */}
             {selectedNode.type === 'area' && (
               <>
-                <Section title="Scroll" hint="Loops the objects centered inside this area, clipped at its edges — Glide scrolls continuously (Speed px/s, Gap adds space before the repeat); Step holds then shifts one tile per run" />
+                <Section title="Scroll" hint="Loops the objects centered inside this area, clipped at its edges — Glide scrolls continuously (Speed px/s, Gap adds space before the repeat); Step holds then shifts one tile per run" docAnchor="scroll" />
                 <Row label="Scroll">
                   <ToggleInput
                     checked={!!selectedNode.scrollEnabled}
@@ -2519,7 +2551,7 @@ function PanelContent() {
             {/* Quick morph editor — add/edit per-node morphs without leaving the inspector */}
             {selectedNode.type !== 'area' && (
             <>
-            <Section title="Morphs" hint="Scripted text and style changes — each morph gets a draggable block on this node's timeline row" />
+            <Section title="Morphs" hint="Scripted text and style changes — each morph gets a draggable block on this node's timeline row" docAnchor="morphs" />
             <div style={{ marginBottom: 10 }}>
               <ActionButton
                 label="Add morph"
@@ -2611,7 +2643,7 @@ function PanelContent() {
               if (passing.length === 0) return null;
               return (
                 <>
-                  <Section title="Passing Tokens" hint="Appearance of each variable token that travels through this node — Stop ends the token here so it doesn't continue downstream" />
+                  <Section title="Passing Tokens" hint="Appearance of each variable token that travels through this node — Stop ends the token here so it doesn't continue downstream" docAnchor="passing-tokens" />
                   {passing
                     .sort((a, b) => (a.variableLabel || a.displayText || '').localeCompare(b.variableLabel || b.displayText || ''))
                     .map(web => {
@@ -2709,7 +2741,7 @@ function PanelContent() {
             })()}
             {!isTextNode && (
               <>
-                <Section title="Popup" />
+                <Section title="Popup" docAnchor="popup" />
                 <Row label="Popup">
                   <ToggleInput
                     checked={selectedNode.showSimplePopupInPlayback ?? false}
@@ -2783,7 +2815,7 @@ function PanelContent() {
 
         {selectedNode.type === 'variable' && (
           <>
-            <Section title="Variable" />
+            <Section title="Variable" docAnchor="variable" />
             <Row label="Name">
               <TextInput value={selectedNode.variableLabel ?? ''} onChange={v => up('variableLabel', v)} />
             </Row>
@@ -2805,7 +2837,7 @@ function PanelContent() {
               </div>
             </Row>
 
-            <Section title="Token Appearance" hint="Overrides for this variable's token only — cleared fields fall back to the global default (empty-selection panel)" />
+            <Section title="Token Appearance" hint="Overrides for this variable's token only — cleared fields fall back to the global default (empty-selection panel)" docAnchor="token-appearance" />
             {(() => {
               const eff = (key) => selectedNode[key] != null ? selectedNode[key] : simOpt[key];
               const has = (key) => selectedNode[key] != null;
@@ -2863,7 +2895,7 @@ function PanelContent() {
 
         {!isMirror && !isTextNode && (
           <>
-            <Section title="Resolve" hint="Morph this element into another node's look when its animation completes — drag the amber timeline block to set the moment" />
+            <Section title="Resolve" hint="Morph this element into another node's look when its animation completes — drag the amber timeline block to set the moment" docAnchor="resolve" />
             <Row label="Mode">
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                 <ModeChip label="Off" active={resolveMode === 'none'} onClick={() => setResolveMode('none')} />
@@ -2994,7 +3026,7 @@ function PanelContent() {
 
         {selectedNode.triggerAfterLinkId && (
           <>
-            <Section title="Spawn Timing" hint="While drawing: fades in during the final portion of the link draw — At completion: starts exactly when the link finishes" />
+            <Section title="Spawn Timing" hint="While drawing: fades in during the final portion of the link draw — At completion: starts exactly when the link finishes" docAnchor="spawn-timing" />
             <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
               <ModeChip
                 label="While drawing"
@@ -3079,7 +3111,7 @@ function PanelContent() {
 
   return (
     <div style={wrap}>
-      <Section title="Link" />
+      <Section title="Link" docAnchor="link" />
 
       <LinkBasics
         linkLike={selectedLink}
@@ -3116,7 +3148,7 @@ function PanelContent() {
 
       {(selectedLink.fromAnchorSide || selectedLink.toAnchorSide) && (
         <>
-          <Section title="Anchors" hint="Drag the link endpoints on canvas, or use these sliders to place each anchor precisely along its side" />
+          <Section title="Anchors" hint="Drag the link endpoints on canvas, or use these sliders to place each anchor precisely along its side" docAnchor="anchors" />
           {selectedLink.fromAnchorSide && selectedLink.fromAnchorSide !== 'center' && (
             <>
               <SliderControl
@@ -3168,7 +3200,7 @@ function PanelContent() {
         </>
       )}
 
-      <Section title="Joints" hint="Joints reroute the link without creating new timeline items — right-click the link on canvas to add one" />
+      <Section title="Joints" hint="Joints reroute the link without creating new timeline items — right-click the link on canvas to add one" docAnchor="joints" />
       {selectedLink.joints?.length ? (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
           {selectedLink.joints.map((joint, index) => (
@@ -3198,7 +3230,7 @@ function PanelContent() {
               />
             </Row>
           )}
-          <Section title="Curvature" hint="Linked keeps both sides of the joint matched; Split lets the curve lean into one side" />
+          <Section title="Curvature" hint="Linked keeps both sides of the joint matched; Split lets the curve lean into one side" docAnchor="curvature" />
           <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
             <ModeChip label="Linked" active={curveMode === 'linked'} onClick={() => setCurveMode('linked')} />
             <ModeChip label="Split" active={curveMode === 'split'} onClick={() => setCurveMode('split')} />

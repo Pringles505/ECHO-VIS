@@ -5,6 +5,7 @@ import PropertiesPanel from './components/PropertiesPanel';
 import ContextMenu     from './components/ContextMenu';
 import KeyframePanel   from './components/KeyframePanel';
 import ProjectsPage    from './components/ProjectsPage';
+import DocsPage        from './components/DocsPage';
 import { usePlayback } from './hooks/usePlayback';
 import useStore        from './store/useStore';
 import {
@@ -12,14 +13,23 @@ import {
   writeProject, createBlankProject,
 } from './projects/projectStore';
 import { capturePreview } from './projects/capturePreview';
+import { docsNav } from './docsNav';
 
 const AUTOSAVE_DELAY = 1500;
 
 function App() {
   const [page, setPage]               = useState('loading');
+  const [docsAnchor, setDocsAnchor]   = useState('');
   const [previewMode, setPreviewMode] = useState(false);
   const [previewBarVisible, setPreviewBarVisible] = useState(false);
   const hideBarTimer = useRef(null);
+
+  useEffect(() => {
+    docsNav.register((anchor) => {
+      setDocsAnchor(anchor ?? '');
+      setPage('docs');
+    });
+  }, []);
 
   const {
     nodes, links, slideBreaks, captureFrame,
@@ -154,6 +164,10 @@ function App() {
   };
 
   if (page === 'loading') return null;
+
+  if (page === 'docs') {
+    return <DocsPage anchor={docsAnchor} onBack={() => setPage(previewMode ? 'editor' : 'editor')} />;
+  }
 
   if (page === 'projects') {
     return (
